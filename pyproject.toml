@@ -1,0 +1,353 @@
+#####################################################################
+# Core Project metadata
+#####################################################################
+[project]
+name = "nvidia-physicsnemo"
+authors = [
+  { name="NVIDIA PhysicsNeMo Team"},
+]
+description = "A deep learning framework for AI-driven multi-physics systems"
+readme = "README.md"
+
+
+requires-python = ">=3.13,<3.14"
+
+license = "Apache-2.0"
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dynamic = ["version", "optional_dependencies"]
+
+dependencies = [
+    "onnx>=1.14.0",
+    "warp-lang>=1.5.0",
+    "pandas>=2.2.0",
+    "nvtx>=0.2.10",
+    "treelib>=1.2.5",
+    "numpy>=1.22.4",
+    "torch>=2.5.0",
+    "torchvision>=0.19.0",
+    "tqdm>=4.60.0",
+    "requests>=2.32.2",
+    "GitPython>=3.1.40",
+    "s3fs>=2023.5.0",
+    "packaging>=24.2",
+    "timm>=1.0.22",
+    "einops>=0.8.1",
+    "h5py>=3.15.1",
+    "cftime>=1.6.5",
+    "jaxtyping>=0.3.3",
+    "termcolor>=3.2.0",
+    "hydra-core>=1.3.2",
+    "tensordict>=0.10.0",
+    "omegaconf>=2.3.0",
+    "importlib-metadata>=8.7.1",
+    "torch-geometric>=2.7.0",
+    "vtk>=9.6.0",
+    "pyvista>=0.47.1",
+    "wandb>=0.25.0",
+    "torch-scatter",
+    "weave>=0.52.35",
+    "sparse-dot-mkl>=0.9.10",
+    "mkl>=2025.3.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/NVIDIA/physicsnemo"
+Documentation = "https://docs.nvidia.com/physicsnemo/index.html#core"
+Issues = "https://github.com/NVIDIA/physicsnemo/issues"
+Changelog = "https://github.com/NVIDIA/physicsnemo/blob/main/CHANGELOG.md"
+
+
+
+#####################################################################
+# Flags for UV compatibility
+#####################################################################
+
+[tool.uv]
+managed = true
+conflicts = [
+    [
+        { extra = "cu12" },
+        { extra = "cu13" },
+    ],
+]
+
+[tool.uv.extra-build-dependencies]
+torch-sparse = ["torch"]
+torch-cluster = ["torch"]
+torch-scatter = ["torch"]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true  # Only use for packages that explicitly specify this index
+
+# PyTorch CUDA 13 index - used on Linux and Windows for torch builds compatible with cuml-cu13.
+# torch 2.10+ on PyPI (CUDA 12.8) pins cuda-bindings==12.9.4, which conflicts with
+# cuml-cu13's requirement for cuda-bindings>=13.0.1 via cuda-python.
+# The CUDA 13 build of torch pins cuda-bindings==13.0.3, which is compatible.
+# On Mac, we fall back to PyPI (CUDA is not available on macOS).
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+# PyTorch CUDA 12.8 index - used when the cu12 extra is active.
+# On PyPI, torch 2.10+ ships CUDA 12.8 builds by default, but pulling from
+# this explicit index keeps resolution symmetric with the cu130 path and
+# avoids implicit fallback differences between uv sync and pip install.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+# When cu12 is active, torch/torchvision come from the CUDA 12.8 index.
+# When cu13 is active, they come from the CUDA 13.0 index.
+# When neither extra is active (bare install), they come from PyPI.
+# On macOS, CUDA extras should not be used (no GPU builds available).
+torch = [
+    { index = "pytorch-cu128", extra = "cu12" },
+    { index = "pytorch-cu130", extra = "cu13" },
+]
+torchvision = [
+    { index = "pytorch-cu128", extra = "cu12" },
+    { index = "pytorch-cu130", extra = "cu13" },
+]
+cuml-cu13 = { index = "nvidia" }
+cuml-cu12 = { index = "nvidia" }
+pylibraft-cu13 = { index = "nvidia" }
+pylibraft-cu12 = { index = "nvidia" }
+nvidia-dali-cuda130 = { index = "nvidia" }
+nvidia-dali-cuda120 = { index = "nvidia" }
+torch-scatter = { path = "../../../Downloads/torch_scatter-2.1.2+pt210cu128-cp313-cp313-linux_x86_64.whl" }
+
+#####################################################################
+# Flags Controlling the local build of physicsnemo
+#####################################################################
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[tool.hatch.version]
+path = "physicsnemo/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["physicsnemo"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.github",
+    "/docs",
+    "/examples",
+    "/test",
+    "/CODING_STANDARDS",
+    "/benchmarks",
+]
+
+
+#####################################################################
+# Local Development Requirements (pytest, etc)
+#####################################################################
+
+[dependency-groups]
+dev = [
+    "asv>=0.6.0",
+    "coverage>=7.13.0",
+    "import-linter>=2.7",
+    "interrogate>=1.7.0",
+    "onnx>=1.20.0",
+    "onnxscript>=0.5.6",
+    "pre-commit>=4.5.0",
+    "pytest>=9.0.1",
+    "pytest-dependency>=0.6.0",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.14.8",
+    "pytest-testmon>=2.2.0",
+    "ipykernel>=7.1.0",
+    "import-linter>=2.10",
+    "urllib3>=2.0,<3",
+    "charset-normalizer>=3.0",
+]
+
+#####################################################################
+# Optional Dependency groups
+#####################################################################
+
+# These groups are self-referential.  So, they chain together as you
+# move up the physicsnemo hierarchy.  A new extra dep in `physicsnemo/nn`
+# will also be an extra dep in `physicsnemo/models`, but not the other
+# direction.
+
+[project.optional-dependencies]
+# CUDA backend extras (mutually exclusive via [tool.uv] conflicts).
+# Combine with feature extras, e.g. nvidia-physicsnemo[nn-extras,cu13].
+# When neither is specified, torch comes from PyPI and no RAPIDS
+# packages are installed.
+cu13 = [
+    "torch>=2.5.0",
+    "torchvision>=0.19.0",
+    "cuml-cu13",
+    "pylibraft-cu13",
+    "cupy-cuda13x==13.6.0",
+    "nvidia-dali-cuda130",
+]
+cu12 = [
+    "torch>=2.5.0",
+    "torchvision>=0.19.0",
+    "cuml-cu12",
+    "pylibraft-cu12",
+    "cupy-cuda12x",
+    "nvidia-dali-cuda120",
+]
+utils-extras = [
+    "wandb",
+    "mlflow",
+    "line_profiler",
+    "vtk",
+    "stl",
+]
+mesh-extras = [
+    "matplotlib>=3.10.8",
+    "pyacvd>=0.3.2",
+    "pyvista>=0.47.0",
+    "vtk>=9.6.0",
+]
+nn-extras = [
+    "scipy",
+    "natten",
+    "nvidia-physicsnemo[utils-extras]",
+]
+model-extras = [
+    "nvidia-physicsnemo[nn-extras]",
+    "pyvista>=0.46.4",
+    "vtk",
+]
+datapipes-extras = [
+    "tfrecord",
+    "dask",
+    "netCDF4",
+    "xarray>=2025.6.1",
+    "zarr>=3.0.0",
+    "tensordict>=0.11.0",
+]
+
+# Use case specific dependency groups.
+gnns = [
+    "torch_geometric",
+    "torch_scatter",
+    "torch_sparse",
+    "torch_cluster",
+    # "nvfuser",
+    "nvidia-physicsnemo[model-extras]",
+]
+
+perf = [
+    "transformer_engine[pytorch]",
+]
+
+
+#####################################################################
+# Linting configuration
+#####################################################################
+
+[tool.ruff]
+# Enable flake8/pycodestyle (`E`), Pyflakes (`F`), flake8-bandit (`S`),
+# isort (`I`), and performance 'PERF' rules.
+lint.select = ["E", "F", "S", "I", "PERF"]
+lint.fixable = ["I"]
+
+# Never enforce `E501` (line length violations),
+# and `S311` (random number generators)
+# and `F722` which breaks jaxtyping annotations
+lint.ignore = ["E501", "S311", "F722"]
+
+# Exclude the docs and experimental folders (this applies to both lint and format)
+exclude = ["docs", "physicsnemo/experimental"]
+
+[tool.ruff.lint.per-file-ignores]
+# Ignore `F401` (import violations) in all `__init__.py` files, and in `docs/*.py`.
+"__init__.py" = ["F401"]
+"docs/*.py" = ["F401"]
+
+# Ignore `S101` (assertions) in all `test` files.
+"test/*.py" = ["S101"]
+
+
+
+[project.entry-points."physicsnemo.models"]
+# AFNO
+AFNO = "physicsnemo.models.afno:AFNO"
+DistributedAFNO = "physicsnemo.models.afno:DistributedAFNO"
+ModAFNO = "physicsnemo.models.afno:ModAFNO"
+
+# Diffusion UNets
+SongUNet = "physicsnemo.models.diffusion_unets:SongUNet"
+SongUNetPosEmbd = "physicsnemo.models.diffusion_unets:SongUNetPosEmbd"
+SongUNetPosLtEmbd = "physicsnemo.models.diffusion_unets:SongUNetPosLtEmbd"
+DhariwalUNet = "physicsnemo.models.diffusion_unets:DhariwalUNet"
+
+# Diffusion wrappers
+CorrDiffRegressionUNet = "physicsnemo.models.diffusion_unets:CorrDiffRegressionUNet"
+StormCastUNet = "physicsnemo.models.diffusion_unets:StormCastUNet"
+
+# DLWP
+DLWP = "physicsnemo.models.dlwp:DLWP"
+
+# DLWP HEALPix
+HEALPixRecUNet = "physicsnemo.models.dlwp_healpix:HEALPixRecUNet"
+HEALPixUNet = "physicsnemo.models.dlwp_healpix:HEALPixUNet"
+
+# DPOT
+DPOTNet = "physicsnemo.models.dpot:DPOTNet"
+
+# Fengwu
+Fengwu = "physicsnemo.models.fengwu:Fengwu"
+
+# FIGConvNet
+FIGConvUNet = "physicsnemo.models.figconvnet:FIGConvUNet"
+
+# FNO
+FNO = "physicsnemo.models.fno:FNO"
+
+# GraphCast
+GraphCastNet = "physicsnemo.models.graphcast:GraphCastNet"
+
+# MeshGraphNets
+MeshGraphNet = "physicsnemo.models.meshgraphnet:MeshGraphNet"
+BiStrideMeshGraphNet = "physicsnemo.models.meshgraphnet:BiStrideMeshGraphNet"
+MeshGraphKAN = "physicsnemo.models.meshgraphnet:MeshGraphKAN"
+HybridMeshGraphNet = "physicsnemo.models.meshgraphnet:HybridMeshGraphNet"
+
+# MLP
+FullyConnected = "physicsnemo.models.mlp:FullyConnected"
+
+# Pangu
+Pangu = "physicsnemo.models.pangu:Pangu"
+
+# Pix2Pix
+Pix2Pix = "physicsnemo.models.pix2pix:Pix2Pix"
+Pix2PixUnet = "physicsnemo.models.pix2pix:Pix2PixUnet"
+
+# RNNs
+One2ManyRNN = "physicsnemo.models.rnn:One2ManyRNN"
+Seq2SeqRNN = "physicsnemo.models.rnn:Seq2SeqRNN"
+
+# SRNNs
+SRResNet = "physicsnemo.models.srrn:SRResNet"
+
+# SwinRNN
+SwinRNN = "physicsnemo.models.swinvrnn:SwinRNN"
+
+# TopoDiff
+TopoDiff = "physicsnemo.models.topodiff:TopoDiff"
+
+# Transolver
+Transolver = "physicsnemo.models.transolver:Transolver"
+
+# VFGN
+VFGN = "physicsnemo.models.vfgn:VFGNLearnedSimulator"
