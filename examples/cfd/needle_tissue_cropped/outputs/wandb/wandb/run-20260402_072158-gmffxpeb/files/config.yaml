@@ -1,0 +1,65 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            nxf0oh3hkb54mjxfykg6lpxlvaiivyk6:
+                codePath: examples/cfd/needle_tissue_cropped/train.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "1967317549056"
+                        used: "1329904521216"
+                email: nhoffma1@umd.edu
+                executable: /home/nathanielhoffman/Desktop/cel/physicsnemo/.venv/bin/python3
+                git:
+                    commit: b5df96e9c093495438eec81b433c54c01b967482
+                    remote: https://github.com/NVIDIA/physicsnemo.git
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-00069fd3-a52b-658b-8b30-8f6f2c19b3fd
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-eb41c786-50c5-040a-c505-275e6dc3f7aa
+                host: FUGE-CUSTOM1
+                memory:
+                    total: "134865293312"
+                os: Linux-6.8.0-106-generic-x86_64-with-glibc2.35
+                program: /home/nathanielhoffman/Desktop/cel/physicsnemo/examples/cfd/needle_tissue_cropped/train.py
+                python: CPython 3.13.12
+                root: /home/nathanielhoffman/Desktop/cel/physicsnemo/examples/cfd/needle_tissue_cropped/outputs/wandb
+                startedAt: "2026-04-02T11:21:58.640046Z"
+                writerId: nxf0oh3hkb54mjxfykg6lpxlvaiivyk6
+        m: []
+        python_version: 3.13.12
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 50
+                - 63
+                - 77
+            "2":
+                - 1
+                - 41
+                - 49
+                - 50
+                - 63
+                - 77
+            "3":
+                - 13
+            "4": 3.13.12
+            "5": 0.25.0
+            "8":
+                - 2
+            "12": 0.25.0
+            "13": linux-x86_64

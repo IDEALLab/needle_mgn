@@ -1,0 +1,196 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            e9g6wapuoctkz5n0ua0f848npra0hopd:
+                codePath: examples/cfd/needle_tissue_domino/train.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "1967317549056"
+                        used: "1331293884416"
+                email: nhoffma1@umd.edu
+                executable: /home/nathanielhoffman/Desktop/cel/physicsnemo/.venv/bin/python3
+                git:
+                    commit: b5df96e9c093495438eec81b433c54c01b967482
+                    remote: https://github.com/NVIDIA/physicsnemo.git
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-00069fd3-a52b-658b-8b30-8f6f2c19b3fd
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-eb41c786-50c5-040a-c505-275e6dc3f7aa
+                host: FUGE-CUSTOM1
+                memory:
+                    total: "134865309696"
+                os: Linux-6.8.0-107-generic-x86_64-with-glibc2.35
+                program: /home/nathanielhoffman/Desktop/cel/physicsnemo/examples/cfd/needle_tissue_domino/train.py
+                python: CPython 3.13.12
+                root: /home/nathanielhoffman/Desktop/cel/physicsnemo/examples/cfd/needle_tissue_domino/outputs
+                startedAt: "2026-04-03T10:04:49.404647Z"
+                writerId: e9g6wapuoctkz5n0ua0f848npra0hopd
+        m: []
+        python_version: 3.13.12
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 50
+                - 63
+                - 77
+            "2":
+                - 1
+                - 41
+                - 49
+                - 50
+                - 63
+                - 77
+            "3":
+                - 16
+            "4": 3.13.12
+            "5": 0.25.0
+            "8":
+                - 2
+            "12": 0.25.0
+            "13": linux-x86_64
+amp:
+    value: true
+ckpt_path:
+    value: ./checkpoints
+data_dir:
+    value: /home/nathanielhoffman/Desktop/cel/physicsnemo/RUN-2
+epochs:
+    value: 300
+global_features:
+    value: 1
+grid_res:
+    value:
+        - 64
+        - 32
+        - 32
+lr:
+    value: 0.0001
+model:
+    value:
+        activation: gelu
+        aggregation_model:
+            activation: gelu
+            base_layer: 256
+        combine_volume_surface: false
+        encode_parameters: false
+        geometry_encoding_type: both
+        geometry_local:
+            base_layer: 256
+            surface_neighbors_in_radius:
+                - 32
+                - 128
+            surface_radii:
+                - 2
+                - 10
+            volume_neighbors_in_radius:
+                - 64
+                - 128
+            volume_radii:
+                - 4
+                - 15
+        geometry_rep:
+            geo_conv:
+                activation: gelu
+                base_neurons: 32
+                base_neurons_in: 1
+                base_neurons_out: 1
+                fourier_features: false
+                num_modes: 5
+                surface_hops: 1
+                surface_neighbors_in_radius:
+                    - 8
+                    - 16
+                    - 128
+                surface_radii:
+                    - 1
+                    - 4
+                    - 15
+                volume_hops: 1
+                volume_neighbors_in_radius:
+                    - 32
+                    - 64
+                    - 128
+                    - 256
+                volume_radii:
+                    - 2
+                    - 8
+                    - 20
+                    - 50
+            geo_processor:
+                activation: gelu
+                base_filters: 8
+                cross_attention: false
+                processor_type: conv
+                self_attention: false
+                surface_sdf_scaling_factor:
+                    - 0.01
+                    - 0.02
+                    - 0.04
+                volume_sdf_scaling_factor:
+                    - 0.04
+        interp_res:
+            - 64
+            - 32
+            - 32
+        local_point_conv:
+            activation: gelu
+        model_type: volume
+        nn_basis_functions:
+            activation: gelu
+            base_layer: 256
+            fourier_features: true
+            num_modes: 5
+        num_neighbors_surface: 7
+        num_neighbors_volume: 10
+        parameter_model:
+            activation: gelu
+            base_layer: 256
+            fourier_features: false
+            num_modes: 5
+        position_encoder:
+            activation: gelu
+            base_neurons: 256
+            fourier_features: true
+            num_modes: 5
+        return_volume_neighbors: false
+        solution_calculation_mode: two-loop
+        use_sdf_in_basis_func: true
+        use_surface_area: false
+        use_surface_normals: false
+num_sample_nodes:
+    value: null
+num_workers:
+    value: 2
+output_dim:
+    value: 9
+save_every:
+    value: 50
+stats_dir:
+    value: ./stats
+train_fraction:
+    value: 0.8
+val_every:
+    value: 10
+val_fraction:
+    value: 0.1
+wandb_entity:
+    value: nhoffma1
+wandb_mode:
+    value: online
+wandb_project:
+    value: PhysicsNeMo-DCEL-DoMINO

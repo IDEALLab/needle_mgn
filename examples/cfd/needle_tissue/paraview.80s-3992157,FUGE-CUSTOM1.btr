@@ -1,0 +1,15 @@
+
+paraview:3992157 terminated with signal 6 at PC=7eb6b84969fc SP=7ffe0683a020.  Backtrace:
+/usr/bin/../lib/x86_64-linux-gnu/libc.so.6(pthread_kill+0x12c)[0x7eb6b84969fc]
+/usr/bin/../lib/x86_64-linux-gnu/libc.so.6(raise+0x16)[0x7eb6b8442476]
+/usr/bin/../lib/x86_64-linux-gnu/libc.so.6(abort+0xd3)[0x7eb6b84287f3]
+/usr/bin/../lib/x86_64-linux-gnu/libQt6Core.so.6(_Z13qErrnoWarningPKcz+0x0)[0x7eb6bcca3203]
+/usr/bin/../lib/x86_64-linux-gnu/libQt6Gui.so.6(+0x11936a)[0x7eb6c291936a]
+/usr/bin/../lib/x86_64-linux-gnu/libQt6Gui.so.6(_ZN22QGuiApplicationPrivate21createEventDispatcherEv+0x38)[0x7eb6c29c76d8]
+/usr/bin/../lib/x86_64-linux-gnu/libQt6Core.so.6(_ZN23QCoreApplicationPrivate4initEv+0x1067)[0x7eb6bcd5a067]
+/usr/bin/../lib/x86_64-linux-gnu/libQt6Gui.so.6(_ZN22QGuiApplicationPrivate4initEv+0x34)[0x7eb6c29c91d4]
+/usr/bin/../lib/x86_64-linux-gnu/libQt6Widgets.so.6(_ZN19QApplicationPrivate4initEv+0xd)[0x7eb6c3d858fd]
+paraview(+0x13e66)[0x60ac270e9e66]
+/usr/bin/../lib/x86_64-linux-gnu/libc.so.6(+0x29d90)[0x7eb6b8429d90]
+/usr/bin/../lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x80)[0x7eb6b8429e40]
+paraview(+0xae25)[0x60ac270e0e25]

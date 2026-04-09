@@ -1,0 +1,168 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: ./outputs/
+
+# -------------------------
+# Paths
+# -------------------------
+data_dir: "/home/nathanielhoffman/Desktop/cel/physicsnemo/RUN-2"
+ckpt_path: "./checkpoints"
+stats_dir: "./stats"
+
+# CUDA device selection.  Set to a string like "0", "1", or "0,1" to restrict
+# which GPUs are visible.  null means use whatever is available.
+cuda_devices: null
+
+# -------------------------
+# Dataset split
+# -------------------------
+train_fraction: 0.8
+val_fraction: 0.1
+
+# -------------------------
+# Grid
+# -------------------------
+# Regular bounding-box grid for the geometry convolution.
+# Radii and grid resolution are in the same units as the mesh (mm).
+# Start small; increase grid_res if under-resolved near the needle tip.
+grid_res: [32, 16, 16]
+
+# Optional: randomly sample this many query nodes per batch to reduce GPU memory.
+# Set to null to use all nodes.
+num_sample_nodes: 2048
+
+# -------------------------
+# Model output
+# -------------------------
+output_dim: 9          # Δu_x Δu_y Δu_z  Δv_x Δv_y Δv_z  Δa_x Δa_y Δa_z
+global_features: 1     # normalised timestep index
+
+# -------------------------
+# DoMINO model parameters
+# -------------------------
+model:
+  model_type: volume          # volume-only; needle is geometry, all nodes are queries
+  activation: gelu
+  interp_res: [32, 16, 16]    # must match grid_res
+  use_sdf_in_basis_func: true
+  num_neighbors_surface: 7
+  num_neighbors_volume: 10
+  combine_volume_surface: false
+  return_volume_neighbors: false
+  use_surface_normals: false   # no surface normals for hex needle mesh
+  use_surface_area: false
+  geometry_encoding_type: both
+  solution_calculation_mode: two-loop
+  encode_parameters: false
+  geometry_rep:
+    geo_conv:
+      base_neurons: 32
+      base_neurons_in: 1
+      base_neurons_out: 1
+      # Radii in mm — tuned for needle-tissue scale.
+      # Adjust if the geometry conv under- or over-smooths the needle shape.
+      volume_radii: [2.0, 8.0, 20.0, 50.0]
+      surface_radii: [1.0, 4.0, 15.0]       # unused (volume-only) but required
+      volume_hops: 1
+      surface_hops: 1
+      volume_neighbors_in_radius: [32, 64, 128, 256]
+      surface_neighbors_in_radius: [8, 16, 128]
+      fourier_features: false
+      num_modes: 5
+      activation: ${model.activation}
+    geo_processor:
+      base_filters: 8
+      activation: ${model.activation}
+      processor_type: conv
+      self_attention: false
+      cross_attention: false
+      # SDF scaling: smaller factor → more emphasis on regions near needle surface
+      volume_sdf_scaling_factor: [0.04]
+      surface_sdf_scaling_factor: [0.01, 0.02, 0.04]   # unused but required
+  local_point_conv:
+    activation: ${model.activation}
+  nn_basis_functions:
+    base_layer: 256
+    fourier_features: true
+    num_modes: 5
+    activation: ${model.activation}
+  aggregation_model:
+    base_layer: 256
+    activation: ${model.activation}
+  position_encoder:
+    # Input to this MLP = (sdf + scaled_sdfs + closest_pos + centroid_pos) + state_vol
+    # = (1 + 1 + 3 + 3) + 30 = 38 features.  base_neurons controls hidden width.
+    base_neurons: 256
+    activation: ${model.activation}
+    fourier_features: true
+    num_modes: 5
+  geometry_local:
+    # Radii in mm for local geometry multi-scale encoding at each query node
+    volume_neighbors_in_radius: [64, 128]
+    surface_neighbors_in_radius: [32, 128]   # unused
+    volume_radii: [4.0, 15.0]
+    surface_radii: [2.0, 10.0]               # unused
+    base_layer: 256
+  parameter_model:
+    base_layer: 256
+    fourier_features: false
+    num_modes: 5
+    activation: ${model.activation}
+
+# -------------------------
+# Fourier feature encoding on per-node state inputs (DCEL extension).
+# When enabled, state_vol is mapped through [sin(xB), cos(xB)] before being
+# concatenated into the position encoder.
+# n_fourier_features_state controls projection count (output = 2 × n).
+# fourier_scale_state is the std of the Gaussian used to sample B.
+node_state_dim_vol: 30
+use_fourier_features_state: true
+n_fourier_features_state: 64
+fourier_scale_state: .36
+
+# -------------------------
+# Inference
+# -------------------------
+infer_start_frame: null
+n_rollout: 20
+infer_output_dir: "./inference_output"
+# Consensus filter: fraction of per-needle-node displacement not correlated
+# with neighbours to remove.  0.0 = disabled.  Try 0.9–0.99.
+consensus_attenuation: 0.0
+
+# -------------------------
+# Training
+# -------------------------
+epochs: 300
+num_workers: 2
+lr: 1e-4
+amp: true
+
+val_every: 10
+save_every: 50
+
+# -------------------------
+# WandB
+# -------------------------
+wandb_mode: "online"
+wandb_project: "PhysicsNeMo-DCEL-DoMINO"
+wandb_entity: "nhoffma1"
+wandb_log_artifact: true

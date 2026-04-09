@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: ./outputs/
+
+# Paths
+data_dir: "../../../RUN-2"
+ckpt_path: "./checkpoints"
+stats_dir: "./stats"
+
+# CUDA device selection.  Set to a string like "0", "1", or "0,1" to restrict
+# which GPUs are visible.  null means use whatever is available.
+cuda_devices: null
+
+# Dataset split fractions
+train_fraction: 0.8
+val_fraction: 0.1
+
+# -------------------------
+# Spatial cropping (the key difference from needle_tissue/)
+# -------------------------
+# Three crop strategies are available; mix them via crop_strategy_weights.
+# Weights are unnormalised — [1, 0, 0] means 100% proximity, [0.7, 0.15, 0.15]
+# means 70% proximity / 15% slice / 15% full-needle.
+# Val/test always use proximity regardless of these weights.
+#
+# proximity  — standard: exclude needle nodes > needle_crop_mm from tissue,
+#              then tissue nodes > tissue_crop_mm from remaining needle nodes.
+# slice      — perpendicular slab of ±slice_half_thickness_mm around a random
+#              axial centre; exposes different cross-sections each epoch.
+# full_needle — keep all needle nodes + tissue within full_needle_tissue_mm.
+#
+needle_crop_mm: 10.0
+tissue_crop_mm: 25.0
+slice_half_thickness_mm: 15.0
+full_needle_tissue_mm: 7.0
+crop_strategy_weights: [0.7, 0.15, 0.15]
+
+# -------------------------
+# Model architecture
+# -------------------------
+# COORD(3)+U(3)+V(3)+A(3)+EVF(1)+S(6)+CPRESS(1) + 8 mat props (10) = 30
+input_dim_nodes: 30
+input_dim_edges: 7
+output_dim: 9
+
+# Random Fourier Feature encoding on node inputs.
+# When enabled, node features are mapped through [sin(xB), cos(xB)] before the
+# node encoder.  n_fourier_features controls the number of frequency projections
+# (output dim = 2 * n_fourier_features).  fourier_scale is the std of the
+# Gaussian from which B is sampled.
+use_fourier_features: false
+n_fourier_features: 64
+fourier_scale: .36
+
+hidden_dim_node_encoder: 256
+hidden_dim_edge_encoder: 256
+hidden_dim_node_decoder: 256
+hidden_dim_processor: 256
+# No BSMS in this variant (dynamic cropping changes topology each step,
+# incompatible with precomputed BSMS coarsenings).
+# Use more vanilla processor steps to compensate.
+processor_size: 15
+aggregation: "sum"
+
+# -------------------------
+# Training
+# -------------------------
+epochs: 300
+batch_size: 1
+num_workers: 2
+lr: 1e-4
+amp: false
+jit: false
+
+val_every: 10
+save_every: 50
+
+# -------------------------
+# Inference (infer.py)
+# -------------------------
+infer_start_frame: null
+n_rollout: 20
+infer_output_dir: "./inference_output"
+# Consensus filter: fraction of per-needle-node displacement not correlated
+# with neighbours to remove.  0.0 = disabled.  Try 0.9–0.99.
+consensus_attenuation: 0.0
+
+# -------------------------
+# WandB
+# -------------------------
+wandb_mode: "online"
+wandb_project: "PhysicsNeMo-Launch"
+wandb_entity: "nhoffma1"
+wandb_log_artifact: true
