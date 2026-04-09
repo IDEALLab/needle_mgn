@@ -111,14 +111,11 @@ hydra:
   overrides:
     hydra:
     - hydra.mode=RUN
-    task:
-    - +infer_start_frame=1
-    - ++n_rollout=200
-    - +cuda_devices=1
+    task: []
   job:
-    name: infer
+    name: train
     chdir: true
-    override_dirname: ++n_rollout=200,+cuda_devices=1,+infer_start_frame=1
+    override_dirname: ''
     id: ???
     num: ???
     config_name: config

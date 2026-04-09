@@ -45,7 +45,12 @@ from omegaconf import DictConfig, OmegaConf
 from scipy.spatial import cKDTree
 from torch_geometric.data import Data
 
-from dataset import _precompute_bsms, _sorted_vtu_files
+from dataset import (
+    _precompute_bsms,
+    _sorted_vtu_files,
+    _is_multi_run,
+    _group_vtu_by_run,
+)
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.models.meshgraphnet import MeshGraphNet
 from physicsnemo.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
@@ -215,14 +220,37 @@ def main(cfg: DictConfig) -> None:
     data_dir = to_absolute_path(cfg.data_dir)
     stats_dir = to_absolute_path(cfg.stats_dir)
 
-    # ---- Inference-specific config with defaults -------------------------
-    # First test frame = n_train + n_val (0-indexed into the full sequence)
-    vtu_files = _sorted_vtu_files(data_dir)
+    # ---- Select VTU files ---------------------------------------------------
+    timestep_stride = int(OmegaConf.select(cfg, "timestep_stride", default=1))
+    if _is_multi_run(data_dir):
+        run_files = _group_vtu_by_run(data_dir, timestep_stride)
+        run_ids = list(run_files.keys())
+        n_runs = len(run_ids)
+        n_train_runs = max(1, int(n_runs * cfg.train_fraction))
+        n_val_runs = max(1, int(n_runs * cfg.val_fraction))
+        test_run_ids = run_ids[n_train_runs + n_val_runs :]
+        if not test_run_ids:
+            test_run_ids = run_ids[-1:]
+
+        _infer_run_id = OmegaConf.select(cfg, "infer_run_id", default=None)
+        infer_run_id = str(_infer_run_id) if _infer_run_id is not None else test_run_ids[0]
+        if infer_run_id not in run_files:
+            raise ValueError(
+                f"infer_run_id={infer_run_id!r} not found. Available: {list(run_files.keys())}"
+            )
+        vtu_files = run_files[infer_run_id]
+        cache_filename = f"preprocessed_cache_RUN-{infer_run_id}.pt"
+        print(f"Inferring on RUN-{infer_run_id}: {len(vtu_files)} frames")
+        default_start = 0
+    else:
+        vtu_files = _sorted_vtu_files(data_dir)
+        cache_filename = "preprocessed_cache.pt"
+        n_pairs = len(vtu_files) - 1
+        n_train = int(n_pairs * cfg.train_fraction)
+        n_val = int(n_pairs * cfg.val_fraction)
+        default_start = n_train + n_val
+
     n_frames = len(vtu_files)
-    n_pairs = n_frames - 1
-    n_train = int(n_pairs * cfg.train_fraction)
-    n_val = int(n_pairs * cfg.val_fraction)
-    default_start = n_train + n_val  # first test frame
 
     _raw_start = OmegaConf.select(cfg, "infer_start_frame", default=None)
     infer_start = default_start if (_raw_start is None) else int(_raw_start)
@@ -273,7 +301,7 @@ def main(cfg: DictConfig) -> None:
     target_stats = load_json(os.path.join(stats_dir, "target_stats.json"))
 
     # ---- Raw cache (always needed — contains per-frame world edges) ------
-    raw_cache_path = os.path.join(data_dir, "preprocessed_cache.pt")
+    raw_cache_path = os.path.join(data_dir, cache_filename)
     if not os.path.exists(raw_cache_path):
         raise FileNotFoundError(
             f"{raw_cache_path} not found — run train.py first."

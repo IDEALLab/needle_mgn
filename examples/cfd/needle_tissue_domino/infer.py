@@ -51,6 +51,8 @@ from dataset import (
     STATIC_PROP_DIMS,
     _compute_sdf_grid,
     _sorted_vtu_files,
+    _is_multi_run,
+    _group_vtu_by_run,
 )
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.models.domino.model import DoMINO
@@ -263,12 +265,39 @@ def main(cfg: DictConfig) -> None:
     data_dir = to_absolute_path(cfg.data_dir)
     stats_dir = to_absolute_path(cfg.stats_dir)
 
-    vtu_files = _sorted_vtu_files(data_dir)
+    timestep_stride = int(OmegaConf.select(cfg, "timestep_stride", default=1))
+    if _is_multi_run(data_dir):
+        run_files = _group_vtu_by_run(data_dir, timestep_stride)
+        run_ids = list(run_files.keys())
+        n_runs = len(run_ids)
+        n_train_runs = max(1, int(n_runs * cfg.train_fraction))
+        n_val_runs = max(1, int(n_runs * cfg.val_fraction))
+        test_run_ids = run_ids[n_train_runs + n_val_runs :] or run_ids[-1:]
+        _infer_run_id = OmegaConf.select(cfg, "infer_run_id", default=None)
+        infer_run_id = str(_infer_run_id) if _infer_run_id is not None else test_run_ids[0]
+        if infer_run_id not in run_files:
+            raise ValueError(
+                f"infer_run_id={infer_run_id!r} not found. Available: {list(run_files.keys())}"
+            )
+        vtu_files = run_files[infer_run_id]
+        raw_cache_filename = f"preprocessed_cache_RUN-{infer_run_id}.pt"
+        grid_res = tuple(cfg.grid_res)
+        domino_cache_filename = (
+            f"domino_cache_RUN-{infer_run_id}_{grid_res[0]}x{grid_res[1]}x{grid_res[2]}.pt"
+        )
+        default_start = 0
+        print(f"Inferring on RUN-{infer_run_id}: {len(vtu_files)} frames")
+    else:
+        vtu_files = _sorted_vtu_files(data_dir)
+        raw_cache_filename = "preprocessed_cache.pt"
+        grid_res = tuple(cfg.grid_res)
+        domino_cache_filename = f"domino_cache_{grid_res[0]}x{grid_res[1]}x{grid_res[2]}.pt"
+        n_pairs = len(vtu_files) - 1
+        n_train = int(n_pairs * cfg.train_fraction)
+        n_val = int(n_pairs * cfg.val_fraction)
+        default_start = n_train + n_val
+
     n_frames = len(vtu_files)
-    n_pairs = n_frames - 1
-    n_train = int(n_pairs * cfg.train_fraction)
-    n_val = int(n_pairs * cfg.val_fraction)
-    default_start = n_train + n_val
 
     infer_start = int(OmegaConf.select(cfg, "infer_start_frame", default=default_start) or default_start)
     n_rollout = int(OmegaConf.select(cfg, "n_rollout", default=20))
@@ -301,7 +330,7 @@ def main(cfg: DictConfig) -> None:
     node_stats = load_json(os.path.join(stats_dir, "domino_node_stats.json"))
     target_stats = load_json(os.path.join(stats_dir, "domino_target_stats.json"))
 
-    raw_cache_path = os.path.join(data_dir, "preprocessed_cache.pt")
+    raw_cache_path = os.path.join(data_dir, raw_cache_filename)
     if not os.path.exists(raw_cache_path):
         raise FileNotFoundError(f"{raw_cache_path} not found — run train.py first.")
     raw_cache = torch.load(raw_cache_path, weights_only=False)
@@ -311,10 +340,7 @@ def main(cfg: DictConfig) -> None:
     edge_type_onehot = raw_cache["edge_type_onehot"]
     n_nodes = int(edge_index.max().item()) + 1
 
-    grid_res = tuple(cfg.grid_res)
-    domino_cache_path = os.path.join(
-        data_dir, f"domino_cache_{grid_res[0]}x{grid_res[1]}x{grid_res[2]}.pt"
-    )
+    domino_cache_path = os.path.join(data_dir, domino_cache_filename)
     if not os.path.exists(domino_cache_path):
         raise FileNotFoundError(
             f"{domino_cache_path} not found — run train.py first to build the cache."
@@ -333,10 +359,8 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ---- Initial state -------------------------------------------------------
-    # cf defaults to zeros (not available at inference time).
     # cpress uses the start-frame value and stays fixed during rollout.
-    state: dict = {k: frame_tensors[k][infer_start].clone().float() for k in STATE_KEYS if k != "cf"}
-    state["cf"] = torch.zeros(n_nodes, 3, dtype=torch.float32)
+    state: dict = {k: frame_tensors[k][infer_start].clone().float() for k in STATE_KEYS}
     state["coord"] = frame_tensors["coord"][infer_start].clone().float()
 
     # ---- Consensus filter precomputation ------------------------------------

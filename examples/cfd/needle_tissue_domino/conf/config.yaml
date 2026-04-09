@@ -38,6 +38,14 @@ train_fraction: 0.8
 val_fraction: 0.1
 
 # -------------------------
+# Multi-run dataset
+# -------------------------
+# For multi-run datasets (files named *-RUN-N_T.vtu), runs are split into
+# train/val/test.  timestep_stride subsamples frames within each run:
+# stride=1 uses all frames; stride=10 uses every 10th frame.
+timestep_stride: 10
+
+# -------------------------
 # Grid
 # -------------------------
 # Regular bounding-box grid for the geometry convolution.
@@ -109,7 +117,7 @@ model:
     activation: ${model.activation}
   position_encoder:
     # Input to this MLP = (sdf + scaled_sdfs + closest_pos + centroid_pos) + state_vol
-    # = (1 + 1 + 3 + 3) + 30 = 38 features.  base_neurons controls hidden width.
+    # = (1 + 1 + 3 + 3) + 27 = 35 features.  base_neurons controls hidden width.
     base_neurons: 256
     activation: ${model.activation}
     fourier_features: true
@@ -133,7 +141,7 @@ model:
 # concatenated into the position encoder.
 # n_fourier_features_state controls projection count (output = 2 × n).
 # fourier_scale_state is the std of the Gaussian used to sample B.
-node_state_dim_vol: 30
+node_state_dim_vol: 27
 use_fourier_features_state: true
 n_fourier_features_state: 64
 fourier_scale_state: .36
@@ -144,6 +152,8 @@ fourier_scale_state: .36
 infer_start_frame: null
 n_rollout: 20
 infer_output_dir: "./inference_output"
+# For multi-run datasets: which run to infer on.  null = first test run.
+infer_run_id: null
 # Consensus filter: fraction of per-needle-node displacement not correlated
 # with neighbours to remove.  0.0 = disabled.  Try 0.9–0.99.
 consensus_attenuation: 0.0
@@ -155,6 +165,9 @@ epochs: 300
 num_workers: 2
 lr: 1e-4
 amp: true
+# Gaussian noise std added to normalised u/v/a inputs during training.
+# Forces the model to denoise rollout drift.  0.0 = disabled.  Try 3e-3.
+noise_std: 0.0
 
 val_every: 10
 save_every: 50

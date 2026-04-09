@@ -67,10 +67,11 @@ _HEX_LOCAL_EDGES: np.ndarray = np.array(
 )  # shape (12, 2)
 
 _CACHE_FILENAME = "preprocessed_cache.pt"
+_MULTI_RUN_PATTERN = re.compile(r"-RUN-(\d+)_(\d+)\.vtu$")
 
 
 def _sorted_vtu_files(data_dir: str) -> List[str]:
-    """Return VTU files in *data_dir* sorted numerically."""
+    """Return VTU files in *data_dir* sorted numerically by the last number in their name."""
     entries = [
         os.path.join(data_dir, f)
         for f in os.listdir(data_dir)
@@ -78,10 +79,37 @@ def _sorted_vtu_files(data_dir: str) -> List[str]:
     ]
     numbers = []
     for path in entries:
-        m = re.search(r"(\d+)", os.path.basename(path))
-        numbers.append(int(m.group(1)) if m else 0)
+        m = re.findall(r"\d+", os.path.basename(path))
+        numbers.append(int(m[-1]) if m else 0)
     order = np.argsort(numbers)
     return [entries[i] for i in order]
+
+
+def _is_multi_run(data_dir: str) -> bool:
+    """Return True if *data_dir* contains multi-run VTU files (``*-RUN-N_T.vtu``)."""
+    for f in os.listdir(data_dir):
+        if _MULTI_RUN_PATTERN.search(f):
+            return True
+    return False
+
+
+def _group_vtu_by_run(
+    data_dir: str, timestep_stride: int = 1
+) -> Dict[str, List[str]]:
+    """Group VTU files by run ID and apply a timestep stride within each run."""
+    runs: Dict[str, List[Tuple[int, str]]] = {}
+    for f in os.listdir(data_dir):
+        m = _MULTI_RUN_PATTERN.search(f)
+        if m:
+            run_id, ts = m.group(1), int(m.group(2))
+            runs.setdefault(run_id, []).append((ts, os.path.join(data_dir, f)))
+    result: Dict[str, List[str]] = {}
+    for run_id in sorted(runs.keys(), key=int):
+        frames = sorted(runs[run_id])
+        paths = [p for _, p in frames[::timestep_stride]]
+        if len(paths) >= 2:
+            result[run_id] = paths
+    return result
 
 
 def _build_hex_edges(
@@ -626,6 +654,7 @@ class NeedleTissueDataset(Dataset):
         stats_path: str = ".",
         cache_dir: Optional[str] = None,
         beam_spacing_mm: float = 0.0,
+        timestep_stride: int = 1,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -634,120 +663,234 @@ class NeedleTissueDataset(Dataset):
         self.stats_path = stats_path
         os.makedirs(stats_path, exist_ok=True)
 
-        vtu_files = _sorted_vtu_files(data_dir)
-        n_frames = len(vtu_files)
-        n_pairs = n_frames - 1
+        # Per-run data (frame tensors, world edges, node props)
+        self._run_data: List[Dict] = []
+        # (run_local_idx, t_local) — one entry per training sample
+        self._samples: List[Tuple[int, int]] = []
 
-        n_train = int(n_pairs * train_fraction)
-        n_val = int(n_pairs * val_fraction)
+        # The old-to-new beam remapping array (None = no beam reduction)
+        self._beam_old_to_new: Optional[np.ndarray] = None
 
-        split_ranges = {
-            "train": (0, n_train),
-            "validation": (n_train, n_train + n_val),
-            "test": (n_train + n_val, n_pairs),
-        }
-        start, end = split_ranges[split]
-        self._pair_indices = list(range(start, end))
-        n_pairs_split = len(self._pair_indices)
+        # Topology shared across all runs (same mesh)
+        self.edge_index: Optional[torch.Tensor] = None
+        self.edge_type_onehot: Optional[torch.Tensor] = None
+        self.n_nodes: int = 0
 
-        if n_pairs_split == 0:
-            raise ValueError(f"No pairs in '{split}' split for {n_frames} frames.")
+        # Determine beam assignment once (from first run); reused across all runs.
+        _beam_asgn_cache: Optional[Tuple] = None  # (beam_asgn, N_beam, n_nodes_orig)
 
-        # ---- Load or build raw preprocessed cache ----
-        # The raw cache contains fixed HEX edges + per-frame world edges.
-        # If an older cache without "world_edges" is found it is regenerated.
-        raw_cache_path = os.path.join(cache_dir or data_dir, _CACHE_FILENAME)
-        if os.path.exists(raw_cache_path):
-            raw_cache = torch.load(raw_cache_path, weights_only=False)
-            if (
-                "world_edges" not in raw_cache
-                or "node_props" not in raw_cache
-                or "cpress" not in raw_cache.get("frame_tensors", {})
-            ):
-                print("Cache outdated — regenerating ...")
+        if _is_multi_run(data_dir):
+            # ---- Multi-run mode: split by run, subsample timesteps ----------
+            run_files = _group_vtu_by_run(data_dir, timestep_stride)
+            run_ids = list(run_files.keys())
+            n_runs = len(run_ids)
+
+            n_train_runs = max(1, int(n_runs * train_fraction))
+            n_val_runs = max(1, int(n_runs * val_fraction))
+
+            if split == "train":
+                split_run_ids = run_ids[:n_train_runs]
+            elif split == "validation":
+                split_run_ids = run_ids[n_train_runs : n_train_runs + n_val_runs]
+            else:
+                split_run_ids = run_ids[n_train_runs + n_val_runs :]
+
+            if not split_run_ids:
+                raise ValueError(
+                    f"No runs assigned to '{split}' split ({n_runs} total)."
+                )
+
+            print(
+                f"Multi-run '{split}' split: {len(split_run_ids)}/{n_runs} runs, "
+                f"stride={timestep_stride}"
+            )
+
+            for r_idx, run_id in enumerate(split_run_ids):
+                vtu_files = run_files[run_id]
+                n_frames_run = len(vtu_files)
+                raw_cache_path = os.path.join(
+                    cache_dir or data_dir,
+                    f"preprocessed_cache_RUN-{run_id}.pt",
+                )
+                if os.path.exists(raw_cache_path):
+                    raw_cache = torch.load(raw_cache_path, weights_only=False)
+                    if (
+                        "world_edges" not in raw_cache
+                        or "node_props" not in raw_cache
+                        or "cpress" not in raw_cache.get("frame_tensors", {})
+                    ):
+                        print(f"Cache outdated for RUN-{run_id} — regenerating ...")
+                        raw_cache = _process_all_frames(vtu_files)
+                        _atomic_torch_save(raw_cache, raw_cache_path)
+                else:
+                    print(
+                        f"Building cache for RUN-{run_id} ({n_frames_run} frames)..."
+                    )
+                    raw_cache = _process_all_frames(vtu_files)
+                    _atomic_torch_save(raw_cache, raw_cache_path)
+                    print(f"  → saved to {raw_cache_path}")
+
+                if beam_spacing_mm > 0.0:
+                    bname = f"beam_cache_RUN-{run_id}_b{beam_spacing_mm:.2g}mm.pt"
+                    beam_path = os.path.join(cache_dir or data_dir, bname)
+                    if os.path.exists(beam_path):
+                        graph_cache = torch.load(beam_path, weights_only=False)
+                        if (
+                            "tissue_node_indices" not in graph_cache
+                            or "node_props" not in graph_cache
+                            or "cpress" not in graph_cache.get("frame_tensors", {})
+                        ):
+                            print(
+                                f"Beam cache outdated for RUN-{run_id} — rebuilding ..."
+                            )
+                            graph_cache = _apply_beam_reduction(
+                                raw_cache, beam_spacing_mm
+                            )
+                            _atomic_torch_save(graph_cache, beam_path)
+                    else:
+                        graph_cache = _apply_beam_reduction(
+                            raw_cache, beam_spacing_mm
+                        )
+                        _atomic_torch_save(graph_cache, beam_path)
+                else:
+                    graph_cache = raw_cache
+
+                if self.edge_index is None:
+                    self.edge_index = graph_cache["edge_index"]
+                    self.edge_type_onehot = graph_cache["edge_type_onehot"]
+                    self.n_nodes = int(self.edge_index.max().item()) + 1
+
+                    if beam_spacing_mm > 0.0:
+                        n_nodes_orig = int(graph_cache["n_nodes_orig"])
+                        n_tissue_bc = int(graph_cache["n_tissue"])
+                        tissue_idx_np = graph_cache["tissue_node_indices"].numpy()
+                        needle_idx_np = graph_cache["needle_node_indices"].numpy()
+                        beam_asgn_np = graph_cache["beam_assignment"].numpy()
+                        old_to_new = np.full(n_nodes_orig, -1, dtype=np.int64)
+                        for new_i, old_i in enumerate(tissue_idx_np):
+                            old_to_new[old_i] = new_i
+                        for j, old_i in enumerate(needle_idx_np):
+                            old_to_new[old_i] = n_tissue_bc + int(beam_asgn_np[j])
+                        self._beam_old_to_new = old_to_new
+
+                self._run_data.append(
+                    {
+                        "frame_tensors": {
+                            key: graph_cache["frame_tensors"][key]
+                            for key in self.INPUT_KEYS
+                        },
+                        "world_edges": raw_cache["world_edges"],
+                        "node_props": graph_cache["node_props"],
+                    }
+                )
+                for t in range(n_frames_run - 1):
+                    self._samples.append((r_idx, t))
+
+        else:
+            # ---- Single-run (legacy) mode -----------------------------------
+            vtu_files = _sorted_vtu_files(data_dir)
+            n_frames = len(vtu_files)
+            n_pairs = n_frames - 1
+
+            n_train = int(n_pairs * train_fraction)
+            n_val = int(n_pairs * val_fraction)
+            split_ranges = {
+                "train": (0, n_train),
+                "validation": (n_train, n_train + n_val),
+                "test": (n_train + n_val, n_pairs),
+            }
+            start, end = split_ranges[split]
+            n_pairs_split = end - start
+
+            if n_pairs_split == 0:
+                raise ValueError(
+                    f"No pairs in '{split}' split for {n_frames} frames."
+                )
+
+            raw_cache_path = os.path.join(cache_dir or data_dir, _CACHE_FILENAME)
+            if os.path.exists(raw_cache_path):
+                raw_cache = torch.load(raw_cache_path, weights_only=False)
+                if (
+                    "world_edges" not in raw_cache
+                    or "node_props" not in raw_cache
+                    or "cpress" not in raw_cache.get("frame_tensors", {})
+                ):
+                    print("Cache outdated — regenerating ...")
+                    raw_cache = _process_all_frames(vtu_files)
+                    _atomic_torch_save(raw_cache, raw_cache_path)
+                    for f in os.listdir(cache_dir or data_dir):
+                        if f.startswith("beam_cache_") or f.startswith("bsms_cache_"):
+                            os.remove(os.path.join(cache_dir or data_dir, f))
+            else:
                 raw_cache = _process_all_frames(vtu_files)
                 _atomic_torch_save(raw_cache, raw_cache_path)
-                # Also remove stale beam / BSMS caches
-                for f in os.listdir(cache_dir or data_dir):
-                    if f.startswith("beam_cache_") or f.startswith("bsms_cache_"):
-                        os.remove(os.path.join(cache_dir or data_dir, f))
-        else:
-            raw_cache = _process_all_frames(vtu_files)
-            _atomic_torch_save(raw_cache, raw_cache_path)
-            print(f"Cache saved to {raw_cache_path}")
+                print(f"Cache saved to {raw_cache_path}")
 
-        # ---- Optional beam reduction for needle nodes ----
-        # Note: if you change beam_spacing_mm, delete stats files so they are
-        # recomputed from the new graph (beam nodes have averaged features).
-        self._beam_old_to_new: Optional[np.ndarray] = None
-        if beam_spacing_mm > 0.0:
-            bname = f"beam_cache_b{beam_spacing_mm:.2g}mm.pt"
-            beam_path = os.path.join(cache_dir or data_dir, bname)
-            if os.path.exists(beam_path):
-                beam_cache = torch.load(beam_path, weights_only=False)
-                if (
-                    "tissue_node_indices" not in beam_cache
-                    or "node_props" not in beam_cache
-                    or "cpress" not in beam_cache.get("frame_tensors", {})
-                ):
-                    print("Beam cache outdated — rebuilding ...")
+            if beam_spacing_mm > 0.0:
+                bname = f"beam_cache_b{beam_spacing_mm:.2g}mm.pt"
+                beam_path = os.path.join(cache_dir or data_dir, bname)
+                if os.path.exists(beam_path):
+                    beam_cache = torch.load(beam_path, weights_only=False)
+                    if (
+                        "tissue_node_indices" not in beam_cache
+                        or "node_props" not in beam_cache
+                        or "cpress" not in beam_cache.get("frame_tensors", {})
+                    ):
+                        print("Beam cache outdated — rebuilding ...")
+                        beam_cache = _apply_beam_reduction(raw_cache, beam_spacing_mm)
+                        _atomic_torch_save(beam_cache, beam_path)
+                else:
+                    print(
+                        f"Building beam representation ({beam_spacing_mm:.2g} mm/node)..."
+                    )
                     beam_cache = _apply_beam_reduction(raw_cache, beam_spacing_mm)
                     _atomic_torch_save(beam_cache, beam_path)
+                    print(f"Beam cache saved to {beam_path}")
+
+                n_nodes_orig = int(beam_cache["n_nodes_orig"])
+                n_tissue_bc = int(beam_cache["n_tissue"])
+                tissue_idx_np = beam_cache["tissue_node_indices"].numpy()
+                needle_idx_np = beam_cache["needle_node_indices"].numpy()
+                beam_asgn_np = beam_cache["beam_assignment"].numpy()
+                old_to_new = np.full(n_nodes_orig, -1, dtype=np.int64)
+                for new_i, old_i in enumerate(tissue_idx_np):
+                    old_to_new[old_i] = new_i
+                for j, old_i in enumerate(needle_idx_np):
+                    old_to_new[old_i] = n_tissue_bc + int(beam_asgn_np[j])
+                self._beam_old_to_new = old_to_new
+                graph_cache = beam_cache
             else:
-                print(f"Building beam representation ({beam_spacing_mm:.2g} mm/node)...")
-                beam_cache = _apply_beam_reduction(raw_cache, beam_spacing_mm)
-                _atomic_torch_save(beam_cache, beam_path)
-                print(f"Beam cache saved to {beam_path}")
+                graph_cache = raw_cache
 
-            # Build old-to-new index map for world edge remapping in _build_graph
-            n_nodes_orig = int(beam_cache["n_nodes_orig"])
-            n_tissue_bc = int(beam_cache["n_tissue"])
-            tissue_idx_np = beam_cache["tissue_node_indices"].numpy()
-            needle_idx_np = beam_cache["needle_node_indices"].numpy()
-            beam_asgn_np = beam_cache["beam_assignment"].numpy()
-            old_to_new = np.full(n_nodes_orig, -1, dtype=np.int64)
-            for new_i, old_i in enumerate(tissue_idx_np):
-                old_to_new[old_i] = new_i
-            for j, old_i in enumerate(needle_idx_np):
-                old_to_new[old_i] = n_tissue_bc + int(beam_asgn_np[j])
-            self._beam_old_to_new = old_to_new
+            self.edge_index = graph_cache["edge_index"]
+            self.edge_type_onehot = graph_cache["edge_type_onehot"]
+            self.n_nodes = int(self.edge_index.max().item()) + 1
 
-            graph_cache = beam_cache
-        else:
-            graph_cache = raw_cache
+            frames_needed = list(range(start, end + 1))
+            self._run_data.append(
+                {
+                    "frame_tensors": {
+                        key: graph_cache["frame_tensors"][key][frames_needed]
+                        for key in self.INPUT_KEYS
+                    },
+                    "world_edges": [raw_cache["world_edges"][i] for i in frames_needed],
+                    "node_props": graph_cache["node_props"],
+                }
+            )
+            for t in range(n_pairs_split):
+                self._samples.append((0, t))
 
-        self.edge_index: torch.Tensor = graph_cache["edge_index"]
-        self.edge_type_onehot: torch.Tensor = graph_cache["edge_type_onehot"]
-        self.n_nodes: int = int(self.edge_index.max().item()) + 1
-
-        # Static material node properties (constant across frames)
-        self._node_props: Dict[str, torch.Tensor] = graph_cache["node_props"]
-
-        # Keep only the frames required for this split in memory
-        frames_needed = sorted(set(range(start, end + 1)))
-        self._frame_tensors: Dict[str, torch.Tensor] = {
-            key: graph_cache["frame_tensors"][key][frames_needed] for key in self.INPUT_KEYS
-        }
-        # Per-frame world edges from raw cache (original node indices)
-        self._world_edges: List[Tuple[torch.Tensor, torch.Tensor]] = [
-            raw_cache["world_edges"][i] for i in frames_needed
-        ]
-        self._pair_local = [p - start for p in self._pair_indices]
-
-        # ---- Spatial partitioning ----
+        # ---- Spatial partitioning (topology-based, use first run) ----------
         self._num_parts = max(1, num_parts)
         if self._num_parts > 1:
-            coord_ref = graph_cache["frame_tensors"]["coord"][0]
+            coord_ref = self._run_data[0]["frame_tensors"]["coord"][0]
             self._partitions = _spatial_partitions(coord_ref, self._num_parts)
         else:
             self._partitions = [torch.arange(self.n_nodes)]
 
-        self.length = n_pairs_split * self._num_parts
+        self.length = len(self._samples) * self._num_parts
 
-        # ---- Optional BSMS multi-scale structure (one set per partition) ----
-        # BSMS is precomputed on the fixed HEX topology only; per-frame world
-        # edges are handled separately in _build_graph and are excluded from
-        # the coarser levels (they are present in the vanilla processor steps).
+        # ---- Optional BSMS multi-scale structure ----------------------------
         self._use_bsms = use_bsms
         self._bsms_data: Optional[List[Tuple]] = None
         if use_bsms:
@@ -760,18 +903,24 @@ class NeedleTissueDataset(Dataset):
                 print(f"Loading BSMS cache from {bsms_cache_path} ...")
                 self._bsms_data = torch.load(bsms_cache_path, weights_only=False)
             else:
-                print(f"Precomputing bi-stride structures for {self._num_parts} partitions...")
-                coord_ref = graph_cache["frame_tensors"]["coord"][0]
+                print(
+                    f"Precomputing bi-stride structures for {self._num_parts} partitions..."
+                )
+                coord_ref = self._run_data[0]["frame_tensors"]["coord"][0]
                 self._bsms_data = _precompute_bsms(
-                    self._partitions, self.edge_index, coord_ref,
-                    self.n_nodes, num_bsms_levels,
+                    self._partitions,
+                    self.edge_index,
+                    coord_ref,
+                    self.n_nodes,
+                    num_bsms_levels,
                 )
                 _atomic_torch_save(self._bsms_data, bsms_cache_path)
                 print(f"BSMS cache saved to {bsms_cache_path}")
 
         print(
-            f"'{split}' split ready: {n_pairs_split} pairs × {self._num_parts} parts "
-            f"= {self.length} samples | {self.edge_index.shape[1]} total edges."
+            f"'{split}' split ready: {len(self._samples)} pairs × {self._num_parts} parts "
+            f"= {self.length} samples | {len(self._run_data)} run(s) "
+            f"| {self.edge_index.shape[1]} total edges."
         )
 
         # ---- Normalisation statistics ----
@@ -791,29 +940,32 @@ class NeedleTissueDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx: int):
-        pair_idx = idx // self._num_parts
+        sample_idx = idx // self._num_parts
         part_idx = idx % self._num_parts
-        graph = self._build_graph(pair_idx, part_idx)
+        graph = self._build_graph(sample_idx, part_idx)
         if not self._use_bsms:
             return graph
         ms_edges, ms_ids = self._bsms_data[part_idx]
         return {"graph": graph, "ms_edges": ms_edges, "ms_ids": ms_ids}
 
-    def _build_graph(self, pair_idx: int, part_idx: int) -> Data:
-        t_local = self._pair_local[pair_idx]
+    def _build_graph(self, sample_idx: int, part_idx: int) -> Data:
+        r_idx, t_local = self._samples[sample_idx]
+        run = self._run_data[r_idx]
+        ft = run["frame_tensors"]
+        node_props = run["node_props"]
         t1_local = t_local + 1
-        part_nodes = self._partitions[part_idx]  # sorted global indices
+        part_nodes = self._partitions[part_idx]
 
-        coord = self._frame_tensors["coord"][t_local]  # (N, 3)
+        coord = ft["coord"][t_local]
 
         x_parts = []
         for key in self.INPUT_KEYS:
-            feat = self._frame_tensors[key][t_local]
+            feat = ft[key][t_local]
             mean = self._node_stats[f"{key}_mean"]
             std = self._node_stats[f"{key}_std"]
             x_parts.append((feat - mean) / std)
         for key in self.STATIC_PROP_KEYS:
-            feat = self._node_props[key]
+            feat = node_props[key]
             mean = self._node_stats[f"{key}_mean"]
             std = self._node_stats[f"{key}_std"]
             x_parts.append((feat - mean) / std)
@@ -822,11 +974,11 @@ class NeedleTissueDataset(Dataset):
         # Target: normalised increment  Δf = f_{t+1} - f_t
         y_parts = []
         for key in self.TARGET_KEYS:
-            delta = self._frame_tensors[key][t1_local] - self._frame_tensors[key][t_local]
+            delta = ft[key][t1_local] - ft[key][t_local]
             mean = self._target_stats[f"{key}_mean"]
             std = self._target_stats[f"{key}_std"]
             y_parts.append((delta - mean) / std)
-        y = torch.cat(y_parts, dim=-1)  # (N, 9)
+        y = torch.cat(y_parts, dim=-1)
 
         # Fixed HEX subgraph for this spatial partition
         sub_ei_hex, sub_et_hex = subgraph(
@@ -834,8 +986,8 @@ class NeedleTissueDataset(Dataset):
             relabel_nodes=True, num_nodes=self.n_nodes,
         )
 
-        # Per-frame world edges (original node indices from raw cache)
-        world_ei, world_et = self._world_edges[t_local]
+        # Per-frame world edges for this run (original node indices)
+        world_ei, world_et = run["world_edges"][t_local]
 
         # Optionally remap original needle/tissue indices → beam-reduced indices
         if self._beam_old_to_new is not None and world_ei.shape[1] > 0:
@@ -882,31 +1034,38 @@ class NeedleTissueDataset(Dataset):
     def _compute_stats(
         self,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Compute per-feature mean and std over all training input frames."""
+        """Compute per-feature mean/std across all training samples and runs."""
+        key_data = {key: [] for key in self.INPUT_KEYS}
+        prop_data = {key: [] for key in self.STATIC_PROP_KEYS}
+        tgt_data = {key: [] for key in self.TARGET_KEYS}
+
+        for r_idx, run in enumerate(self._run_data):
+            ft = run["frame_tensors"]
+            node_props = run["node_props"]
+            pair_locals = [t for r, t in self._samples if r == r_idx]
+            t1_locals = [t + 1 for t in pair_locals]
+
+            for key in self.INPUT_KEYS:
+                key_data[key].append(ft[key][pair_locals])
+            for key in self.STATIC_PROP_KEYS:
+                prop_data[key].append(node_props[key])
+            for key in self.TARGET_KEYS:
+                tgt_data[key].append(ft[key][t1_locals] - ft[key][pair_locals])
+
         node_stats: Dict[str, torch.Tensor] = {}
-        target_stats: Dict[str, torch.Tensor] = {}
-
         for key, dim in zip(self.INPUT_KEYS, self.INPUT_DIMS):
-            data = self._frame_tensors[key][self._pair_local]
-            flat = data.reshape(-1, dim)
+            flat = torch.cat(key_data[key], dim=0).reshape(-1, dim).float()
             node_stats[f"{key}_mean"] = flat.mean(0)
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 
-        # Static material properties: stats over nodes only (no time dimension)
         for key, dim in zip(self.STATIC_PROP_KEYS, self.STATIC_PROP_DIMS):
-            flat = self._node_props[key].float()
+            flat = torch.cat(prop_data[key], dim=0).float()
             node_stats[f"{key}_mean"] = flat.mean(0)
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 
-        # Target stats are computed on increments Δf = f_{t+1} - f_t so that
-        # normalisation matches what _build_graph produces.
-        t1_locals = [p + 1 for p in self._pair_local]
+        target_stats: Dict[str, torch.Tensor] = {}
         for key in self.TARGET_KEYS:
-            delta = (
-                self._frame_tensors[key][t1_locals]
-                - self._frame_tensors[key][self._pair_local]
-            )
-            flat = delta.reshape(-1, 3)
+            flat = torch.cat(tgt_data[key], dim=0).reshape(-1, 3).float()
             target_stats[f"{key}_mean"] = flat.mean(0)
             target_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 

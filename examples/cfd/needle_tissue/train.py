@@ -67,6 +67,7 @@ class MGNTrainer:
         self.dist = dist
         self.amp = cfg.amp
         self.use_bsms = cfg.use_bsms
+        self.noise_std = float(cfg.get("noise_std", 0.0))
 
         stats_dir = to_absolute_path(cfg.stats_dir)
         data_dir = to_absolute_path(cfg.data_dir)
@@ -82,6 +83,7 @@ class MGNTrainer:
             stats_path=stats_dir,
             cache_dir=data_dir,
             beam_spacing_mm=cfg.beam_spacing_mm,
+            timestep_stride=cfg.get("timestep_stride", 1),
         )
         # Validation: full graph, same BSMS setting as training (no-grad keeps memory low)
         val_dataset = NeedleTissueDataset(
@@ -95,6 +97,7 @@ class MGNTrainer:
             stats_path=stats_dir,
             cache_dir=data_dir,
             beam_spacing_mm=cfg.beam_spacing_mm,
+            timestep_stride=cfg.get("timestep_stride", 1),
         )
 
         train_sampler = DistributedSampler(
@@ -218,11 +221,20 @@ class MGNTrainer:
 
     def forward(self, graph, ms_edges=(), ms_ids=()):
         with autocast(device_type=self.dist.device.type, enabled=self.amp):
+            x, y = graph.x, graph.y
+            if self.noise_std > 0.0:
+                # Add Gaussian noise to normalised u/v/a inputs (indices 3:12).
+                # Subtract same noise from target so the model learns to predict
+                # the true increment from the noisy current state.
+                noise = torch.randn(x.shape[0], 9, device=x.device, dtype=x.dtype) * self.noise_std
+                x = x.clone()
+                x[:, 3:12] = x[:, 3:12] + noise
+                y = y - noise
             pred = self.model(
-                graph.x, graph.edge_attr, graph,
+                x, graph.edge_attr, graph,
                 ms_edges=ms_edges, ms_ids=ms_ids,
             )
-            return self.criterion(pred, graph.y)
+            return self.criterion(pred, y)
 
     def backward(self, loss):
         if self.amp:

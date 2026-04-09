@@ -21,7 +21,7 @@ hydra:
     dir: ./outputs/
 
 # Paths
-data_dir: "../../../RUN-2"
+data_dir: "/home/nathanielhoffman/Desktop/cel/physicsnemo/RUN-2"
 ckpt_path: "./checkpoints"
 stats_dir: "./stats"
 
@@ -32,6 +32,14 @@ cuda_devices: null
 # Dataset split fractions
 train_fraction: 0.8
 val_fraction: 0.1
+
+# -------------------------
+# Multi-run dataset
+# -------------------------
+# For multi-run datasets (files named *-RUN-N_T.vtu), runs are split into
+# train/val/test.  timestep_stride subsamples frames within each run:
+# stride=1 uses all frames; stride=10 uses every 10th frame.
+timestep_stride: 10
 
 # -------------------------
 # Spatial cropping (the key difference from needle_tissue/)
@@ -83,12 +91,15 @@ aggregation: "sum"
 # -------------------------
 # Training
 # -------------------------
-epochs: 300
+epochs: 350
 batch_size: 1
 num_workers: 2
 lr: 1e-4
 amp: false
 jit: false
+# Gaussian noise std added to normalised u/v/a inputs during training.
+# Forces the model to denoise rollout drift.  0.0 = disabled.  Try 3e-3.
+noise_std: 3e-3
 
 val_every: 10
 save_every: 50
@@ -99,6 +110,8 @@ save_every: 50
 infer_start_frame: null
 n_rollout: 20
 infer_output_dir: "./inference_output"
+# For multi-run datasets: which run to infer on.  null = first test run.
+infer_run_id: null
 # Consensus filter: fraction of per-needle-node displacement not correlated
 # with neighbours to remove.  0.0 = disabled.  Try 0.9–0.99.
 consensus_attenuation: 0.0

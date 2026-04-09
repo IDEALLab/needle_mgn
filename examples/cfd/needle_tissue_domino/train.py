@@ -81,6 +81,7 @@ def main(cfg: DictConfig) -> None:
         val_fraction=cfg.val_fraction,
         stats_path=stats_dir,
         num_sample_nodes=cfg.get("num_sample_nodes", None),
+        timestep_stride=cfg.get("timestep_stride", 1),
     )
     val_dataset = NeedleTissueDominoDataset(
         data_dir=data_dir,
@@ -90,6 +91,7 @@ def main(cfg: DictConfig) -> None:
         val_fraction=cfg.val_fraction,
         stats_path=stats_dir,
         num_sample_nodes=cfg.get("num_sample_nodes", None),
+        timestep_stride=cfg.get("timestep_stride", 1),
     )
 
     train_sampler = DistributedSampler(
@@ -130,6 +132,8 @@ def main(cfg: DictConfig) -> None:
 
     load_checkpoint(ckpt_dir, models=model, optimizer=optimizer, device=dist.device)
 
+    noise_std = float(cfg.get("noise_std", 0.0))
+
     # ---- Training loop ------------------------------------------------------
     for epoch in range(cfg.epochs):
         train_sampler.set_epoch(epoch)
@@ -140,6 +144,15 @@ def main(cfg: DictConfig) -> None:
             batch = {k: v.to(dist.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
             y_true = batch.pop("y")                              # (1, N, 9)
+
+            if noise_std > 0.0:
+                # Add Gaussian noise to normalised u/v/a in state_vol (indices 0:9).
+                # Subtract same noise from target so the model learns to predict
+                # the true increment from the noisy current state.
+                noise = torch.randn_like(batch["state_vol"][..., :9]) * noise_std
+                batch["state_vol"] = batch["state_vol"].clone()
+                batch["state_vol"][..., :9] = batch["state_vol"][..., :9] + noise
+                y_true = y_true - noise
 
             optimizer.zero_grad()
             with autocast("cuda", enabled=cfg.amp):

@@ -23,7 +23,7 @@ volume_mesh_centers    : All nodes (needle + tissue) as query points
 sdf_nodes              : Min distance from each node to the nearest needle node
 pos_volume_closest     : Position of that nearest needle node
 pos_volume_center_of_mass : Needle centroid broadcast to all nodes
-state_vol              : Normalised per-node state (u, v, a, evf, s, cf, cpress,
+state_vol              : Normalised per-node state (u, v, a, evf, s, cpress,
                          mat_E, mat_c10, mat_density, mat_fiber, mat_k1, mat_k2,
                          mat_kappa, mat_nu)
 grid / sdf_grid        : Regular bounding-box grid with needle-SDF values (cached)
@@ -33,7 +33,6 @@ The geometry convolution sees the needle point cloud (xyz only, input_features=3
 Per-node physical state is injected separately into the volume position encoder
 via the node_state_dim_vol extension added to DoMINO.
 
-CFORCE defaults to zeros until VTU files include it.
 CPRESS defaults to zeros until VTU files include it.
 Static material properties (mat_E, mat_c10, etc.) default to zeros if absent.
 """
@@ -61,6 +60,8 @@ _spec.loader.exec_module(_cropped)
 _get_needle_tissue_node_sets = _cropped._get_needle_tissue_node_sets
 _process_all_frames = _cropped._process_all_frames
 _sorted_vtu_files = _cropped._sorted_vtu_files
+_is_multi_run = _cropped._is_multi_run
+_group_vtu_by_run = _cropped._group_vtu_by_run
 from physicsnemo.datapipes.gnn.utils import load_json
 
 
@@ -68,14 +69,14 @@ from physicsnemo.datapipes.gnn.utils import load_json
 # Constants
 # ---------------------------------------------------------------------------
 
-# Dynamic state features per node: u(3) v(3) a(3) evf(1) s(6) cf(3) cpress(1) = 20
-STATE_KEYS = ["u", "v", "a", "evf", "s", "cf", "cpress"]
-STATE_DIMS = [3, 3, 3, 1, 6, 3, 1]
+# Dynamic state features per node: u(3) v(3) a(3) evf(1) s(6) cpress(1) = 17
+STATE_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
+STATE_DIMS = [3, 3, 3, 1, 6, 1]
 # Static material properties: mat_E(1) mat_c10(1) mat_density(1) mat_fiber(3)
 #                              mat_k1(1) mat_k2(1) mat_kappa(1) mat_nu(1) = 10
 STATIC_PROP_KEYS = ["mat_E", "mat_c10", "mat_density", "mat_fiber", "mat_k1", "mat_k2", "mat_kappa", "mat_nu"]
 STATIC_PROP_DIMS = [1, 1, 1, 3, 1, 1, 1, 1]
-NODE_STATE_DIM = sum(STATE_DIMS) + sum(STATIC_PROP_DIMS)  # 20 + 10 = 30
+NODE_STATE_DIM = sum(STATE_DIMS) + sum(STATIC_PROP_DIMS)  # 17 + 10 = 27
 
 _DOMINO_CACHE_FILE = "domino_cache.pt"
 _RAW_CACHE_FILE = "preprocessed_cache.pt"
@@ -148,7 +149,6 @@ def _build_domino_cache(
       * Per-frame SDF on that grid (distance to nearest needle node)
       * Per-frame SDF at all mesh nodes
       * Per-frame closest needle-node position for each mesh node
-      * Per-frame CFORCE arrays (zeros if not present in VTU)
 
     The grid is computed from the union of all-frame node positions so it
     covers the full insertion trajectory.
@@ -173,7 +173,6 @@ def _build_domino_cache(
     frame_sdf_grid = np.empty((n_frames, *grid_res), dtype=np.float32)
     frame_sdf_nodes = np.empty((n_frames, n_nodes), dtype=np.float32)
     frame_closest = np.empty((n_frames, n_nodes, 3), dtype=np.float32)
-    frame_cf = np.zeros((n_frames, n_nodes, 3), dtype=np.float32)
 
     for i in range(n_frames):
         if (i + 1) % 20 == 0:
@@ -192,18 +191,6 @@ def _build_domino_cache(
         frame_sdf_nodes[i] = dist.astype(np.float32)
         frame_closest[i] = needle_pos[nn_idx].astype(np.float32)
 
-    # CFORCE: try to load from VTU files
-    print("  Loading CFORCE from VTU files (zeros if absent) ...")
-    for i, path in enumerate(vtu_files):
-        mesh = pv.read(path)
-        if "CFORCE" in mesh.point_data:
-            cf = mesh.point_data["CFORCE"].astype(np.float32)
-            if cf.ndim == 1:
-                cf = cf[:, None]  # scalar → (N, 1), pad to 3
-                cf = np.concatenate([cf, np.zeros((cf.shape[0], 2), dtype=np.float32)], axis=1)
-            frame_cf[i] = cf[:, :3]
-        # else: remains zeros
-
     cache = {
         "needle_idx": torch.from_numpy(needle_idx),
         "tissue_idx": torch.from_numpy(tissue_idx),
@@ -211,7 +198,6 @@ def _build_domino_cache(
         "frame_sdf_grid": torch.from_numpy(frame_sdf_grid),  # (F, Nx, Ny, Nz)
         "frame_sdf_nodes": torch.from_numpy(frame_sdf_nodes),  # (F, N)
         "frame_closest": torch.from_numpy(frame_closest),   # (F, N, 3)
-        "frame_cf": torch.from_numpy(frame_cf),             # (F, N, 3)
         "grid_res": grid_res,
         "grid_min": torch.from_numpy(global_min.astype(np.float32)),
         "grid_max": torch.from_numpy(global_max.astype(np.float32)),
@@ -259,6 +245,7 @@ class NeedleTissueDominoDataset(Dataset):
         val_fraction: float = 0.1,
         stats_path: str = ".",
         num_sample_nodes: Optional[int] = None,
+        timestep_stride: int = 1,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"Invalid split: '{split}'")
@@ -267,79 +254,185 @@ class NeedleTissueDominoDataset(Dataset):
         self.num_sample_nodes = num_sample_nodes
         os.makedirs(stats_path, exist_ok=True)
 
-        vtu_files = _sorted_vtu_files(data_dir)
-        n_frames = len(vtu_files)
-        n_pairs = n_frames - 1
+        # Per-run data; each entry has frame tensors, cf, sdf/closest, grid info
+        self._run_data: List[Dict] = []
+        # (run_local_idx, t_local) pairs
+        self._samples: List[Tuple[int, int]] = []
 
-        n_train = int(n_pairs * train_fraction)
-        n_val = int(n_pairs * val_fraction)
-        split_ranges = {
-            "train": (0, n_train),
-            "validation": (n_train, n_train + n_val),
-            "test": (n_train + n_val, n_pairs),
-        }
-        start, end = split_ranges[split]
-        self._pair_indices = list(range(start, end))
-        if not self._pair_indices:
-            raise ValueError(f"No pairs in '{split}' split for {n_frames} frames.")
+        # Shared topology info (set from first run)
+        self.needle_idx: Optional[np.ndarray] = None
+        self.tissue_idx: Optional[np.ndarray] = None
+        self.n_nodes: int = 0
 
-        # ---- Raw preprocessed cache (reused from needle_tissue_cropped) -----
-        raw_cache_path = os.path.join(data_dir, _RAW_CACHE_FILE)
-        if os.path.exists(raw_cache_path):
-            raw_cache = torch.load(raw_cache_path, weights_only=False)
-            if (
-                "world_edges" not in raw_cache
-                or "node_props" not in raw_cache
-                or "cpress" not in raw_cache.get("frame_tensors", {})
-            ):
-                print("Cache outdated — regenerating ...")
+        if _is_multi_run(data_dir):
+            # ---- Multi-run mode: split by run, subsample timesteps ----------
+            run_files = _group_vtu_by_run(data_dir, timestep_stride)
+            run_ids = list(run_files.keys())
+            n_runs = len(run_ids)
+
+            n_train_runs = max(1, int(n_runs * train_fraction))
+            n_val_runs = max(1, int(n_runs * val_fraction))
+
+            if split == "train":
+                split_run_ids = run_ids[:n_train_runs]
+            elif split == "validation":
+                split_run_ids = run_ids[n_train_runs : n_train_runs + n_val_runs]
+            else:
+                split_run_ids = run_ids[n_train_runs + n_val_runs :]
+
+            if not split_run_ids:
+                raise ValueError(
+                    f"No runs assigned to '{split}' split ({n_runs} total)."
+                )
+
+            print(
+                f"Multi-run '{split}' split: {len(split_run_ids)}/{n_runs} runs, "
+                f"stride={timestep_stride}"
+            )
+
+            for r_idx, run_id in enumerate(split_run_ids):
+                vtu_files = run_files[run_id]
+                n_frames_run = len(vtu_files)
+
+                raw_cache_path = os.path.join(
+                    data_dir, f"preprocessed_cache_RUN-{run_id}.pt"
+                )
+                if os.path.exists(raw_cache_path):
+                    raw_cache = torch.load(raw_cache_path, weights_only=False)
+                    if (
+                        "world_edges" not in raw_cache
+                        or "node_props" not in raw_cache
+                        or "cpress" not in raw_cache.get("frame_tensors", {})
+                    ):
+                        print(f"Cache outdated for RUN-{run_id} — regenerating ...")
+                        raw_cache = _process_all_frames(vtu_files)
+                        torch.save(raw_cache, raw_cache_path)
+                else:
+                    print(
+                        f"Building cache for RUN-{run_id} ({n_frames_run} frames)..."
+                    )
+                    raw_cache = _process_all_frames(vtu_files)
+                    torch.save(raw_cache, raw_cache_path)
+
+                domino_cache_path = os.path.join(
+                    data_dir,
+                    f"domino_cache_RUN-{run_id}_{grid_res[0]}x{grid_res[1]}x{grid_res[2]}.pt",
+                )
+                if os.path.exists(domino_cache_path):
+                    dc = torch.load(domino_cache_path, weights_only=False)
+                    if dc.get("grid_res") != grid_res:
+                        print(
+                            f"Grid mismatch for RUN-{run_id} — rebuilding DoMINO cache ..."
+                        )
+                        dc = _build_domino_cache(
+                            vtu_files, raw_cache, grid_res, domino_cache_path
+                        )
+                else:
+                    dc = _build_domino_cache(
+                        vtu_files, raw_cache, grid_res, domino_cache_path
+                    )
+
+                if self.needle_idx is None:
+                    self.needle_idx = dc["needle_idx"].numpy()
+                    self.tissue_idx = dc["tissue_idx"].numpy()
+                    self.n_nodes = raw_cache["frame_tensors"]["coord"].shape[1]
+
+                self._run_data.append(
+                    {
+                        "frame_tensors": raw_cache["frame_tensors"],
+                        "node_props": raw_cache["node_props"],
+                        "frame_sdf_grid": dc["frame_sdf_grid"],
+                        "frame_sdf_nodes": dc["frame_sdf_nodes"],
+                        "frame_closest": dc["frame_closest"],
+                        "grid_xyz": dc["grid_xyz"],
+                        "grid_min": dc["grid_min"],
+                        "grid_max": dc["grid_max"],
+                    }
+                )
+                for t in range(n_frames_run - 1):
+                    self._samples.append((r_idx, t))
+
+        else:
+            # ---- Single-run (legacy) mode -----------------------------------
+            vtu_files = _sorted_vtu_files(data_dir)
+            n_frames = len(vtu_files)
+            n_pairs = n_frames - 1
+
+            n_train = int(n_pairs * train_fraction)
+            n_val = int(n_pairs * val_fraction)
+            split_ranges = {
+                "train": (0, n_train),
+                "validation": (n_train, n_train + n_val),
+                "test": (n_train + n_val, n_pairs),
+            }
+            start, end = split_ranges[split]
+            if start == end:
+                raise ValueError(
+                    f"No pairs in '{split}' split for {n_frames} frames."
+                )
+
+            raw_cache_path = os.path.join(data_dir, _RAW_CACHE_FILE)
+            if os.path.exists(raw_cache_path):
+                raw_cache = torch.load(raw_cache_path, weights_only=False)
+                if (
+                    "world_edges" not in raw_cache
+                    or "node_props" not in raw_cache
+                    or "cpress" not in raw_cache.get("frame_tensors", {})
+                ):
+                    print("Cache outdated — regenerating ...")
+                    raw_cache = _process_all_frames(vtu_files)
+                    torch.save(raw_cache, raw_cache_path)
+            else:
                 raw_cache = _process_all_frames(vtu_files)
                 torch.save(raw_cache, raw_cache_path)
-        else:
-            raw_cache = _process_all_frames(vtu_files)
-            torch.save(raw_cache, raw_cache_path)
 
-        self._frame_tensors: Dict[str, torch.Tensor] = raw_cache["frame_tensors"]
-        self._node_props: Dict[str, torch.Tensor] = raw_cache["node_props"]
+            domino_cache_path = os.path.join(
+                data_dir,
+                f"domino_cache_{grid_res[0]}x{grid_res[1]}x{grid_res[2]}.pt",
+            )
+            if os.path.exists(domino_cache_path):
+                dc = torch.load(domino_cache_path, weights_only=False)
+                if dc.get("grid_res") != grid_res:
+                    print("Grid resolution mismatch — rebuilding DoMINO cache ...")
+                    dc = _build_domino_cache(
+                        vtu_files, raw_cache, grid_res, domino_cache_path
+                    )
+            else:
+                dc = _build_domino_cache(
+                    vtu_files, raw_cache, grid_res, domino_cache_path
+                )
 
-        # ---- DCEL-DoMINO cache (SDF grid, closest points, CFORCE) -----------
-        domino_cache_path = os.path.join(
-            data_dir, f"domino_cache_{grid_res[0]}x{grid_res[1]}x{grid_res[2]}.pt"
-        )
-        if os.path.exists(domino_cache_path):
-            dc = torch.load(domino_cache_path, weights_only=False)
-            if dc.get("grid_res") != grid_res:
-                print("Grid resolution mismatch — rebuilding DoMINO cache ...")
-                dc = _build_domino_cache(vtu_files, raw_cache, grid_res, domino_cache_path)
-        else:
-            dc = _build_domino_cache(vtu_files, raw_cache, grid_res, domino_cache_path)
+            self.needle_idx = dc["needle_idx"].numpy()
+            self.tissue_idx = dc["tissue_idx"].numpy()
+            self.n_nodes = raw_cache["frame_tensors"]["coord"].shape[1]
 
-        self.needle_idx: np.ndarray = dc["needle_idx"].numpy()
-        self.tissue_idx: np.ndarray = dc["tissue_idx"].numpy()
-        self.n_nodes: int = self._frame_tensors["coord"].shape[1]
-        self._grid_xyz: torch.Tensor = dc["grid_xyz"]           # (Nx, Ny, Nz, 3)
-        self._frame_sdf_grid: torch.Tensor = dc["frame_sdf_grid"]
-        self._frame_sdf_nodes: torch.Tensor = dc["frame_sdf_nodes"]
-        self._frame_closest: torch.Tensor = dc["frame_closest"]
-        self._frame_cf: torch.Tensor = dc["frame_cf"]
-        self._grid_min: torch.Tensor = dc["grid_min"]
-        self._grid_max: torch.Tensor = dc["grid_max"]
+            self._run_data.append(
+                {
+                    "frame_tensors": raw_cache["frame_tensors"],
+                    "node_props": raw_cache["node_props"],
+                    "frame_sdf_grid": dc["frame_sdf_grid"],
+                    "frame_sdf_nodes": dc["frame_sdf_nodes"],
+                    "frame_closest": dc["frame_closest"],
+                    "frame_cf": dc["frame_cf"],
+                    "grid_xyz": dc["grid_xyz"],
+                    "grid_min": dc["grid_min"],
+                    "grid_max": dc["grid_max"],
+                }
+            )
+            for t in range(start, end):
+                self._samples.append((0, t - start))
 
-        # Restrict to frames needed for this split
-        frames_needed = sorted(set(range(start, end + 1)))
-        self._pair_local = [p - start for p in self._pair_indices]
-        self._frame_offset = start
-        self.length = len(self._pair_indices)
+        self.length = len(self._samples)
 
         print(
             f"'{split}' split: {self.length} samples | "
             f"{len(self.needle_idx)} needle + {len(self.tissue_idx)} tissue nodes | "
-            f"grid {grid_res}"
+            f"grid {grid_res} | {len(self._run_data)} run(s)"
         )
 
         # ---- Normalisation statistics ---------------------------------------
         if split == "train":
-            self._node_stats, self._target_stats = self._compute_stats(frames_needed)
+            self._node_stats, self._target_stats = self._compute_stats()
             self._save_stats(stats_path)
         else:
             self._node_stats = load_json(os.path.join(stats_path, "domino_node_stats.json"))
@@ -353,55 +446,47 @@ class NeedleTissueDominoDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        t = self._pair_local[idx]          # local index into kept frame tensors
-        t_abs = self._pair_indices[idx]    # absolute frame index for SDF/closest
+        r_idx, t_local = self._samples[idx]
+        return self._build_data_dict(r_idx, t_local)
 
-        return self._build_data_dict(t, t_abs)
-
-    def _build_data_dict(self, t_local: int, t_abs: int) -> Dict[str, torch.Tensor]:
-        """Assemble the full data dict for one timestep pair."""
-        ft = self._frame_tensors
+    def _build_data_dict(self, r_idx: int, t_local: int) -> Dict[str, torch.Tensor]:
+        """Assemble the full data dict for one run/timestep pair."""
+        run = self._run_data[r_idx]
+        ft = run["frame_tensors"]
+        node_props = run["node_props"]
         t1_local = t_local + 1
 
-        coord = ft["coord"][t_local]                          # (N, 3)
-        needle_pos = coord[self.needle_idx]                   # (N_needle, 3)
-        needle_centroid = needle_pos.mean(dim=0, keepdim=True)  # (1, 3)
+        coord = ft["coord"][t_local]                              # (N, 3)
+        needle_pos = coord[self.needle_idx]                       # (N_needle, 3)
+        needle_centroid = needle_pos.mean(dim=0, keepdim=True)    # (1, 3)
 
-        # --- Normalise coordinates to [-1, 1] using global bounding box ------
-        vol_min = self._grid_min                              # (3,)
-        vol_max = self._grid_max                              # (3,)
+        vol_min = run["grid_min"]
+        vol_max = run["grid_max"]
         geo_coords = 2.0 * (needle_pos - vol_min) / (vol_max - vol_min) - 1.0
         vol_centers = 2.0 * (coord - vol_min) / (vol_max - vol_min) - 1.0
         centroid_norm = 2.0 * (needle_centroid - vol_min) / (vol_max - vol_min) - 1.0
 
-        # --- SDF and closest ------------------------------------------------
-        sdf_nodes = self._frame_sdf_nodes[t_abs].unsqueeze(-1)   # (N, 1)
-        pos_closest = self._frame_closest[t_abs]                  # (N, 3)
-        pos_com = centroid_norm.expand(self.n_nodes, -1)          # (N, 3)
-        sdf_grid = self._frame_sdf_grid[t_abs]                    # (Nx, Ny, Nz)
+        sdf_nodes = run["frame_sdf_nodes"][t_local].unsqueeze(-1)  # (N, 1)
+        pos_closest = run["frame_closest"][t_local]                # (N, 3)
+        pos_com = centroid_norm.expand(self.n_nodes, -1)           # (N, 3)
+        sdf_grid = run["frame_sdf_grid"][t_local]                  # (Nx, Ny, Nz)
 
-        # Normalise SDF to [0, 1] using the 99th-percentile of tissue SDF
-        # (so needle-adjacent tissue has sdf≈0, far tissue has sdf≈1)
         sdf_nodes = sdf_nodes / (sdf_nodes.max() + 1e-8)
         sdf_grid = sdf_grid / (sdf_grid.max() + 1e-8)
 
         # --- State features at all nodes (normalised) -----------------------
         state_parts = []
-        cf = self._frame_cf[t_abs]                               # (N, 3)
-        for key, dim in zip(STATE_KEYS, STATE_DIMS):
-            if key == "cf":
-                feat = cf
-            else:
-                feat = ft[key][t_local]
+        for key in STATE_KEYS:
+            feat = ft[key][t_local]
             mean = self._node_stats[f"{key}_mean"]
             std = self._node_stats[f"{key}_std"]
             state_parts.append((feat - mean) / std)
         for key in STATIC_PROP_KEYS:
-            feat = self._node_props[key]
+            feat = node_props[key]
             mean = self._node_stats[f"{key}_mean"]
             std = self._node_stats[f"{key}_std"]
             state_parts.append((feat - mean) / std)
-        state_vol = torch.cat(state_parts, dim=-1)               # (N, NODE_STATE_DIM)
+        state_vol = torch.cat(state_parts, dim=-1)                 # (N, NODE_STATE_DIM)
 
         # --- Target: normalised increments ----------------------------------
         y_parts = []
@@ -410,7 +495,7 @@ class NeedleTissueDominoDataset(Dataset):
             mean = self._target_stats[f"{key}_mean"]
             std = self._target_stats[f"{key}_std"]
             y_parts.append((delta - mean) / std)
-        y = torch.cat(y_parts, dim=-1)                           # (N, 9)
+        y = torch.cat(y_parts, dim=-1)                            # (N, 9)
 
         # --- Optional random node subsampling --------------------------------
         if self.num_sample_nodes is not None and self.num_sample_nodes < self.n_nodes:
@@ -424,41 +509,31 @@ class NeedleTissueDominoDataset(Dataset):
 
         # --- Assemble DoMINO data_dict (batch dim = 1) ----------------------
         def b(t: torch.Tensor) -> torch.Tensor:
-            """Add batch dimension."""
             return t.unsqueeze(0)
 
-        grid_3d = self._grid_xyz                                  # (Nx, Ny, Nz, 3)
-        # Normalise grid to [-1, 1]
+        grid_3d = run["grid_xyz"]
         grid_3d_norm = 2.0 * (grid_3d - vol_min) / (vol_max - vol_min) - 1.0
+        n_frames_run = run["frame_sdf_grid"].shape[0]
 
         data_dict = {
-            # Geometry (needle positions, Lagrangian body)
-            "geometry_coordinates": b(geo_coords),               # (1, N_needle, 3)
-            # Volume query points
-            "volume_mesh_centers": b(vol_centers),               # (1, N_nodes, 3)
-            # SDF and positional context at query nodes
-            "sdf_nodes": b(sdf_nodes),                           # (1, N_nodes, 1)
-            "pos_volume_closest": b(pos_closest),                # (1, N_nodes, 3)
-            "pos_volume_center_of_mass": b(pos_com),             # (1, N_nodes, 3)
-            # Per-node state features (DCEL extension)
-            "state_vol": b(state_vol),                           # (1, N_nodes, 19)
-            # Bounding box grid with SDF
-            "grid": b(grid_3d_norm),                             # (1, Nx, Ny, Nz, 3)
-            "sdf_grid": b(sdf_grid),                             # (1, Nx, Ny, Nz)
-            # DoMINO requires surf_grid even in volume-only mode — reuse volume grid
+            "geometry_coordinates": b(geo_coords),
+            "volume_mesh_centers": b(vol_centers),
+            "sdf_nodes": b(sdf_nodes),
+            "pos_volume_closest": b(pos_closest),
+            "pos_volume_center_of_mass": b(pos_com),
+            "state_vol": b(state_vol),
+            "grid": b(grid_3d_norm),
+            "sdf_grid": b(sdf_grid),
             "surf_grid": b(grid_3d_norm),
             "sdf_surf_grid": b(sdf_grid),
-            # Global conditioning: normalised timestep index
             "global_params_values": torch.tensor(
-                [[[float(t_abs)]]], dtype=torch.float32
+                [[[float(t_local)]]], dtype=torch.float32
             ),
             "global_params_reference": torch.tensor(
-                [[[float(self._frame_sdf_grid.shape[0] - 1)]]], dtype=torch.float32
+                [[[float(n_frames_run - 1)]]], dtype=torch.float32
             ),
-            # Bounding box for DoMINO coordinate normalisation
             "volume_min_max": torch.stack([vol_min, vol_max], dim=0).unsqueeze(0),
-            # Target
-            "y": b(y),                                           # (1, N_nodes, 9)
+            "y": b(y),
         }
         return data_dict
 
@@ -467,33 +542,40 @@ class NeedleTissueDominoDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _compute_stats(
-        self, frames: List[int]
+        self,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Compute mean/std over all training frames for state and target features."""
+        """Compute mean/std across all training runs and frames."""
+        key_data = {key: [] for key in STATE_KEYS}
+        prop_data = {key: [] for key in STATIC_PROP_KEYS}
+        tgt_data = {key: [] for key in self.TARGET_KEYS}
+
+        for r_idx, run in enumerate(self._run_data):
+            ft = run["frame_tensors"]
+            node_props = run["node_props"]
+            pair_locals = [t for r, t in self._samples if r == r_idx]
+            t1_locals = [t + 1 for t in pair_locals]
+
+            for key in STATE_KEYS:
+                key_data[key].append(ft[key][pair_locals])
+            for key in STATIC_PROP_KEYS:
+                prop_data[key].append(node_props[key])
+            for key in self.TARGET_KEYS:
+                tgt_data[key].append(ft[key][t1_locals] - ft[key][pair_locals])
+
         node_stats: Dict[str, torch.Tensor] = {}
-        target_stats: Dict[str, torch.Tensor] = {}
-
-        ft = self._frame_tensors
         for key, dim in zip(STATE_KEYS, STATE_DIMS):
-            if key == "cf":
-                data = self._frame_cf[frames]          # (F, N, 3)
-            else:
-                data = ft[key][frames]
-            flat = data.reshape(-1, dim).float()
+            flat = torch.cat(key_data[key], dim=0).reshape(-1, dim).float()
             node_stats[f"{key}_mean"] = flat.mean(0)
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 
-        # Static material properties: stats over nodes only (no time dimension)
         for key, dim in zip(STATIC_PROP_KEYS, STATIC_PROP_DIMS):
-            flat = self._node_props[key].float()
+            flat = torch.cat(prop_data[key], dim=0).float()
             node_stats[f"{key}_mean"] = flat.mean(0)
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 
-        pair_locals = [p - self._frame_offset for p in self._pair_indices]
-        t1_locals = [p + 1 for p in pair_locals]
+        target_stats: Dict[str, torch.Tensor] = {}
         for key in self.TARGET_KEYS:
-            delta = ft[key][t1_locals].float() - ft[key][pair_locals].float()
-            flat = delta.reshape(-1, 3)
+            flat = torch.cat(tgt_data[key], dim=0).reshape(-1, 3).float()
             target_stats[f"{key}_mean"] = flat.mean(0)
             target_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 

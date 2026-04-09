@@ -53,6 +53,7 @@ class MGNTrainer:
     def __init__(self, cfg: DictConfig, dist, rank_zero_logger):
         self.dist = dist
         self.amp = cfg.amp
+        self.noise_std = float(cfg.get("noise_std", 0.0))
 
         stats_dir = to_absolute_path(cfg.stats_dir)
         data_dir = to_absolute_path(cfg.data_dir)
@@ -70,6 +71,7 @@ class MGNTrainer:
             val_fraction=cfg.val_fraction,
             stats_path=stats_dir,
             cache_dir=data_dir,
+            timestep_stride=cfg.get("timestep_stride", 1),
         )
         val_dataset = NeedleTissueDataset(
             data_dir=data_dir,
@@ -83,6 +85,7 @@ class MGNTrainer:
             val_fraction=cfg.val_fraction,
             stats_path=stats_dir,
             cache_dir=data_dir,
+            timestep_stride=cfg.get("timestep_stride", 1),
         )
 
         train_sampler = DistributedSampler(
@@ -179,8 +182,17 @@ class MGNTrainer:
 
     def forward(self, graph):
         with autocast(device_type=self.dist.device.type, enabled=self.amp):
-            pred = self.model(graph.x, graph.edge_attr, graph)
-            return self.criterion(pred, graph.y)
+            x, y = graph.x, graph.y
+            if self.noise_std > 0.0:
+                # Add Gaussian noise to normalised u/v/a inputs (indices 3:12).
+                # Subtract same noise from target so the model learns to predict
+                # the true increment from the noisy current state.
+                noise = torch.randn(x.shape[0], 9, device=x.device, dtype=x.dtype) * self.noise_std
+                x = x.clone()
+                x[:, 3:12] = x[:, 3:12] + noise
+                y = y - noise
+            pred = self.model(x, graph.edge_attr, graph)
+            return self.criterion(pred, y)
 
     def backward(self, loss):
         if self.amp:
