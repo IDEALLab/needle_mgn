@@ -214,3 +214,13 @@ __marimo__/
 *.toml
 *.lock
 *.toml
+*.wandb
+CLAUDE.md
+examples/cfd/needle_tissue_cropped/outputs/wandb/wandb/run-20260409_085557-khqmw3id/run-khqmw3id.wandb
+*.done
+pyproject.toml
+*.pvd
+*.png
+*.csv
+examples/cfd/needle_tissue_domino/outputs/wandb/
+examples/cfd/needle_tissue_cropped/outputs/wandb/

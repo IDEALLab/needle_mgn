@@ -29,6 +29,7 @@ BSMS is not supported because the subgraph topology changes every training step.
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -249,53 +250,58 @@ def _load_node_props(mesh: pv.UnstructuredGrid) -> Dict[str, torch.Tensor]:
     return props
 
 
-def _process_all_frames(vtu_files: List[str]) -> Dict:
-    """Load all VTU frames, build fixed HEX topology and per-frame world edges."""
-    print(f"Processing {len(vtu_files)} VTU frames (result will be cached)...")
+def _process_single_frame(path: str) -> Dict:
+    """Load one VTU frame and return its per-frame features.
 
-    frame_tensors: Dict[str, List[np.ndarray]] = {
-        k: [] for k in ("coord", "u", "v", "a", "evf", "s", "cpress")
+    Called from ThreadPoolExecutor workers — must not mutate shared state.
+    """
+    mesh = pv.read(path)
+    n_nodes = mesh.n_points
+    evf_node, s_node = _cell_features_to_nodes(mesh, n_nodes)
+    if "CPRESS" in mesh.point_data:
+        cp = mesh.point_data["CPRESS"].astype(np.float32)
+        if cp.ndim == 1:
+            cp = cp[:, None]
+    else:
+        cp = np.zeros((n_nodes, 1), dtype=np.float32)
+    return {
+        "coord": mesh.points.astype(np.float32),
+        "u": mesh.point_data["U"].astype(np.float32),
+        "v": mesh.point_data["V"].astype(np.float32),
+        "a": mesh.point_data["A"].astype(np.float32),
+        "evf": evf_node,
+        "s": s_node,
+        "cpress": cp,
+        "world_edges": _extract_world_edges(mesh),
     }
-    world_edges: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    mesh_ref = None
-    node_props: Optional[Dict[str, torch.Tensor]] = None
 
-    for i, path in enumerate(vtu_files):
-        mesh = pv.read(path)
-        if mesh_ref is None:
-            mesh_ref = mesh
-            node_props = _load_node_props(mesh)
-        n_nodes = mesh.n_points
-        evf_node, s_node = _cell_features_to_nodes(mesh, n_nodes)
-        frame_tensors["coord"].append(mesh.points.astype(np.float32))
-        frame_tensors["u"].append(mesh.point_data["U"].astype(np.float32))
-        frame_tensors["v"].append(mesh.point_data["V"].astype(np.float32))
-        frame_tensors["a"].append(mesh.point_data["A"].astype(np.float32))
-        frame_tensors["evf"].append(evf_node)
-        frame_tensors["s"].append(s_node)
-        if "CPRESS" in mesh.point_data:
-            cp = mesh.point_data["CPRESS"].astype(np.float32)
-            if cp.ndim == 1:
-                cp = cp[:, None]
-        else:
-            cp = np.zeros((n_nodes, 1), dtype=np.float32)
-        frame_tensors["cpress"].append(cp)
-        world_edges.append(_extract_world_edges(mesh))
-        if (i + 1) % 50 == 0:
-            print(f"  {i + 1}/{len(vtu_files)} frames loaded")
 
+def _process_all_frames(vtu_files: List[str], num_workers: int = 1) -> Dict:
+    """Load all VTU frames in parallel, build fixed HEX topology and per-frame world edges."""
+    n = len(vtu_files)
+    print(f"Processing {n} VTU frames with {num_workers} workers (result will be cached)...")
+
+    # Read frame 0 on the main process to build fixed topology and static node props.
+    mesh_ref = pv.read(vtu_files[0])
+    node_props = _load_node_props(mesh_ref)
     print("Building fixed HEX topology...")
     edge_index, edge_type_onehot = _build_hex_edges(mesh_ref)
 
-    stacked = {
-        k: torch.from_numpy(np.stack(v, axis=0)) for k, v in frame_tensors.items()
+    # Process all frames in parallel (frame 0 is re-read, which is fine).
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(_process_single_frame, vtu_files))
+
+    keys = ("coord", "u", "v", "a", "evf", "s", "cpress")
+    frame_tensors = {
+        k: torch.from_numpy(np.stack([r[k] for r in results], axis=0)) for k in keys
     }
+    world_edges = [r["world_edges"] for r in results]
 
     return {
         "edge_index": edge_index,
         "edge_type_onehot": edge_type_onehot,
         "world_edges": world_edges,
-        "frame_tensors": stacked,
+        "frame_tensors": frame_tensors,
         "node_props": node_props,
     }
 
@@ -447,12 +453,18 @@ class NeedleTissueDataset(Dataset):
                 )
                 if os.path.exists(cache_path):
                     cache = torch.load(cache_path, weights_only=False)
+                    cached_frames = cache.get("frame_tensors", {}).get("coord")
+                    cached_n = len(cached_frames) if cached_frames is not None else 0
                     if (
                         "world_edges" not in cache
                         or "node_props" not in cache
                         or "cpress" not in cache.get("frame_tensors", {})
+                        or cached_n != n_frames_run
                     ):
-                        print(f"Cache outdated for RUN-{run_id} — regenerating ...")
+                        print(
+                            f"Cache outdated for RUN-{run_id} "
+                            f"(cached={cached_n}, on-disk={n_frames_run}) — regenerating ..."
+                        )
                         cache = _process_all_frames(vtu_files)
                         _atomic_torch_save(cache, cache_path)
                 else:

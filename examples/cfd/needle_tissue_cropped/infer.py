@@ -53,6 +53,8 @@ from dataset import (
     _get_needle_tissue_node_sets,
     _is_multi_run,
     _group_vtu_by_run,
+    _process_all_frames,
+    _atomic_torch_save,
 )
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.models.meshgraphnet import MeshGraphNet
@@ -388,14 +390,25 @@ def main(cfg: DictConfig) -> None:
     target_stats = load_json(os.path.join(stats_dir, "target_stats.json"))
 
     raw_cache_path = os.path.join(data_dir, cache_filename)
-    if not os.path.exists(raw_cache_path):
-        raise FileNotFoundError(f"{raw_cache_path} not found — run train.py first.")
-    cache = torch.load(raw_cache_path, weights_only=False)
-    if "world_edges" not in cache:
-        raise KeyError(
-            f"Raw cache missing per-frame world edges. "
-            f"Delete {raw_cache_path} and re-run train.py to rebuild it."
-        )
+    _need_rebuild = not os.path.exists(raw_cache_path)
+    if not _need_rebuild:
+        _existing = torch.load(raw_cache_path, weights_only=False)
+        _cached_n = len(_existing.get("frame_tensors", {}).get("coord", []))
+        if (
+            "world_edges" not in _existing
+            or _cached_n != len(vtu_files)
+        ):
+            print(
+                f"Cache outdated (cached={_cached_n}, on-disk={len(vtu_files)}) — rebuilding ..."
+            )
+            _need_rebuild = True
+        else:
+            cache = _existing
+    if _need_rebuild:
+        print(f"Building cache at {raw_cache_path} ...")
+        cache = _process_all_frames(vtu_files)
+        _atomic_torch_save(cache, raw_cache_path)
+        print(f"  → saved to {raw_cache_path}")
 
     hex_edge_index = cache["edge_index"]
     hex_edge_type_onehot = cache["edge_type_onehot"]

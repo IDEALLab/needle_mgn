@@ -49,7 +49,9 @@ from dataset import (
     STATE_KEYS,
     STATIC_PROP_KEYS,
     STATIC_PROP_DIMS,
+    _build_domino_cache,
     _compute_sdf_grid,
+    _process_all_frames,
     _sorted_vtu_files,
     _is_multi_run,
     _group_vtu_by_run,
@@ -331,9 +333,18 @@ def main(cfg: DictConfig) -> None:
     target_stats = load_json(os.path.join(stats_dir, "domino_target_stats.json"))
 
     raw_cache_path = os.path.join(data_dir, raw_cache_filename)
-    if not os.path.exists(raw_cache_path):
-        raise FileNotFoundError(f"{raw_cache_path} not found — run train.py first.")
-    raw_cache = torch.load(raw_cache_path, weights_only=False)
+    _need_raw = not os.path.exists(raw_cache_path)
+    if not _need_raw:
+        raw_cache = torch.load(raw_cache_path, weights_only=False)
+        _cached_n = len(raw_cache.get("frame_tensors", {}).get("coord", []))
+        if _cached_n != len(vtu_files):
+            print(f"Raw cache outdated (cached={_cached_n}, on-disk={len(vtu_files)}) — rebuilding ...")
+            _need_raw = True
+    if _need_raw:
+        print(f"Building raw cache at {raw_cache_path} ...")
+        raw_cache = _process_all_frames(vtu_files)
+        torch.save(raw_cache, raw_cache_path)
+        print(f"  → saved to {raw_cache_path}")
     frame_tensors = raw_cache["frame_tensors"]
     node_props = raw_cache.get("node_props", {})
     edge_index = raw_cache["edge_index"]
@@ -341,11 +352,16 @@ def main(cfg: DictConfig) -> None:
     n_nodes = int(edge_index.max().item()) + 1
 
     domino_cache_path = os.path.join(data_dir, domino_cache_filename)
-    if not os.path.exists(domino_cache_path):
-        raise FileNotFoundError(
-            f"{domino_cache_path} not found — run train.py first to build the cache."
-        )
-    dc = torch.load(domino_cache_path, weights_only=False)
+    _need_dc = not os.path.exists(domino_cache_path)
+    if not _need_dc:
+        dc = torch.load(domino_cache_path, weights_only=False)
+        _dc_n = dc.get("frame_sdf_grid", torch.empty(0)).shape[0]
+        if dc.get("grid_res") != list(grid_res) or _dc_n != len(vtu_files):
+            print(f"DoMINO cache outdated (cached={_dc_n}, on-disk={len(vtu_files)}) — rebuilding ...")
+            _need_dc = True
+    if _need_dc:
+        print(f"Building DoMINO cache at {domino_cache_path} ...")
+        dc = _build_domino_cache(vtu_files, raw_cache, grid_res, domino_cache_path)
 
     needle_idx: np.ndarray = dc["needle_idx"].numpy()
     grid_xyz: torch.Tensor = dc["grid_xyz"]               # (Nx, Ny, Nz, 3)

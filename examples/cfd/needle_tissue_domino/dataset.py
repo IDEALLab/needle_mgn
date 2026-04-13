@@ -299,12 +299,17 @@ class NeedleTissueDominoDataset(Dataset):
                 )
                 if os.path.exists(raw_cache_path):
                     raw_cache = torch.load(raw_cache_path, weights_only=False)
+                    cached_n = len(raw_cache.get("frame_tensors", {}).get("coord", []))
                     if (
                         "world_edges" not in raw_cache
                         or "node_props" not in raw_cache
                         or "cpress" not in raw_cache.get("frame_tensors", {})
+                        or cached_n != n_frames_run
                     ):
-                        print(f"Cache outdated for RUN-{run_id} — regenerating ...")
+                        print(
+                            f"Cache outdated for RUN-{run_id} "
+                            f"(cached={cached_n}, on-disk={n_frames_run}) — regenerating ..."
+                        )
                         raw_cache = _process_all_frames(vtu_files)
                         torch.save(raw_cache, raw_cache_path)
                 else:
@@ -320,9 +325,11 @@ class NeedleTissueDominoDataset(Dataset):
                 )
                 if os.path.exists(domino_cache_path):
                     dc = torch.load(domino_cache_path, weights_only=False)
-                    if dc.get("grid_res") != grid_res:
+                    dc_n = dc.get("frame_sdf_grid", torch.empty(0)).shape[0]
+                    if dc.get("grid_res") != grid_res or dc_n != n_frames_run:
                         print(
-                            f"Grid mismatch for RUN-{run_id} — rebuilding DoMINO cache ..."
+                            f"DoMINO cache outdated for RUN-{run_id} "
+                            f"(cached={dc_n}, on-disk={n_frames_run}) — rebuilding ..."
                         )
                         dc = _build_domino_cache(
                             vtu_files, raw_cache, grid_res, domino_cache_path
@@ -374,12 +381,16 @@ class NeedleTissueDominoDataset(Dataset):
             raw_cache_path = os.path.join(data_dir, _RAW_CACHE_FILE)
             if os.path.exists(raw_cache_path):
                 raw_cache = torch.load(raw_cache_path, weights_only=False)
+                cached_n = len(raw_cache.get("frame_tensors", {}).get("coord", []))
                 if (
                     "world_edges" not in raw_cache
                     or "node_props" not in raw_cache
                     or "cpress" not in raw_cache.get("frame_tensors", {})
+                    or cached_n != n_frames
                 ):
-                    print("Cache outdated — regenerating ...")
+                    print(
+                        f"Cache outdated (cached={cached_n}, on-disk={n_frames}) — regenerating ..."
+                    )
                     raw_cache = _process_all_frames(vtu_files)
                     torch.save(raw_cache, raw_cache_path)
             else:
@@ -392,8 +403,11 @@ class NeedleTissueDominoDataset(Dataset):
             )
             if os.path.exists(domino_cache_path):
                 dc = torch.load(domino_cache_path, weights_only=False)
-                if dc.get("grid_res") != grid_res:
-                    print("Grid resolution mismatch — rebuilding DoMINO cache ...")
+                dc_n = dc.get("frame_sdf_grid", torch.empty(0)).shape[0]
+                if dc.get("grid_res") != grid_res or dc_n != n_frames:
+                    print(
+                        f"DoMINO cache outdated (cached={dc_n}, on-disk={n_frames}) — rebuilding ..."
+                    )
                     dc = _build_domino_cache(
                         vtu_files, raw_cache, grid_res, domino_cache_path
                     )
