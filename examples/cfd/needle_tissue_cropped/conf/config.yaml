@@ -21,13 +21,13 @@ hydra:
     dir: ./outputs/
 
 # Paths
-data_dir: "/home/nathanielhoffman/Desktop/cel/physicsnemo/RUN-2"
+data_dir: "../../../RUN-2"
 ckpt_path: "./checkpoints"
 stats_dir: "./stats"
 
 # CUDA device selection.  Set to a string like "0", "1", or "0,1" to restrict
 # which GPUs are visible.  null means use whatever is available.
-cuda_devices: null
+cuda_devices: 1
 
 # Dataset split fractions
 train_fraction: 0.8
@@ -85,17 +85,17 @@ hidden_dim_processor: 256
 # No BSMS in this variant (dynamic cropping changes topology each step,
 # incompatible with precomputed BSMS coarsenings).
 # Use more vanilla processor steps to compensate.
-processor_size: 15
+processor_size: 12
 aggregation: "sum"
 
 # -------------------------
 # Training
 # -------------------------
-epochs: 350
+epochs: 200
 batch_size: 1
 num_workers: 2
 lr: 1e-4
-amp: false
+amp: true
 jit: false
 # Gaussian noise std added to normalised u/v/a inputs during training.
 # Forces the model to denoise rollout drift.  0.0 = disabled.  Try 3e-3.
