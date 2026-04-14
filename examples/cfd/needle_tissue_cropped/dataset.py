@@ -276,26 +276,45 @@ def _process_single_frame(path: str) -> Dict:
     }
 
 
-def _process_all_frames(vtu_files: List[str], num_workers: int = 1) -> Dict:
+def _process_all_frames(vtu_files: List[str], num_workers: int = 8) -> Dict:
     """Load all VTU frames in parallel, build fixed HEX topology and per-frame world edges."""
+    import time
+    from concurrent.futures import as_completed
+
     n = len(vtu_files)
     print(f"Processing {n} VTU frames with {num_workers} workers (result will be cached)...")
+    t0 = time.time()
 
     # Read frame 0 on the main process to build fixed topology and static node props.
     mesh_ref = pv.read(vtu_files[0])
     node_props = _load_node_props(mesh_ref)
     print("Building fixed HEX topology...")
     edge_index, edge_type_onehot = _build_hex_edges(mesh_ref)
+    print(f"  topology done ({time.time() - t0:.1f}s)")
 
-    # Process all frames in parallel (frame 0 is re-read, which is fine).
+    # Process all frames in parallel, printing progress as each completes.
+    results = [None] * n
+    done = 0
+    report_every = max(1, n // 20)  # print at ~5% intervals
+
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        results = list(executor.map(_process_single_frame, vtu_files))
+        futures = {executor.submit(_process_single_frame, p): i for i, p in enumerate(vtu_files)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            results[idx] = future.result()
+            done += 1
+            if done % report_every == 0 or done == n:
+                elapsed = time.time() - t0
+                rate = done / elapsed
+                eta = (n - done) / rate if rate > 0 else 0
+                print(f"  frames {done}/{n}  ({elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
 
     keys = ("coord", "u", "v", "a", "evf", "s", "cpress")
     frame_tensors = {
         k: torch.from_numpy(np.stack([r[k] for r in results], axis=0)) for k in keys
     }
     world_edges = [r["world_edges"] for r in results]
+    print(f"  stacking done — total {time.time() - t0:.1f}s")
 
     return {
         "edge_index": edge_index,

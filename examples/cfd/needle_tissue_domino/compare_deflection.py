@@ -39,7 +39,11 @@ import numpy as np
 import pyvista as pv
 import torch
 
-from dataset import _sorted_vtu_files
+from dataset import (
+    _get_needle_tissue_node_sets,
+    _process_all_frames,
+    _sorted_vtu_files,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,21 +61,21 @@ def _get_needle_indices(data_dir: str, grid_res=(64, 32, 32)) -> np.ndarray:
             dc = torch.load(path, weights_only=False)
             return dc["needle_idx"].numpy()
 
-    # Fall back to raw preprocessed cache
-    raw_path = os.path.join(data_dir, "preprocessed_cache.pt")
-    if not os.path.exists(raw_path):
-        raise FileNotFoundError(
-            f"No cache found in {data_dir}. Run train.py first."
-        )
-    import importlib.util as _ilu
-    _spec = _ilu.spec_from_file_location(
-        "needle_tissue_cropped_dataset",
-        os.path.join(os.path.dirname(__file__), "..", "needle_tissue_cropped", "dataset.py"),
-    )
-    _mod = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    raw = torch.load(raw_path, weights_only=False)
-    needle_idx, _ = _mod._get_needle_tissue_node_sets(
+    # Fall back to a topology-only cache built from a single VTU frame.
+    # Needle indices come from the fixed HEX topology, which is identical
+    # across all frames and runs — there is no need to process the full dataset.
+    topo_path = os.path.join(data_dir, "preprocessed_topology.pt")
+    if os.path.exists(topo_path):
+        raw = torch.load(topo_path, weights_only=False)
+    else:
+        first_file = _sorted_vtu_files(data_dir)[0]
+        print(f"Building topology cache from {os.path.basename(first_file)} ...")
+        raw = _process_all_frames([first_file])
+        tmp = topo_path + f".{os.getpid()}.tmp"
+        torch.save(raw, tmp)
+        os.replace(tmp, topo_path)
+        print(f"  → saved to {topo_path}")
+    needle_idx, _ = _get_needle_tissue_node_sets(
         raw["edge_index"], raw["edge_type_onehot"]
     )
     return needle_idx
@@ -103,8 +107,10 @@ def _lateral_deflection(pos: np.ndarray, ref_pos: np.ndarray) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser(description="Compare needle deflection: DCEL-DoMINO vs GT")
-    parser.add_argument("--infer_dir", default="./outputs/inference_output")
-    parser.add_argument("--data_dir", required=True)
+    parser.add_argument("--infer_dir", default="./inference_output")
+    parser.add_argument("--data_dir", default=os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../RUN-2")
+    ))
     parser.add_argument("--out_dir", default="./outputs/deflection_plots")
     parser.add_argument(
         "--grid_res", default="64,32,32",
