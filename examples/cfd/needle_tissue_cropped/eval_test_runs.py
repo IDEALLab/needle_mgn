@@ -50,6 +50,7 @@ Usage:
 import argparse
 import csv
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import matplotlib
 matplotlib.use("Agg")
@@ -178,6 +179,38 @@ def _plot_summary(all_rows: dict, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-run worker (runs in a subprocess)
+# ---------------------------------------------------------------------------
+
+def _analyse_run_worker(
+    run_id: str,
+    infer_dir: str,
+    run_out_dir: str,
+    needle_idx: np.ndarray,
+    ref_pos_needle: np.ndarray,
+    sort_order: np.ndarray,
+) -> tuple:
+    """Analyse one inference run and return (run_id, rows, error_str).
+
+    Designed to run in a subprocess via ProcessPoolExecutor.  Returns
+    ``error_str=None`` on success, or a non-empty string on failure so the
+    caller can report it without crashing the pool.
+    """
+    try:
+        rows = analyze_run(
+            infer_dir=infer_dir,
+            needle_idx=needle_idx,
+            ref_pos_needle=ref_pos_needle,
+            sort_order=sort_order,
+            out_dir=run_out_dir,
+            run_label=run_id,
+        )
+        return run_id, rows, None
+    except Exception as exc:  # noqa: BLE001
+        return run_id, None, str(exc)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -194,6 +227,8 @@ def main():
     parser.add_argument("--train_fraction", type=float, default=_DEFAULT_TRAIN_FRACTION)
     parser.add_argument("--val_fraction",   type=float, default=_DEFAULT_VAL_FRACTION)
     parser.add_argument("--timestep_stride", type=int, default=_DEFAULT_TIMESTEP_STRIDE)
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="Number of parallel worker processes (default: 8)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -215,32 +250,39 @@ def main():
     axial_coords = centred @ principal
     sort_order = np.argsort(axial_coords)
 
-    # --- Per-run analysis -----------------------------------------------------
-    all_rows: dict = {}
+    # --- Build work list (skip runs whose infer dir is missing) ---------------
     skipped = []
-
+    work: list = []
     for run_id in test_run_ids:
         infer_dir = os.path.join(args.infer_base_dir, f"RUN-{run_id}")
         if not os.path.isdir(infer_dir):
             print(f"[skip] RUN-{run_id}: {infer_dir} not found")
             skipped.append(run_id)
             continue
-
         run_out_dir = os.path.join(args.out_dir, f"RUN-{run_id}")
-        print(f"\nAnalysing RUN-{run_id} ...")
-        try:
-            rows = analyze_run(
-                infer_dir=infer_dir,
-                needle_idx=needle_idx,
-                ref_pos_needle=ref_pos_needle,
-                sort_order=sort_order,
-                out_dir=run_out_dir,
-                run_label=run_id,
-            )
-            all_rows[run_id] = rows
-        except FileNotFoundError as exc:
-            print(f"[skip] RUN-{run_id}: {exc}")
-            skipped.append(run_id)
+        work.append((run_id, infer_dir, run_out_dir, needle_idx, ref_pos_needle, sort_order))
+
+    # --- Per-run analysis in parallel ----------------------------------------
+    results: dict = {}  # run_id → rows, filled as futures complete
+    n_workers = min(len(work), args.num_workers) if work else 1
+    print(f"\nAnalysing {len(work)} runs with {n_workers} workers ...")
+
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {
+            pool.submit(_analyse_run_worker, *item): item[0]
+            for item in work
+        }
+        for future in as_completed(futures):
+            run_id, rows, err = future.result()
+            if err is not None:
+                print(f"[skip] RUN-{run_id}: {err}")
+                skipped.append(run_id)
+            else:
+                print(f"  ✓ RUN-{run_id}")
+                results[run_id] = rows
+
+    # Restore insertion order from test_run_ids for deterministic summary output.
+    all_rows = {rid: results[rid] for rid in test_run_ids if rid in results}
 
     if not all_rows:
         print("\nNo runs analysed — check --infer_base_dir.")
