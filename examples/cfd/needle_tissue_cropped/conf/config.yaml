@@ -85,7 +85,7 @@ hidden_dim_processor: 256
 # No BSMS in this variant (dynamic cropping changes topology each step,
 # incompatible with precomputed BSMS coarsenings).
 # Use more vanilla processor steps to compensate.
-processor_size: 12
+processor_size: 15
 aggregation: "sum"
 
 # -------------------------
