@@ -231,13 +231,27 @@ def _save_vtu_worker(
     cell_data: dict,
     point_data: dict,
 ) -> None:
+    """Reconstruct an UnstructuredGrid from raw arrays and save.
+
+    Uses vtkXMLUnstructuredGridWriter directly with SetWriteArrayMetaData(False)
+    to suppress L2_NORM_RANGE information-key entries that newer VTK writes but
+    older ParaView versions cannot parse.
+    """
     import pyvista as pv
+    import vtk
+
     mesh = pv.UnstructuredGrid(cells_flat, celltypes, points)
     for k, v in cell_data.items():
         mesh.cell_data[k] = v
     for k, v in point_data.items():
         mesh.point_data[k] = v
-    mesh.save(out_path)
+
+    writer = vtk.vtkXMLUnstructuredGridWriter()
+    writer.SetFileName(out_path)
+    writer.SetInputData(mesh)
+    if hasattr(writer, "SetWriteArrayMetaData"):
+        writer.SetWriteArrayMetaData(False)
+    writer.Write()
 
 
 def _write_pvd(out_dir: str, entries: list) -> str:
