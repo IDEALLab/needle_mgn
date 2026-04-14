@@ -35,6 +35,7 @@ Override config values with Hydra syntax:
 
 import os
 import re
+import time
 from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
@@ -496,9 +497,11 @@ def main(cfg: DictConfig) -> None:
     # ---- Rollout ---------------------------------------------------------
     pvd_entries = []
     write_futures = []
+    t0_rollout = time.time()
 
     with ProcessPoolExecutor(max_workers=2) as write_executor, torch.no_grad():
         for step in range(n_rollout):
+            t_step = time.time()
             # --- Full mesh (no spatial crop) ---
             part_nodes = torch.arange(n_nodes, dtype=torch.long)
 
@@ -621,9 +624,11 @@ def main(cfg: DictConfig) -> None:
             write_futures.append((step, fname, future))
             pvd_entries.append((infer_start + step + 1, fname))
 
+            step_ms = (time.time() - t_step) * 1000
             print(
                 f"  step {step + 1:3d}/{n_rollout}  →  {fname}"
                 f"  ({len(part_nodes)} nodes, full mesh)"
+                f"  [{step_ms:.0f}ms]"
                 + ("  (+ GT)" if has_gt else "  (extrapolating beyond GT)")
             )
 
@@ -631,7 +636,8 @@ def main(cfg: DictConfig) -> None:
         future.result()
 
     pvd_path = _write_pvd(out_dir, pvd_entries)
-    print(f"\nDone. Open {pvd_path} in Paraview to animate.")
+    total_s = time.time() - t0_rollout
+    print(f"\nDone in {total_s:.1f}s ({total_s / n_rollout * 1000:.0f}ms/step). Open {pvd_path} in Paraview to animate.")
     print("Tip: in Paraview use Filters → Warp By Vector on U_pred to visualise displacement.")
 
 

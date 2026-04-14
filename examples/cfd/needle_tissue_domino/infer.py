@@ -33,6 +33,7 @@ Usage (from examples/cfd/needle_tissue_domino/):
 """
 
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import hydra
@@ -414,9 +415,11 @@ def main(cfg: DictConfig) -> None:
     # ---- Rollout ------------------------------------------------------------
     pvd_entries = []
     write_futures = []
+    t0_rollout = time.time()
 
     with ProcessPoolExecutor(max_workers=2) as write_executor, torch.no_grad():
         for step in range(n_rollout):
+            t_step = time.time()
             t_abs = infer_start + step
 
             data_dict = _build_step_data_dict(
@@ -477,8 +480,10 @@ def main(cfg: DictConfig) -> None:
             write_futures.append(future)
             pvd_entries.append((gt_frame_idx, fname))
 
+            step_ms = (time.time() - t_step) * 1000
             print(
                 f"  step {step + 1:3d}/{n_rollout}  →  {fname}"
+                f"  [{step_ms:.0f}ms]"
                 + ("  (+ GT)" if has_gt else "  (extrapolating beyond GT)")
             )
 
@@ -486,7 +491,8 @@ def main(cfg: DictConfig) -> None:
         f.result()
 
     pvd_path = _write_pvd(out_dir, pvd_entries)
-    print(f"\nDone. Open {pvd_path} in Paraview to animate.")
+    total_s = time.time() - t0_rollout
+    print(f"\nDone in {total_s:.1f}s ({total_s / n_rollout * 1000:.0f}ms/step). Open {pvd_path} in Paraview to animate.")
 
 
 if __name__ == "__main__":
