@@ -55,10 +55,12 @@ import pyvista as pv  # noqa: E402
 import torch  # noqa: E402
 
 from dataset import (
-    _get_needle_tissue_node_sets,
-    _sorted_vtu_files,
-    _process_all_frames,
     _atomic_torch_save,
+    _build_hex_edges,
+    _get_needle_tissue_node_sets,
+    _load_node_props,
+    _process_single_frame,
+    _sorted_vtu_files,
 )
 
 
@@ -66,33 +68,112 @@ from dataset import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+_TOPO_CACHE = "preprocessed_topology.pt"
+_FRAME_CHUNK_PREFIX = "preprocessed_frames_"
+_FRAME_CHUNK_SIZE = 50  # frames per chunk file
+
+
+def _build_topology_cache(data_dir: str) -> dict:
+    """Build and save a topology-only cache from frame 0.
+
+    Stores only ``edge_index``, ``edge_type_onehot``, and ``node_props``.
+    This is far cheaper than the full frame cache because it reads a single
+    VTU file rather than the entire dataset.
+    """
+    vtu_files = _sorted_vtu_files(data_dir)
+    topo_path = os.path.join(data_dir, _TOPO_CACHE)
+    print(f"Building topology cache from frame 0 → {topo_path} ...")
+    mesh = pv.read(vtu_files[0])
+    edge_index, edge_type_onehot = _build_hex_edges(mesh)
+    node_props = _load_node_props(mesh)
+    cache = {
+        "edge_index": edge_index,
+        "edge_type_onehot": edge_type_onehot,
+        "node_props": node_props,
+    }
+    _atomic_torch_save(cache, topo_path)
+    print(f"  → saved to {topo_path}")
+    return cache
+
+
+def _build_frame_chunks(data_dir: str, chunk_size: int = _FRAME_CHUNK_SIZE) -> list:
+    """Process VTU frames in chunks and save each chunk to a separate file.
+
+    Instead of loading all frames into memory at once, processes
+    ``chunk_size`` frames at a time and writes
+    ``preprocessed_frames_{start:05d}.pt`` files.  Returns the sorted list of
+    chunk file paths.
+
+    Parameters
+    ----------
+    data_dir : str
+        Directory containing VTU files.
+    chunk_size : int
+        Number of frames per chunk file.
+
+    Returns
+    -------
+    list of str
+        Paths of the written chunk files, in frame order.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    vtu_files = _sorted_vtu_files(data_dir)
+    chunk_paths = []
+    keys = ("coord", "u", "v", "a", "evf", "s", "cpress")
+    n_workers = min(4, chunk_size)
+
+    for start in range(0, len(vtu_files), chunk_size):
+        chunk_files = vtu_files[start : start + chunk_size]
+        chunk_path = os.path.join(
+            data_dir, f"{_FRAME_CHUNK_PREFIX}{start:05d}.pt"
+        )
+        if os.path.exists(chunk_path):
+            existing = torch.load(chunk_path, weights_only=False)
+            cached_n = existing.get("frame_tensors", {}).get("coord")
+            if cached_n is not None and len(cached_n) == len(chunk_files):
+                chunk_paths.append(chunk_path)
+                continue
+
+        print(
+            f"Building frame chunk {start}–{start + len(chunk_files) - 1}"
+            f" → {chunk_path} ..."
+        )
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            results = list(ex.map(_process_single_frame, chunk_files))
+
+        frame_tensors = {
+            k: torch.from_numpy(
+                np.stack([r[k] for r in results], axis=0)
+            )
+            for k in keys
+        }
+        world_edges = [r["world_edges"] for r in results]
+        _atomic_torch_save(
+            {"frame_tensors": frame_tensors, "world_edges": world_edges},
+            chunk_path,
+        )
+        print(f"  → saved {len(chunk_files)} frames to {chunk_path}")
+        chunk_paths.append(chunk_path)
+
+    return chunk_paths
+
+
 def _get_needle_indices(data_dir: str) -> np.ndarray:
     """Return original-mesh node indices that belong to the needle (et=0).
 
-    Reads the ``preprocessed_cache.pt`` built by ``train.py`` and extracts
-    needle node indices via the HEX edge topology (no beam reduction).
-    Rebuilds the cache if it is missing or the frame count has changed.
+    Uses a lightweight topology-only cache (``preprocessed_topology.pt``)
+    built from frame 0 alone.  This avoids loading the full frame dataset
+    into memory.  If frame data is also needed, call
+    :func:`_build_frame_chunks` to build per-chunk cache files.
     """
-    vtu_files = _sorted_vtu_files(data_dir)
-    cache_path = os.path.join(data_dir, "preprocessed_cache.pt")
-
-    need_rebuild = not os.path.exists(cache_path)
-    if not need_rebuild:
-        existing = torch.load(cache_path, weights_only=False)
-        cached_n = len(existing.get("frame_tensors", {}).get("coord", []))
-        if cached_n != len(vtu_files):
-            print(
-                f"Cache outdated (cached={cached_n}, on-disk={len(vtu_files)}) — rebuilding ..."
-            )
-            need_rebuild = True
-
-    if need_rebuild:
-        print(f"Building cache at {cache_path} ...")
-        cache = _process_all_frames(vtu_files)
-        _atomic_torch_save(cache, cache_path)
-        print(f"  → saved to {cache_path}")
+    topo_path = os.path.join(data_dir, _TOPO_CACHE)
+    if os.path.exists(topo_path):
+        cache = torch.load(topo_path, weights_only=False)
+        if "edge_index" not in cache or "edge_type_onehot" not in cache:
+            cache = _build_topology_cache(data_dir)
     else:
-        cache = existing
+        cache = _build_topology_cache(data_dir)
 
     needle_idx, _ = _get_needle_tissue_node_sets(
         cache["edge_index"], cache["edge_type_onehot"]
@@ -350,9 +431,9 @@ def _write_csv(path: str, rows: list) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Compare needle deflection: prediction vs GT")
-    parser.add_argument("--infer_dir", default="./outputs/inference_output",
+    parser.add_argument("--infer_dir", default="./inference_output",
                         help="Directory containing predicted_XXXX.vtu files")
-    parser.add_argument("--data_dir", required=True,
+    parser.add_argument("--data_dir", default="../../../RUN-2",
                         help="Directory containing raw VTU files")
     parser.add_argument("--out_dir", default="./outputs/deflection_plots",
                         help="Directory to write plots and CSV")

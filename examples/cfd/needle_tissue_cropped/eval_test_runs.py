@@ -56,6 +56,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pyvista as pv
+from omegaconf import OmegaConf
 
 from compare_deflection import (
     _get_needle_indices,
@@ -64,6 +65,15 @@ from compare_deflection import (
     _write_csv,
 )
 from dataset import _group_vtu_by_run, _sorted_vtu_files
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_CFG = OmegaConf.load(os.path.join(_SCRIPT_DIR, "conf", "config.yaml"))
+
+_RAW_DATA_DIR: str = OmegaConf.select(_CFG, "data_dir", default="../../../RUN-2")
+_DEFAULT_DATA_DIR: str = os.path.normpath(os.path.join(_SCRIPT_DIR, _RAW_DATA_DIR))
+_DEFAULT_TRAIN_FRACTION: float = float(OmegaConf.select(_CFG, "train_fraction", default=0.8))
+_DEFAULT_VAL_FRACTION: float = float(OmegaConf.select(_CFG, "val_fraction", default=0.1))
+_DEFAULT_TIMESTEP_STRIDE: int = int(OmegaConf.select(_CFG, "timestep_stride", default=1))
 
 
 # ---------------------------------------------------------------------------
@@ -175,15 +185,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate needle deflection across all test-set runs."
     )
-    parser.add_argument("--data_dir", required=True,
-                        help="Directory containing raw VTU files (multi-run)")
-    parser.add_argument("--infer_base_dir", required=True,
+    parser.add_argument("--data_dir", default=_DEFAULT_DATA_DIR,
+                        help="Directory containing raw VTU files (defaults to config.yaml data_dir)")
+    parser.add_argument("--infer_base_dir", default="./inference_output",
                         help="Parent dir containing RUN-<id>/ subdirs of predicted VTUs")
     parser.add_argument("--out_dir", default="./outputs/eval_test_runs",
                         help="Directory to write per-run outputs and summary")
-    parser.add_argument("--train_fraction", type=float, default=0.8)
-    parser.add_argument("--val_fraction",   type=float, default=0.1)
-    parser.add_argument("--timestep_stride", type=int, default=10)
+    parser.add_argument("--train_fraction", type=float, default=_DEFAULT_TRAIN_FRACTION)
+    parser.add_argument("--val_fraction",   type=float, default=_DEFAULT_VAL_FRACTION)
+    parser.add_argument("--timestep_stride", type=int, default=_DEFAULT_TIMESTEP_STRIDE)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)

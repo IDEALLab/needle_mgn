@@ -22,11 +22,11 @@ overrides.  Predicted VTUs for each run are written to:
 
     <infer_output_base>/RUN-<id>/
 
-Usage (from examples/cfd/needle_tissue_cropped/):
+Usage (from examples/cfd/needle_tissue_domino/):
     uv run run_test_inference.py
     uv run run_test_inference.py --infer_output_base ./outputs/inference_output
     uv run run_test_inference.py --run_ids 140 141 142   # specific runs only
-    uv run run_test_inference.py --extra "n_rollout=50 needle_crop_mm=15.0"
+    uv run run_test_inference.py --extra "n_rollout=50"
 """
 
 import argparse
@@ -144,8 +144,6 @@ def main():
             sys.executable, "infer.py",
             f"infer_run_id={run_id}",
             f"infer_output_dir={run_out_dir}",
-            # Suppress Hydra's per-run output dir chatter by keeping the default
-            # hydra.run.dir but isolating the actual VTU output via infer_output_dir.
         ] + extra_overrides
 
         result = subprocess.run(cmd, cwd=script_dir)
