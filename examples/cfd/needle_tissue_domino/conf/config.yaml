@@ -23,7 +23,7 @@ hydra:
 # -------------------------
 # Paths
 # -------------------------
-data_dir: "/home/nathanielhoffman/Desktop/cel/physicsnemo/RUN-2"
+data_dir: "../../../RUN-2"
 ckpt_path: "./checkpoints"
 stats_dir: "./stats"
 
@@ -60,7 +60,7 @@ num_sample_nodes: 2048
 # -------------------------
 # Model output
 # -------------------------
-output_dim: 9          # Δu_x Δu_y Δu_z  Δv_x Δv_y Δv_z  Δa_x Δa_y Δa_z
+output_dim: 17         # Δu(3) Δv(3) Δa(3) Δevf(1) Δs(6) Δcpress(1)
 global_features: 1     # normalised timestep index
 
 # -------------------------
@@ -161,7 +161,8 @@ consensus_attenuation: 0.0
 # -------------------------
 # Training
 # -------------------------
-epochs: 300
+
+epochs: 400
 num_workers: 2
 lr: 1e-4
 amp: true
