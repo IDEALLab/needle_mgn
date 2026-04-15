@@ -69,7 +69,8 @@ from physicsnemo.datapipes.gnn.utils import load_json
 
 INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s", "cpress"]
 STATIC_PROP_KEYS = ["mat_E", "mat_c10", "mat_density", "mat_fiber", "mat_k1", "mat_k2", "mat_kappa", "mat_nu"]
-TARGET_KEYS = ["u", "v", "a"]
+TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
+TARGET_DIMS = [3, 3, 3, 1, 6, 1]
 
 _WORLD_EDGE_TYPE = torch.tensor([[0.0, 0.0, 1.0]])
 
@@ -91,14 +92,14 @@ def _normalize(state: dict, node_props: dict, node_stats: dict) -> torch.Tensor:
 
 
 def _denorm_target(pred: torch.Tensor, target_stats: dict) -> dict:
-    """Un-normalise model output (N, 9) → dict of {u, v, a} tensors."""
+    """Un-normalise model output (N, 17) → dict of {u, v, a, evf, s, cpress} tensors."""
     out = {}
     offset = 0
-    for key in TARGET_KEYS:
+    for key, dim in zip(TARGET_KEYS, TARGET_DIMS):
         mean = target_stats[f"{key}_mean"]
         std = target_stats[f"{key}_std"]
-        out[key] = pred[:, offset : offset + 3] * std + mean
-        offset += 3
+        out[key] = pred[:, offset : offset + dim] * std + mean
+        offset += dim
     return out
 
 
@@ -502,6 +503,7 @@ def main(cfg: DictConfig) -> None:
     with ProcessPoolExecutor(max_workers=2) as write_executor, torch.no_grad():
         for step in range(n_rollout):
             t_step = time.time()
+
             # --- Full mesh (no spatial crop) ---
             part_nodes = torch.arange(n_nodes, dtype=torch.long)
 
@@ -547,9 +549,12 @@ def main(cfg: DictConfig) -> None:
                 next_uvw_sub["u"][needle_local_in_part] = u_needle_filtered
 
             # --- Integrate increments — only for nodes inside the crop ---
-            state["u"][part_nodes] = state["u"][part_nodes] + next_uvw_sub["u"]
-            state["v"][part_nodes] = state["v"][part_nodes] + next_uvw_sub["v"]
-            state["a"][part_nodes] = state["a"][part_nodes] + next_uvw_sub["a"]
+            state["u"][part_nodes]      = state["u"][part_nodes]      + next_uvw_sub["u"]
+            state["v"][part_nodes]      = state["v"][part_nodes]      + next_uvw_sub["v"]
+            state["a"][part_nodes]      = state["a"][part_nodes]      + next_uvw_sub["a"]
+            state["evf"][part_nodes]    = state["evf"][part_nodes]    + next_uvw_sub["evf"]
+            state["s"][part_nodes]      = state["s"][part_nodes]      + next_uvw_sub["s"]
+            state["cpress"][part_nodes] = state["cpress"][part_nodes] + next_uvw_sub["cpress"]
 
             # Advance Lagrangian (needle) node positions for cropped needle nodes
             needle_in_crop = part_nodes[

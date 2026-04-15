@@ -26,6 +26,7 @@ Usage (from examples/cfd/needle_tissue_domino/):
 """
 
 import os
+import time
 
 import hydra
 import torch
@@ -139,24 +140,26 @@ def main(cfg: DictConfig) -> None:
         train_sampler.set_epoch(epoch)
         model.train()
         train_loss = 0.0
+        t0_epoch = time.time()
 
         for batch in train_loader:
             batch = {k: v.to(dist.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
-            y_true = batch.pop("y")                              # (1, N, 9)
+            y_true = batch.pop("y")                              # (1, N, 17)
 
             if noise_std > 0.0:
                 # Add Gaussian noise to normalised u/v/a in state_vol (indices 0:9).
-                # Subtract same noise from target so the model learns to predict
-                # the true increment from the noisy current state.
+                # Subtract same noise from the u/v/a portion of the target so the
+                # model learns to predict the true increment from the noisy state.
                 noise = torch.randn_like(batch["state_vol"][..., :9]) * noise_std
                 batch["state_vol"] = batch["state_vol"].clone()
                 batch["state_vol"][..., :9] = batch["state_vol"][..., :9] + noise
-                y_true = y_true - noise
+                y_true = y_true.clone()
+                y_true[..., :9] = y_true[..., :9] - noise
 
             optimizer.zero_grad()
             with autocast("cuda", enabled=cfg.amp):
-                pred_vol, _ = model(batch)                       # (1, N, 9)
+                pred_vol, _ = model(batch)                       # (1, N, 17)
                 loss = torch.nn.functional.mse_loss(pred_vol, y_true)
 
             scaler.scale(loss).backward()
@@ -184,13 +187,16 @@ def main(cfg: DictConfig) -> None:
             val_loss /= max(len(val_loader), 1)
 
             if dist.rank == 0:
+                epoch_s = time.time() - t0_epoch
                 print(
                     f"Epoch {epoch + 1:4d}/{cfg.epochs}  "
-                    f"train={train_loss:.6f}  val={val_loss:.6f}"
+                    f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                    f"time={epoch_s:.1f}s"
                 )
                 wandb.log({"train_loss": train_loss, "val_loss": val_loss, "epoch": epoch + 1})
         elif dist.rank == 0:
-            print(f"Epoch {epoch + 1:4d}/{cfg.epochs}  train={train_loss:.6f}")
+            epoch_s = time.time() - t0_epoch
+            print(f"Epoch {epoch + 1:4d}/{cfg.epochs}  train={train_loss:.6f}  time={epoch_s:.1f}s")
             wandb.log({"train_loss": train_loss, "epoch": epoch + 1})
 
         # ---- Checkpoint -----------------------------------------------------

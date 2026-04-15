@@ -118,8 +118,8 @@ def _build_step_data_dict(
         mean = node_stats[f"{key}_mean"]
         std = node_stats[f"{key}_std"]
         state_parts.append((feat - mean) / std)
-    for key in STATIC_PROP_KEYS:
-        feat = node_props.get(key, torch.zeros(n_nodes, 1))
+    for key, dim in zip(STATIC_PROP_KEYS, STATIC_PROP_DIMS):
+        feat = node_props.get(key, torch.zeros(n_nodes, dim))
         mean = node_stats[f"{key}_mean"]
         std = node_stats[f"{key}_std"]
         state_parts.append((feat - mean) / std)
@@ -147,15 +147,19 @@ def _build_step_data_dict(
     }
 
 
+_TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
+_TARGET_DIMS = [3, 3, 3, 1, 6, 1]
+
+
 def _denorm_target(pred: torch.Tensor, target_stats: dict) -> dict:
-    """Un-normalise model output (N, 9) → {u, v, a}."""
+    """Un-normalise model output (N, 17) → {u, v, a, evf, s, cpress}."""
     out = {}
     offset = 0
-    for key in ("u", "v", "a"):
+    for key, dim in zip(_TARGET_KEYS, _TARGET_DIMS):
         mean = target_stats[f"{key}_mean"]
         std = target_stats[f"{key}_std"]
-        out[key] = pred[:, offset : offset + 3] * std + mean
-        offset += 3
+        out[key] = pred[:, offset : offset + dim] * std + mean
+        offset += dim
     return out
 
 
@@ -444,9 +448,12 @@ def main(cfg: DictConfig) -> None:
                 )
 
             # Accumulate increments
-            state["u"] = state["u"] + next_uvw["u"]
-            state["v"] = state["v"] + next_uvw["v"]
-            state["a"] = state["a"] + next_uvw["a"]
+            state["u"]      = state["u"]      + next_uvw["u"]
+            state["v"]      = state["v"]      + next_uvw["v"]
+            state["a"]      = state["a"]      + next_uvw["a"]
+            state["evf"]    = state["evf"]    + next_uvw["evf"]
+            state["s"]      = state["s"]      + next_uvw["s"]
+            state["cpress"] = state["cpress"] + next_uvw["cpress"]
 
             # Advance Lagrangian needle positions
             state["coord"][needle_idx] += next_uvw["u"][needle_idx]

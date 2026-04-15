@@ -190,7 +190,8 @@ class MGNTrainer:
                 noise = torch.randn(x.shape[0], 9, device=x.device, dtype=x.dtype) * self.noise_std
                 x = x.clone()
                 x[:, 3:12] = x[:, 3:12] + noise
-                y = y - noise
+                y = y.clone()
+                y[:, :9] = y[:, :9] - noise
             pred = self.model(x, graph.edge_attr, graph)
             return self.criterion(pred, y)
 

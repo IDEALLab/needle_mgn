@@ -397,7 +397,8 @@ class NeedleTissueDataset(Dataset):
     INPUT_DIMS = [3, 3, 3, 3, 1, 6, 1]
     STATIC_PROP_KEYS = _STATIC_PROP_KEYS
     STATIC_PROP_DIMS = _STATIC_PROP_DIMS
-    TARGET_KEYS = ["u", "v", "a"]
+    TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
+    TARGET_DIMS = [3, 3, 3, 1, 6, 1]
 
     def __init__(
         self,
@@ -803,8 +804,8 @@ class NeedleTissueDataset(Dataset):
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 
         target_stats: Dict[str, torch.Tensor] = {}
-        for key in self.TARGET_KEYS:
-            flat = torch.cat(tgt_data[key], dim=0).reshape(-1, 3).float()
+        for key, dim in zip(self.TARGET_KEYS, self.TARGET_DIMS):
+            flat = torch.cat(tgt_data[key], dim=0).reshape(-1, dim).float()
             target_stats[f"{key}_mean"] = flat.mean(0)
             target_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 
