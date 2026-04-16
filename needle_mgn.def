@@ -1,0 +1,156 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Apptainer definition file for the needle-tissue MeshGraphNet / DCEL-DoMINO
+# training and inference pipeline.
+#
+# BUILD
+# -----
+#   apptainer build needle_mgn.sif needle_mgn.def
+#
+# RUN (bind the dataset directory at /data/RUN-2 inside the container)
+# -----
+#   apptainer exec \
+#       --bind /path/to/RUN-2:/data/RUN-2 \
+#       --nv \
+#       needle_mgn.sif \
+#       uv run python examples/cfd/needle_tissue_domino/train.py
+#
+# Bind additional directories as needed, e.g. to persist checkpoints and
+# outputs outside the container:
+#
+#   apptainer exec \
+#       --bind /path/to/RUN-2:/data/RUN-2 \
+#       --bind /path/to/my_checkpoints:/opt/needle_mgn/examples/cfd/needle_tissue_domino/checkpoints \
+#       --bind /path/to/my_outputs:/opt/needle_mgn/examples/cfd/needle_tissue_domino/outputs \
+#       --nv \
+#       needle_mgn.sif \
+#       uv run python examples/cfd/needle_tissue_domino/train.py
+#
+# The --nv flag passes through host GPU drivers.  The dataset directory must
+# match the data_dir value in the relevant conf/config.yaml (default ../../../RUN-2
+# relative to the example scripts, which resolves to /data/RUN-2 when running
+# from /opt/needle_mgn).
+
+Bootstrap: docker
+From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+
+%labels
+    Description PhysicsNeMo needle-tissue simulation container (MGN + DCEL-DoMINO)
+    CUDA 12.8
+    Python 3.13
+
+%files
+    # Core library
+    physicsnemo /opt/needle_mgn/physicsnemo
+    __init__.py /opt/needle_mgn/__init__.py
+    pyproject.toml /opt/needle_mgn/pyproject.toml
+    uv.lock /opt/needle_mgn/uv.lock
+
+    # Example scripts and configs (large generated artifacts removed in %post)
+    examples /opt/needle_mgn/examples
+
+    # Local torch-scatter wheel (host path is patched to container path in %post)
+    /home/nathanielhoffman/Downloads/torch_scatter-2.1.2+pt210cu128-cp313-cp313-linux_x86_64.whl /opt/wheels/torch_scatter-2.1.2+pt210cu128-cp313-cp313-linux_x86_64.whl
+
+%environment
+    export PATH=/opt/uv/bin:/opt/needle_mgn/.venv/bin:$PATH
+    export VIRTUAL_ENV=/opt/needle_mgn/.venv
+    export PYTHONPATH=/opt/needle_mgn:$PYTHONPATH
+    # Point Hydra at the correct working dir when running from anywhere
+    export HYDRA_FULL_ERROR=1
+
+%post
+    set -e
+
+    # ---- System packages ------------------------------------------------
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+        git \
+        libgomp1 \
+        ca-certificates
+
+    # Python 3.13 via deadsnakes PPA (Ubuntu 24.04 ships 3.12 by default)
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+        python3.13 \
+        python3.13-dev \
+        python3.13-venv
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+    # ---- uv -------------------------------------------------------------
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/opt/uv sh
+    export PATH=/opt/uv/bin:$PATH
+
+    # ---- Patch local wheel path in pyproject.toml and uv.lock ----------
+    # The wheel was installed on the build host at a user-specific path.
+    # Rewrite both files to reference the in-container location so that
+    # uv sync --frozen resolves correctly.
+    WHEEL_HOST_DIR="/home/nathanielhoffman/Downloads"
+    WHEEL_CONTAINER_DIR="/opt/wheels"
+
+    sed -i "s|path = \"${WHEEL_HOST_DIR}/|path = \"${WHEEL_CONTAINER_DIR}/|g" \
+        /opt/needle_mgn/pyproject.toml
+
+    sed -i "s|${WHEEL_HOST_DIR}/|${WHEEL_CONTAINER_DIR}/|g" \
+        /opt/needle_mgn/uv.lock
+
+    # ---- Install Python environment -------------------------------------
+    cd /opt/needle_mgn
+    uv sync --frozen --python python3.13 --extra cu12
+
+    # ---- Strip large generated artifacts from examples -----------------
+    # These are runtime outputs that should live outside the container
+    # (bind-mount your own checkpoints/outputs/inference directories).
+    rm -rf \
+        examples/cfd/needle_tissue_cropped/inference_output \
+        examples/cfd/needle_tissue_cropped/checkpoints \
+        examples/cfd/needle_tissue_cropped/outputs \
+        examples/cfd/needle_tissue_domino/inference_output \
+        examples/cfd/needle_tissue_domino/checkpoints \
+        examples/cfd/needle_tissue_domino/checkpoints_no_fft \
+        examples/cfd/needle_tissue_domino/outputs
+
+    find /opt/needle_mgn/examples -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+    # ---- Dataset mount point -------------------------------------------
+    mkdir -p /data/RUN-2
+
+%runscript
+    cd /opt/needle_mgn
+    exec "$@"
+
+%help
+    PhysicsNeMo needle-tissue simulation container.
+
+    Dataset bind mount
+    ------------------
+    The simulation dataset (RUN-2/) is NOT included in this image.
+    Bind it at /data/RUN-2 when running:
+
+        apptainer exec --bind /your/path/to/RUN-2:/data/RUN-2 --nv needle_mgn.sif <command>
+
+    The config files default data_dir to ../../../RUN-2 relative to the
+    example scripts, which resolves to /data/RUN-2 when running from the
+    /opt/needle_mgn root.  Override with a Hydra argument if needed:
+
+        uv run python examples/cfd/needle_tissue_domino/train.py data_dir=/data/RUN-2
+
+    Persisting outputs
+    ------------------
+    Bind mount host directories over the output paths to persist across runs:
+
+        --bind /host/checkpoints:/opt/needle_mgn/examples/cfd/needle_tissue_domino/checkpoints
+        --bind /host/outputs:/opt/needle_mgn/examples/cfd/needle_tissue_domino/outputs
+        --bind /host/inference:/opt/needle_mgn/examples/cfd/needle_tissue_domino/inference_output
+
+    GPU
+    ---
+    Always pass --nv to enable GPU access inside the container.
