@@ -48,6 +48,7 @@ From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-rockylinux9
     __init__.py /opt/needle_mgn/__init__.py
     pyproject.toml /opt/needle_mgn/pyproject.toml
     uv.lock /opt/needle_mgn/uv.lock
+    README.md /opt/needle_mgn/README.md
 
     # Example scripts and configs (large generated artifacts removed in %post)
     examples /opt/needle_mgn/examples
