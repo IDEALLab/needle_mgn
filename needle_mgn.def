@@ -56,7 +56,7 @@ From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-rockylinux9
     /home/nathanielhoffman/Downloads/torch_scatter-2.1.2+pt210cu128-cp313-cp313-linux_x86_64.whl /opt/wheels/torch_scatter-2.1.2+pt210cu128-cp313-cp313-linux_x86_64.whl
 
 %environment
-    export PATH=/opt/uv/bin:/opt/needle_mgn/.venv/bin:$PATH
+    export PATH=/opt/uv:/opt/needle_mgn/.venv/bin:$PATH
     export VIRTUAL_ENV=/opt/needle_mgn/.venv
     export PYTHONPATH=/opt/needle_mgn:$PYTHONPATH
     # Point Hydra at the correct working dir when running from anywhere
@@ -66,7 +66,7 @@ From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-rockylinux9
     set -e
 
     # ---- System packages ------------------------------------------------
-    dnf install -y \
+    dnf install -y --allowerasing \
         curl \
         git \
         libgomp \
@@ -75,7 +75,7 @@ From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-rockylinux9
 
     # ---- uv (manages Python 3.13 itself — no distro repo needed) --------
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/opt/uv sh
-    export PATH=/opt/uv/bin:$PATH
+    export PATH=/opt/uv:$PATH
 
     # Let uv download and manage Python 3.13 so we don't depend on any
     # distro package server for the Python version.
