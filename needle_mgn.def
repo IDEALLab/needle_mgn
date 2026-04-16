@@ -34,12 +34,13 @@
 # from /opt/needle_mgn).
 
 Bootstrap: docker
-From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-rockylinux9
 
 %labels
     Description PhysicsNeMo needle-tissue simulation container (MGN + DCEL-DoMINO)
     CUDA 12.8
     Python 3.13
+    OS Rocky Linux 9
 
 %files
     # Core library
@@ -65,29 +66,20 @@ From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     set -e
 
     # ---- System packages ------------------------------------------------
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y --no-install-recommends \
-        software-properties-common \
+    dnf install -y \
         curl \
         git \
-        libgomp1 \
+        libgomp \
         ca-certificates
+    dnf clean all
 
-    # Python 3.13 via deadsnakes PPA (Ubuntu 24.04 ships 3.12 by default)
-    add-apt-repository -y ppa:deadsnakes/ppa
-    apt-get update -qq
-    apt-get install -y --no-install-recommends \
-        python3.13 \
-        python3.13-dev \
-        python3.13-venv
-
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-
-    # ---- uv -------------------------------------------------------------
+    # ---- uv (manages Python 3.13 itself — no distro repo needed) --------
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/opt/uv sh
     export PATH=/opt/uv/bin:$PATH
+
+    # Let uv download and manage Python 3.13 so we don't depend on any
+    # distro package server for the Python version.
+    uv python install 3.13
 
     # ---- Patch local wheel path in pyproject.toml and uv.lock ----------
     # The wheel was installed on the build host at a user-specific path.
@@ -104,7 +96,7 @@ From: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
     # ---- Install Python environment -------------------------------------
     cd /opt/needle_mgn
-    uv sync --frozen --python python3.13 --extra cu12
+    uv sync --frozen --python 3.13 --extra cu12
 
     # ---- Strip large generated artifacts from examples -----------------
     # These are runtime outputs that should live outside the container
