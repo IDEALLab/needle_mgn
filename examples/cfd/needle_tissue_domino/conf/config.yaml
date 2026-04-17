@@ -136,11 +136,20 @@ model:
     activation: ${model.activation}
 
 # -------------------------
+# Features
+# -------------------------
+# Set to false to drop contact-pressure (cpress) from state inputs and targets.
+# With cpress: node_state_dim_vol=27, output_dim=17
+# Without cpress: node_state_dim_vol=26, output_dim=16
+use_cpress: true
+
+# -------------------------
 # Fourier feature encoding on per-node state inputs (DCEL extension).
 # When enabled, state_vol is mapped through [sin(xB), cos(xB)] before being
 # concatenated into the position encoder.
 # n_fourier_features_state controls projection count (output = 2 × n).
 # fourier_scale_state is the std of the Gaussian used to sample B.
+# node_state_dim_vol is derived from use_cpress in train.py.
 node_state_dim_vol: 27
 use_fourier_features_state: true
 n_fourier_features_state: 64

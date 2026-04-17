@@ -62,12 +62,19 @@ full_needle_tissue_mm: 7.0
 crop_strategy_weights: [0.7, 0.15, 0.15]
 
 # -------------------------
+# Features
+# -------------------------
+# Set to false to drop contact-pressure (cpress) from inputs and targets.
+# With cpress: input_dim_nodes=30, output_dim=17
+# Without cpress: input_dim_nodes=29, output_dim=16
+use_cpress: true
+
+# -------------------------
 # Model architecture
 # -------------------------
-# COORD(3)+U(3)+V(3)+A(3)+EVF(1)+S(6)+CPRESS(1) + 8 mat props (10) = 30
-input_dim_nodes: 30
+# input_dim_nodes and output_dim are derived from use_cpress in train.py;
+# the values below are the reference with use_cpress=true.
 input_dim_edges: 7
-output_dim: 9
 
 # Random Fourier Feature encoding on node inputs.
 # When enabled, node features are mapped through [sin(xB), cos(xB)] before the

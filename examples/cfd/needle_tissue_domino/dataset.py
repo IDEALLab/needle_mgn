@@ -234,9 +234,6 @@ class NeedleTissueDominoDataset(Dataset):
         ``None`` uses all nodes.
     """
 
-    TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
-    TARGET_DIMS = [3, 3, 3, 1, 6, 1]
-
     def __init__(
         self,
         data_dir: str,
@@ -247,9 +244,22 @@ class NeedleTissueDominoDataset(Dataset):
         stats_path: str = ".",
         num_sample_nodes: Optional[int] = None,
         timestep_stride: int = 1,
+        use_cpress: bool = True,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"Invalid split: '{split}'")
+
+        self.use_cpress = use_cpress
+        if use_cpress:
+            self.TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
+            self.TARGET_DIMS = [3, 3, 3, 1, 6, 1]
+            self._state_keys = STATE_KEYS
+            self._state_dims = STATE_DIMS
+        else:
+            self.TARGET_KEYS = ["u", "v", "a", "evf", "s"]
+            self.TARGET_DIMS = [3, 3, 3, 1, 6]
+            self._state_keys = [k for k in STATE_KEYS if k != "cpress"]
+            self._state_dims = [d for k, d in zip(STATE_KEYS, STATE_DIMS) if k != "cpress"]
 
         self.split = split
         self.num_sample_nodes = num_sample_nodes
@@ -454,6 +464,20 @@ class NeedleTissueDominoDataset(Dataset):
             self._target_stats = load_json(os.path.join(stats_path, "domino_target_stats.json"))
 
     # ------------------------------------------------------------------
+    # Dimension properties (depend on use_cpress)
+    # ------------------------------------------------------------------
+
+    @property
+    def node_state_dim(self) -> int:
+        """Per-node state feature dimension: dynamic state + static material props."""
+        return sum(self._state_dims) + sum(STATIC_PROP_DIMS)
+
+    @property
+    def output_dim(self) -> int:
+        """Total target output dimension."""
+        return sum(self.TARGET_DIMS)
+
+    # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
 
@@ -491,7 +515,7 @@ class NeedleTissueDominoDataset(Dataset):
 
         # --- State features at all nodes (normalised) -----------------------
         state_parts = []
-        for key in STATE_KEYS:
+        for key in self._state_keys:
             feat = ft[key][t_local]
             mean = self._node_stats[f"{key}_mean"]
             std = self._node_stats[f"{key}_std"]
@@ -560,7 +584,7 @@ class NeedleTissueDominoDataset(Dataset):
         self,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Compute mean/std across all training runs and frames."""
-        key_data = {key: [] for key in STATE_KEYS}
+        key_data = {key: [] for key in self._state_keys}
         prop_data = {key: [] for key in STATIC_PROP_KEYS}
         tgt_data = {key: [] for key in self.TARGET_KEYS}
 
@@ -570,7 +594,7 @@ class NeedleTissueDominoDataset(Dataset):
             pair_locals = [t for r, t in self._samples if r == r_idx]
             t1_locals = [t + 1 for t in pair_locals]
 
-            for key in STATE_KEYS:
+            for key in self._state_keys:
                 key_data[key].append(ft[key][pair_locals])
             for key in STATIC_PROP_KEYS:
                 prop_data[key].append(node_props[key])
@@ -578,7 +602,7 @@ class NeedleTissueDominoDataset(Dataset):
                 tgt_data[key].append(ft[key][t1_locals] - ft[key][pair_locals])
 
         node_stats: Dict[str, torch.Tensor] = {}
-        for key, dim in zip(STATE_KEYS, STATE_DIMS):
+        for key, dim in zip(self._state_keys, self._state_dims):
             flat = torch.cat(key_data[key], dim=0).reshape(-1, dim).float()
             node_stats[f"{key}_mean"] = flat.mean(0)
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)

@@ -59,6 +59,7 @@ class MGNTrainer:
         data_dir = to_absolute_path(cfg.data_dir)
 
         crop_strategy_weights = tuple(cfg.crop_strategy_weights)
+        use_cpress = bool(cfg.get("use_cpress", True))
         train_dataset = NeedleTissueDataset(
             data_dir=data_dir,
             split="train",
@@ -72,6 +73,7 @@ class MGNTrainer:
             stats_path=stats_dir,
             cache_dir=data_dir,
             timestep_stride=cfg.get("timestep_stride", 1),
+            use_cpress=use_cpress,
         )
         val_dataset = NeedleTissueDataset(
             data_dir=data_dir,
@@ -86,6 +88,7 @@ class MGNTrainer:
             stats_path=stats_dir,
             cache_dir=data_dir,
             timestep_stride=cfg.get("timestep_stride", 1),
+            use_cpress=use_cpress,
         )
 
         train_sampler = DistributedSampler(
@@ -115,9 +118,9 @@ class MGNTrainer:
         )
 
         self.model = MeshGraphNet(
-            input_dim_nodes=cfg.input_dim_nodes,
+            input_dim_nodes=train_dataset.input_dim_nodes,
             input_dim_edges=cfg.input_dim_edges,
-            output_dim=cfg.output_dim,
+            output_dim=train_dataset.output_dim,
             processor_size=cfg.processor_size,
             hidden_dim_node_encoder=cfg.hidden_dim_node_encoder,
             hidden_dim_edge_encoder=cfg.hidden_dim_edge_encoder,

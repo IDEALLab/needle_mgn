@@ -45,7 +45,6 @@ from omegaconf import DictConfig, OmegaConf
 from scipy.spatial import cKDTree
 
 from dataset import (
-    NODE_STATE_DIM,
     STATE_DIMS,
     STATE_KEYS,
     STATIC_PROP_KEYS,
@@ -79,6 +78,8 @@ def _build_step_data_dict(
     node_stats: dict,
     t_abs: int,
     n_total_frames: int,
+    state_keys: list,
+    state_dims: list,
 ) -> dict:
     """Construct the DoMINO data_dict from the current running state."""
     coord = state["coord"]                            # (N, 3)
@@ -113,7 +114,7 @@ def _build_step_data_dict(
 
     # Per-node state features (dynamic + static material props)
     state_parts = []
-    for key, dim in zip(STATE_KEYS, STATE_DIMS):
+    for key, dim in zip(state_keys, state_dims):
         feat = state.get(key, torch.zeros(n_nodes, dim))
         mean = node_stats[f"{key}_mean"]
         std = node_stats[f"{key}_std"]
@@ -123,7 +124,7 @@ def _build_step_data_dict(
         mean = node_stats[f"{key}_mean"]
         std = node_stats[f"{key}_std"]
         state_parts.append((feat - mean) / std)
-    state_vol = torch.cat(state_parts, dim=-1)        # (N, NODE_STATE_DIM)
+    state_vol = torch.cat(state_parts, dim=-1)
 
     def b(t: torch.Tensor) -> torch.Tensor:
         return t.unsqueeze(0)
@@ -147,15 +148,15 @@ def _build_step_data_dict(
     }
 
 
-_TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
-_TARGET_DIMS = [3, 3, 3, 1, 6, 1]
+_ALL_TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
+_ALL_TARGET_DIMS = [3, 3, 3, 1, 6, 1]
 
 
-def _denorm_target(pred: torch.Tensor, target_stats: dict) -> dict:
-    """Un-normalise model output (N, 17) → {u, v, a, evf, s, cpress}."""
+def _denorm_target(pred: torch.Tensor, target_stats: dict, target_keys: list, target_dims: list) -> dict:
+    """Un-normalise model output → dict of predicted-state tensors."""
     out = {}
     offset = 0
-    for key, dim in zip(_TARGET_KEYS, _TARGET_DIMS):
+    for key, dim in zip(target_keys, target_dims):
         mean = target_stats[f"{key}_mean"]
         std = target_stats[f"{key}_std"]
         out[key] = pred[:, offset : offset + dim] * std + mean
@@ -327,19 +328,36 @@ def main(cfg: DictConfig) -> None:
     )
     os.makedirs(out_dir, exist_ok=True)
 
+    # ---- Feature lists (controlled by use_cpress) -------------------------
+    use_cpress = bool(cfg.get("use_cpress", True))
+    if use_cpress:
+        target_keys = _ALL_TARGET_KEYS
+        target_dims = _ALL_TARGET_DIMS
+        state_keys  = list(STATE_KEYS)
+        state_dims  = list(STATE_DIMS)
+    else:
+        target_keys = [k for k in _ALL_TARGET_KEYS if k != "cpress"]
+        target_dims = [d for k, d in zip(_ALL_TARGET_KEYS, _ALL_TARGET_DIMS) if k != "cpress"]
+        state_keys  = [k for k in STATE_KEYS if k != "cpress"]
+        state_dims  = [d for k, d in zip(STATE_KEYS, STATE_DIMS) if k != "cpress"]
+
+    node_state_dim = sum(state_dims) + sum(STATIC_PROP_DIMS)
+    output_dim     = sum(target_dims)
+
     print(
         f"Rollout: start_frame={infer_start}, n_rollout={n_rollout}, "
-        f"GT available for {n_frames - 1 - infer_start} steps"
+        f"GT available for {n_frames - 1 - infer_start} steps\n"
+        f"use_cpress={use_cpress}: node_state_dim={node_state_dim}, output_dim={output_dim}"
     )
 
     # ---- Model --------------------------------------------------------------
     model = DoMINO(
         input_features=3,
-        output_features_vol=cfg.output_dim,
+        output_features_vol=output_dim,
         output_features_surf=None,
         global_features=cfg.global_features,
         model_parameters=OmegaConf.to_container(cfg.model, resolve=True),
-        node_state_dim_vol=NODE_STATE_DIM,
+        node_state_dim_vol=node_state_dim,
         use_fourier_features_state=cfg.get("use_fourier_features_state", False),
         n_fourier_features_state=cfg.get("n_fourier_features_state", 64),
         fourier_scale_state=cfg.get("fourier_scale_state", 1.0),
@@ -394,8 +412,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ---- Initial state -------------------------------------------------------
-    # cpress uses the start-frame value and stays fixed during rollout.
-    state: dict = {k: frame_tensors[k][infer_start].clone().float() for k in STATE_KEYS}
+    state: dict = {k: frame_tensors[k][infer_start].clone().float() for k in state_keys}
     state["coord"] = frame_tensors["coord"][infer_start].clone().float()
 
     # ---- Consensus filter precomputation ------------------------------------
@@ -431,15 +448,16 @@ def main(cfg: DictConfig) -> None:
                 grid_xyz, grid_xyz_flat,
                 grid_min, grid_max,
                 node_stats, t_abs, n_frames,
+                state_keys, state_dims,
             )
             data_dict = {
                 k: v.to(dist.device) if isinstance(v, torch.Tensor) else v
                 for k, v in data_dict.items()
             }
 
-            pred_vol, _ = model(data_dict)               # (1, N, 9)
-            pred_vol = pred_vol.squeeze(0).cpu()         # (N, 9)
-            next_uvw = _denorm_target(pred_vol, target_stats)
+            pred_vol, _ = model(data_dict)
+            pred_vol = pred_vol.squeeze(0).cpu()
+            next_uvw = _denorm_target(pred_vol, target_stats, target_keys, target_dims)
 
             # Consensus filter: attenuate needle displacement not shared by neighbours
             if consensus_attenuation > 0.0:
@@ -448,12 +466,8 @@ def main(cfg: DictConfig) -> None:
                 )
 
             # Accumulate increments
-            state["u"]      = state["u"]      + next_uvw["u"]
-            state["v"]      = state["v"]      + next_uvw["v"]
-            state["a"]      = state["a"]      + next_uvw["a"]
-            state["evf"]    = state["evf"]    + next_uvw["evf"]
-            state["s"]      = state["s"]      + next_uvw["s"]
-            state["cpress"] = state["cpress"] + next_uvw["cpress"]
+            for _key in target_keys:
+                state[_key] = state[_key] + next_uvw[_key]
 
             # Advance Lagrangian needle positions
             state["coord"][needle_idx] += next_uvw["u"][needle_idx]

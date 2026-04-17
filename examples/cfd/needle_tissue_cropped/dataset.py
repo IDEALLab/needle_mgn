@@ -393,12 +393,8 @@ class NeedleTissueDataset(Dataset):
         Directory for the preprocessed cache file.
     """
 
-    INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s", "cpress"]
-    INPUT_DIMS = [3, 3, 3, 3, 1, 6, 1]
     STATIC_PROP_KEYS = _STATIC_PROP_KEYS
     STATIC_PROP_DIMS = _STATIC_PROP_DIMS
-    TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
-    TARGET_DIMS = [3, 3, 3, 1, 6, 1]
 
     def __init__(
         self,
@@ -414,9 +410,22 @@ class NeedleTissueDataset(Dataset):
         stats_path: str = ".",
         cache_dir: Optional[str] = None,
         timestep_stride: int = 1,
+        use_cpress: bool = True,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
+
+        self.use_cpress = use_cpress
+        if use_cpress:
+            self.INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s", "cpress"]
+            self.INPUT_DIMS = [3, 3, 3, 3, 1, 6, 1]
+            self.TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
+            self.TARGET_DIMS = [3, 3, 3, 1, 6, 1]
+        else:
+            self.INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s"]
+            self.INPUT_DIMS = [3, 3, 3, 3, 1, 6]
+            self.TARGET_KEYS = ["u", "v", "a", "evf", "s"]
+            self.TARGET_DIMS = [3, 3, 3, 1, 6]
 
         self.split = split
         self.stats_path = stats_path
@@ -597,6 +606,20 @@ class NeedleTissueDataset(Dataset):
         else:
             self._node_stats = load_json(os.path.join(stats_path, "node_stats.json"))
             self._target_stats = load_json(os.path.join(stats_path, "target_stats.json"))
+
+    # ------------------------------------------------------------------
+    # Dimension properties (depend on use_cpress)
+    # ------------------------------------------------------------------
+
+    @property
+    def input_dim_nodes(self) -> int:
+        """Total node feature dimension: dynamic inputs + static material props."""
+        return sum(self.INPUT_DIMS) + sum(self.STATIC_PROP_DIMS)
+
+    @property
+    def output_dim(self) -> int:
+        """Total target output dimension."""
+        return sum(self.TARGET_DIMS)
 
     # ------------------------------------------------------------------
     # Dataset interface

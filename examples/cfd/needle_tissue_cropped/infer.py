@@ -67,18 +67,20 @@ from physicsnemo.datapipes.gnn.utils import load_json
 # Constants / helpers
 # ---------------------------------------------------------------------------
 
-INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s", "cpress"]
-STATIC_PROP_KEYS = ["mat_E", "mat_c10", "mat_density", "mat_fiber", "mat_k1", "mat_k2", "mat_kappa", "mat_nu"]
-TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
-TARGET_DIMS = [3, 3, 3, 1, 6, 1]
+_ALL_INPUT_KEYS    = ["coord", "u", "v", "a", "evf", "s", "cpress"]
+_ALL_INPUT_DIMS    = [3, 3, 3, 3, 1, 6, 1]
+_ALL_TARGET_KEYS   = ["u", "v", "a", "evf", "s", "cpress"]
+_ALL_TARGET_DIMS   = [3, 3, 3, 1, 6, 1]
+STATIC_PROP_KEYS   = ["mat_E", "mat_c10", "mat_density", "mat_fiber", "mat_k1", "mat_k2", "mat_kappa", "mat_nu"]
+_STATIC_PROP_DIMS  = [1, 1, 1, 3, 1, 1, 1, 1]
 
 _WORLD_EDGE_TYPE = torch.tensor([[0.0, 0.0, 1.0]])
 
 
-def _normalize(state: dict, node_props: dict, node_stats: dict) -> torch.Tensor:
+def _normalize(state: dict, node_props: dict, node_stats: dict, input_keys: list) -> torch.Tensor:
     """Concatenate and normalise all input features (dynamic + static material props)."""
     parts = []
-    for key in INPUT_KEYS:
+    for key in input_keys:
         feat = state[key]
         mean = node_stats[f"{key}_mean"]
         std = node_stats[f"{key}_std"]
@@ -91,11 +93,11 @@ def _normalize(state: dict, node_props: dict, node_stats: dict) -> torch.Tensor:
     return torch.cat(parts, dim=-1)
 
 
-def _denorm_target(pred: torch.Tensor, target_stats: dict) -> dict:
-    """Un-normalise model output (N, 17) → dict of {u, v, a, evf, s, cpress} tensors."""
+def _denorm_target(pred: torch.Tensor, target_stats: dict, target_keys: list, target_dims: list) -> dict:
+    """Un-normalise model output → dict of predicted-state tensors."""
     out = {}
     offset = 0
-    for key, dim in zip(TARGET_KEYS, TARGET_DIMS):
+    for key, dim in zip(target_keys, target_dims):
         mean = target_stats[f"{key}_mean"]
         std = target_stats[f"{key}_std"]
         out[key] = pred[:, offset : offset + dim] * std + mean
@@ -229,6 +231,7 @@ def _build_step_graph(
     world_et: torch.Tensor,
     n_nodes: int,
     node_stats: dict,
+    input_keys: list,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -249,7 +252,7 @@ def _build_step_graph(
             all_et = torch.cat([sub_et_hex, world_et[keep]], dim=0)
 
     coord_sub = state["coord"][part_nodes]
-    x_sub = _normalize(state, node_props, node_stats)[part_nodes]
+    x_sub = _normalize(state, node_props, node_stats, input_keys)[part_nodes]
 
     src, dst = all_ei
     rel_pos = coord_sub[src] - coord_sub[dst]
@@ -374,17 +377,34 @@ def main(cfg: DictConfig) -> None:
     needle_crop_mm = float(cfg.needle_crop_mm)
     tissue_crop_mm = float(cfg.tissue_crop_mm)
 
+    # ---- Feature lists (controlled by use_cpress) ------------------------
+    use_cpress = bool(cfg.get("use_cpress", True))
+    if use_cpress:
+        input_keys  = _ALL_INPUT_KEYS
+        input_dims  = _ALL_INPUT_DIMS
+        target_keys = _ALL_TARGET_KEYS
+        target_dims = _ALL_TARGET_DIMS
+    else:
+        input_keys  = [k for k in _ALL_INPUT_KEYS  if k != "cpress"]
+        input_dims  = [d for k, d in zip(_ALL_INPUT_KEYS, _ALL_INPUT_DIMS)  if k != "cpress"]
+        target_keys = [k for k in _ALL_TARGET_KEYS if k != "cpress"]
+        target_dims = [d for k, d in zip(_ALL_TARGET_KEYS, _ALL_TARGET_DIMS) if k != "cpress"]
+
+    input_dim_nodes = sum(input_dims) + sum(_STATIC_PROP_DIMS)
+    output_dim      = sum(target_dims)
+
     print(
         f"Rollout: start_frame={infer_start}, n_rollout={n_rollout}, "
         f"GT available for {n_steps_with_gt} steps\n"
-        f"Crop: needle≤{needle_crop_mm}mm, tissue≤{tissue_crop_mm}mm"
+        f"Crop: needle≤{needle_crop_mm}mm, tissue≤{tissue_crop_mm}mm\n"
+        f"use_cpress={use_cpress}: input_dim_nodes={input_dim_nodes}, output_dim={output_dim}"
     )
 
     # ---- Model -----------------------------------------------------------
     model = MeshGraphNet(
-        input_dim_nodes=cfg.input_dim_nodes,
+        input_dim_nodes=input_dim_nodes,
         input_dim_edges=cfg.input_dim_edges,
-        output_dim=cfg.output_dim,
+        output_dim=output_dim,
         processor_size=cfg.processor_size,
         hidden_dim_node_encoder=cfg.hidden_dim_node_encoder,
         hidden_dim_edge_encoder=cfg.hidden_dim_edge_encoder,
@@ -480,9 +500,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     # ---- Initial state ---------------------------------------------------
-    # cpress is included in INPUT_KEYS; it stays fixed at the start-frame value
-    # during rollout since the model does not predict it.
-    state = {k: frame_tensors[k][infer_start].clone().float() for k in INPUT_KEYS}
+    state = {k: frame_tensors[k][infer_start].clone().float() for k in input_keys}
 
     # ---- Output mesh topology -----------------------------------------------
     # HEX cells are fixed; LINE cells (world/contact edges) update each step.
@@ -528,11 +546,11 @@ def main(cfg: DictConfig) -> None:
                 state, node_props, part_nodes,
                 hex_edge_index, hex_edge_type_onehot,
                 world_ei, world_et,
-                n_nodes, node_stats,
+                n_nodes, node_stats, input_keys,
             )
             graph = graph.to(dist.device)
             pred_sub = model(graph.x, graph.edge_attr, graph).cpu()
-            next_uvw_sub = _denorm_target(pred_sub, target_stats)
+            next_uvw_sub = _denorm_target(pred_sub, target_stats, target_keys, target_dims)
 
             # --- Consensus filter on needle displacement ----------------------
             # part_nodes is the full mesh here, so needle_local_ei (global) maps directly.
@@ -549,12 +567,8 @@ def main(cfg: DictConfig) -> None:
                 next_uvw_sub["u"][needle_local_in_part] = u_needle_filtered
 
             # --- Integrate increments — only for nodes inside the crop ---
-            state["u"][part_nodes]      = state["u"][part_nodes]      + next_uvw_sub["u"]
-            state["v"][part_nodes]      = state["v"][part_nodes]      + next_uvw_sub["v"]
-            state["a"][part_nodes]      = state["a"][part_nodes]      + next_uvw_sub["a"]
-            state["evf"][part_nodes]    = state["evf"][part_nodes]    + next_uvw_sub["evf"]
-            state["s"][part_nodes]      = state["s"][part_nodes]      + next_uvw_sub["s"]
-            state["cpress"][part_nodes] = state["cpress"][part_nodes] + next_uvw_sub["cpress"]
+            for _key in target_keys:
+                state[_key][part_nodes] = state[_key][part_nodes] + next_uvw_sub[_key]
 
             # Advance Lagrangian (needle) node positions for cropped needle nodes
             needle_in_crop = part_nodes[

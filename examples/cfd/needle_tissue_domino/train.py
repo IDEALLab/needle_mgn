@@ -37,7 +37,7 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from dataset import NODE_STATE_DIM, NeedleTissueDominoDataset
+from dataset import NeedleTissueDominoDataset
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.models.domino.model import DoMINO
 from physicsnemo.utils import load_checkpoint, save_checkpoint
@@ -74,6 +74,7 @@ def main(cfg: DictConfig) -> None:
     grid_res = tuple(cfg.grid_res)
 
     # ---- Datasets -----------------------------------------------------------
+    use_cpress = bool(cfg.get("use_cpress", True))
     train_dataset = NeedleTissueDominoDataset(
         data_dir=data_dir,
         split="train",
@@ -83,6 +84,7 @@ def main(cfg: DictConfig) -> None:
         stats_path=stats_dir,
         num_sample_nodes=cfg.get("num_sample_nodes", None),
         timestep_stride=cfg.get("timestep_stride", 1),
+        use_cpress=use_cpress,
     )
     val_dataset = NeedleTissueDominoDataset(
         data_dir=data_dir,
@@ -93,6 +95,7 @@ def main(cfg: DictConfig) -> None:
         stats_path=stats_dir,
         num_sample_nodes=cfg.get("num_sample_nodes", None),
         timestep_stride=cfg.get("timestep_stride", 1),
+        use_cpress=use_cpress,
     )
 
     train_sampler = DistributedSampler(
@@ -118,11 +121,11 @@ def main(cfg: DictConfig) -> None:
     # ---- Model --------------------------------------------------------------
     model = DoMINO(
         input_features=3,                          # needle xyz only in geometry conv
-        output_features_vol=cfg.output_dim,        # Δu Δv Δa = 9
+        output_features_vol=train_dataset.output_dim,
         output_features_surf=None,                 # volume-only mode
         global_features=cfg.global_features,
         model_parameters=OmegaConf.to_container(cfg.model, resolve=True),
-        node_state_dim_vol=NODE_STATE_DIM,         # 30: u v a evf s cf cpress + 8 mat props
+        node_state_dim_vol=train_dataset.node_state_dim,
         use_fourier_features_state=cfg.get("use_fourier_features_state", False),
         n_fourier_features_state=cfg.get("n_fourier_features_state", 64),
         fourier_scale_state=cfg.get("fourier_scale_state", 1.0),
