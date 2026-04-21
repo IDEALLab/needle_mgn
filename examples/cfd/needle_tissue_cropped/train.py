@@ -44,8 +44,7 @@ from physicsnemo.utils.logging.wandb import initialize_wandb
 
 
 def _collate(batch):
-    """Unwrap single-item batch into a PyG Batch object."""
-    assert len(batch) == 1
+    """Collate a list of PyG Data objects into a single Batch."""
     return Batch.from_data_list(batch)
 
 
