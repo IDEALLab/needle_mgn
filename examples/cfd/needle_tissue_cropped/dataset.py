@@ -411,11 +411,14 @@ class NeedleTissueDataset(Dataset):
         cache_dir: Optional[str] = None,
         timestep_stride: int = 1,
         use_cpress: bool = True,
+        per_region_norm: bool = False,
+        max_frames_per_run: Optional[int] = None,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
 
         self.use_cpress = use_cpress
+        self.per_region_norm = per_region_norm
         if use_cpress:
             self.INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s", "cpress"]
             self.INPUT_DIMS = [3, 3, 3, 3, 1, 6, 1]
@@ -509,17 +512,41 @@ class NeedleTissueDataset(Dataset):
                     self.edge_type_onehot = cache["edge_type_onehot"]
                     self.n_nodes = int(self.edge_index.max().item()) + 1
 
+                # Optionally subsample frames within the run to cap RAM usage.
+                # Uniform subsampling preserves temporal coverage while keeping
+                # at most max_frames_per_run consecutive-pair samples in memory.
+                if max_frames_per_run is not None and n_frames_run > max_frames_per_run:
+                    keep_idx = np.round(
+                        np.linspace(0, n_frames_run - 1, max_frames_per_run)
+                    ).astype(int)
+                    # Deduplicate and sort (linspace can repeat endpoints at small N)
+                    keep_idx = sorted(set(keep_idx.tolist()))
+                    run_frames: Dict = {
+                        key: cache["frame_tensors"][key][keep_idx]
+                        for key in self.INPUT_KEYS
+                    }
+                    run_world_edges = [cache["world_edges"][i] for i in keep_idx]
+                    n_kept = len(keep_idx)
+                    print(
+                        f"  RUN-{run_id}: subsampled {n_frames_run} → {n_kept} frames "
+                        f"(max_frames_per_run={max_frames_per_run})"
+                    )
+                else:
+                    run_frames = {
+                        key: cache["frame_tensors"][key]
+                        for key in self.INPUT_KEYS
+                    }
+                    run_world_edges = cache["world_edges"]
+                    n_kept = n_frames_run
+
                 self._run_data.append(
                     {
-                        "frame_tensors": {
-                            key: cache["frame_tensors"][key]
-                            for key in self.INPUT_KEYS
-                        },
-                        "world_edges": cache["world_edges"],
+                        "frame_tensors": run_frames,
+                        "world_edges": run_world_edges,
                         "node_props": cache["node_props"],
                     }
                 )
-                for t in range(n_frames_run - 1):
+                for t in range(n_kept - 1):
                     self._samples.append((r_idx, t))
 
         else:
@@ -583,6 +610,9 @@ class NeedleTissueDataset(Dataset):
         )
         self.needle_node_indices: np.ndarray = needle_idx
         self.tissue_node_indices: np.ndarray = tissue_idx
+        # Cached as torch long tensors for fast per-region indexing in _build_graph
+        self._needle_idx_t = torch.from_numpy(needle_idx.astype(np.int64))
+        self._tissue_idx_t = torch.from_numpy(tissue_idx.astype(np.int64))
         print(
             f"Node sets: {len(needle_idx)} needle, {len(tissue_idx)} tissue "
             f"(total {self.n_nodes})"
@@ -733,24 +763,38 @@ class NeedleTissueDataset(Dataset):
         # Node features (normalised): dynamic frame features + static material props
         x_parts = []
         for key in self.INPUT_KEYS:
-            feat = ft[key][t_local]
-            mean = self._node_stats[f"{key}_mean"]
-            std = self._node_stats[f"{key}_std"]
-            x_parts.append((feat - mean) / std)
+            feat = ft[key][t_local]  # (n_nodes, dim)
+            if self.per_region_norm:
+                feat_norm = feat.clone()
+                feat_norm[self._needle_idx_t] = (
+                    feat[self._needle_idx_t] - self._node_stats[f"{key}_needle_mean"]
+                ) / self._node_stats[f"{key}_needle_std"]
+                feat_norm[self._tissue_idx_t] = (
+                    feat[self._tissue_idx_t] - self._node_stats[f"{key}_tissue_mean"]
+                ) / self._node_stats[f"{key}_tissue_std"]
+                x_parts.append(feat_norm)
+            else:
+                x_parts.append((feat - self._node_stats[f"{key}_mean"]) / self._node_stats[f"{key}_std"])
         for key in self.STATIC_PROP_KEYS:
             feat = node_props[key]
-            mean = self._node_stats[f"{key}_mean"]
-            std = self._node_stats[f"{key}_std"]
-            x_parts.append((feat - mean) / std)
+            x_parts.append((feat - self._node_stats[f"{key}_mean"]) / self._node_stats[f"{key}_std"])
         x = torch.cat(x_parts, dim=-1)
 
         # Target: normalised increments Δf = f_{t+1} - f_t
         y_parts = []
         for key in self.TARGET_KEYS:
-            delta = ft[key][t1_local] - ft[key][t_local]
-            mean = self._target_stats[f"{key}_mean"]
-            std = self._target_stats[f"{key}_std"]
-            y_parts.append((delta - mean) / std)
+            delta = ft[key][t1_local] - ft[key][t_local]  # (n_nodes, dim)
+            if self.per_region_norm:
+                delta_norm = delta.clone()
+                delta_norm[self._needle_idx_t] = (
+                    delta[self._needle_idx_t] - self._target_stats[f"{key}_needle_mean"]
+                ) / self._target_stats[f"{key}_needle_std"]
+                delta_norm[self._tissue_idx_t] = (
+                    delta[self._tissue_idx_t] - self._target_stats[f"{key}_tissue_mean"]
+                ) / self._target_stats[f"{key}_tissue_std"]
+                y_parts.append(delta_norm)
+            else:
+                y_parts.append((delta - self._target_stats[f"{key}_mean"]) / self._target_stats[f"{key}_std"])
         y = torch.cat(y_parts, dim=-1)
 
         # HEX subgraph restricted to the crop
@@ -797,7 +841,15 @@ class NeedleTissueDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _compute_stats(self) -> Tuple[Dict, Dict]:
-        """Compute per-feature mean/std across all training samples and runs."""
+        """Compute per-feature mean/std across all training samples and runs.
+
+        When ``per_region_norm=True`` the stats JSON also contains
+        ``{key}_needle_mean``, ``{key}_needle_std``, ``{key}_tissue_mean``,
+        ``{key}_tissue_std`` entries computed from needle-only and tissue-only
+        node subsets respectively.  This corrects the scale mismatch for features
+        like contact pressure (non-zero only on needle contact nodes) and stress
+        (very different magnitudes between the stiff needle and soft tissue).
+        """
         key_data = {key: [] for key in self.INPUT_KEYS}
         prop_data = {key: [] for key in self.STATIC_PROP_KEYS}
         tgt_data = {key: [] for key in self.TARGET_KEYS}
@@ -816,10 +868,21 @@ class NeedleTissueDataset(Dataset):
                 tgt_data[key].append(ft[key][t1_locals] - ft[key][pair_locals])
 
         node_stats: Dict[str, torch.Tensor] = {}
+
         for key, dim in zip(self.INPUT_KEYS, self.INPUT_DIMS):
-            flat = torch.cat(key_data[key], dim=0).reshape(-1, dim).float()
+            # all_data: (total_pairs, n_nodes, dim)
+            all_data = torch.cat(key_data[key], dim=0).float()
+            flat = all_data.reshape(-1, dim)
             node_stats[f"{key}_mean"] = flat.mean(0)
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
+
+            if self.per_region_norm:
+                flat_n = all_data[:, self._needle_idx_t, :].reshape(-1, dim)
+                node_stats[f"{key}_needle_mean"] = flat_n.mean(0)
+                node_stats[f"{key}_needle_std"] = flat_n.std(0).clamp(min=1e-8)
+                flat_t = all_data[:, self._tissue_idx_t, :].reshape(-1, dim)
+                node_stats[f"{key}_tissue_mean"] = flat_t.mean(0)
+                node_stats[f"{key}_tissue_std"] = flat_t.std(0).clamp(min=1e-8)
 
         for key, dim in zip(self.STATIC_PROP_KEYS, self.STATIC_PROP_DIMS):
             flat = torch.cat(prop_data[key], dim=0).float()
@@ -827,10 +890,20 @@ class NeedleTissueDataset(Dataset):
             node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
 
         target_stats: Dict[str, torch.Tensor] = {}
+
         for key, dim in zip(self.TARGET_KEYS, self.TARGET_DIMS):
-            flat = torch.cat(tgt_data[key], dim=0).reshape(-1, dim).float()
+            all_data = torch.cat(tgt_data[key], dim=0).float()
+            flat = all_data.reshape(-1, dim)
             target_stats[f"{key}_mean"] = flat.mean(0)
             target_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
+
+            if self.per_region_norm:
+                flat_n = all_data[:, self._needle_idx_t, :].reshape(-1, dim)
+                target_stats[f"{key}_needle_mean"] = flat_n.mean(0)
+                target_stats[f"{key}_needle_std"] = flat_n.std(0).clamp(min=1e-8)
+                flat_t = all_data[:, self._tissue_idx_t, :].reshape(-1, dim)
+                target_stats[f"{key}_tissue_mean"] = flat_t.mean(0)
+                target_stats[f"{key}_tissue_std"] = flat_t.std(0).clamp(min=1e-8)
 
         return node_stats, target_stats
 

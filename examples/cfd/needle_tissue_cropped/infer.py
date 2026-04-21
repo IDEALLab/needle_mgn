@@ -58,7 +58,7 @@ from dataset import (
     _atomic_torch_save,
 )
 from physicsnemo.distributed.manager import DistributedManager
-from physicsnemo.models.meshgraphnet import MeshGraphNet
+from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN
 from physicsnemo.utils import load_checkpoint
 from physicsnemo.datapipes.gnn.utils import load_json
 
@@ -77,30 +77,71 @@ _STATIC_PROP_DIMS  = [1, 1, 1, 3, 1, 1, 1, 1]
 _WORLD_EDGE_TYPE = torch.tensor([[0.0, 0.0, 1.0]])
 
 
-def _normalize(state: dict, node_props: dict, node_stats: dict, input_keys: list) -> torch.Tensor:
-    """Concatenate and normalise all input features (dynamic + static material props)."""
+def _normalize(
+    state: dict,
+    node_props: dict,
+    node_stats: dict,
+    input_keys: list,
+    needle_idx_t: Optional[torch.Tensor] = None,
+    tissue_idx_t: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Concatenate and normalise all input features (dynamic + static material props).
+
+    When ``needle_idx_t`` and ``tissue_idx_t`` are provided, per-region
+    normalization is applied: needle nodes use ``{key}_needle_*`` stats and
+    tissue nodes use ``{key}_tissue_*`` stats.
+    """
     parts = []
     for key in input_keys:
         feat = state[key]
-        mean = node_stats[f"{key}_mean"]
-        std = node_stats[f"{key}_std"]
-        parts.append((feat - mean) / std)
+        if needle_idx_t is not None:
+            feat_norm = feat.clone()
+            feat_norm[needle_idx_t] = (
+                feat[needle_idx_t] - node_stats[f"{key}_needle_mean"]
+            ) / node_stats[f"{key}_needle_std"]
+            feat_norm[tissue_idx_t] = (
+                feat[tissue_idx_t] - node_stats[f"{key}_tissue_mean"]
+            ) / node_stats[f"{key}_tissue_std"]
+            parts.append(feat_norm)
+        else:
+            parts.append((feat - node_stats[f"{key}_mean"]) / node_stats[f"{key}_std"])
     for key in STATIC_PROP_KEYS:
         feat = node_props[key]
-        mean = node_stats[f"{key}_mean"]
-        std = node_stats[f"{key}_std"]
-        parts.append((feat - mean) / std)
+        parts.append((feat - node_stats[f"{key}_mean"]) / node_stats[f"{key}_std"])
     return torch.cat(parts, dim=-1)
 
 
-def _denorm_target(pred: torch.Tensor, target_stats: dict, target_keys: list, target_dims: list) -> dict:
-    """Un-normalise model output → dict of predicted-state tensors."""
+def _denorm_target(
+    pred: torch.Tensor,
+    target_stats: dict,
+    target_keys: list,
+    target_dims: list,
+    needle_mask: Optional[torch.Tensor] = None,
+    tissue_mask: Optional[torch.Tensor] = None,
+) -> dict:
+    """Un-normalise model output → dict of predicted-state tensors.
+
+    When ``needle_mask`` and ``tissue_mask`` (bool tensors over the crop) are
+    provided, per-region denormalization is applied using ``{key}_needle_*``
+    and ``{key}_tissue_*`` stats respectively.
+    """
     out = {}
     offset = 0
     for key, dim in zip(target_keys, target_dims):
-        mean = target_stats[f"{key}_mean"]
-        std = target_stats[f"{key}_std"]
-        out[key] = pred[:, offset : offset + dim] * std + mean
+        chunk = pred[:, offset : offset + dim]
+        if needle_mask is not None:
+            result = torch.empty_like(chunk)
+            result[needle_mask] = (
+                chunk[needle_mask] * target_stats[f"{key}_needle_std"]
+                + target_stats[f"{key}_needle_mean"]
+            )
+            result[tissue_mask] = (
+                chunk[tissue_mask] * target_stats[f"{key}_tissue_std"]
+                + target_stats[f"{key}_tissue_mean"]
+            )
+            out[key] = result
+        else:
+            out[key] = chunk * target_stats[f"{key}_std"] + target_stats[f"{key}_mean"]
         offset += dim
     return out
 
@@ -232,6 +273,8 @@ def _build_step_graph(
     n_nodes: int,
     node_stats: dict,
     input_keys: list,
+    needle_idx_t: Optional[torch.Tensor] = None,
+    tissue_idx_t: Optional[torch.Tensor] = None,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -252,7 +295,9 @@ def _build_step_graph(
             all_et = torch.cat([sub_et_hex, world_et[keep]], dim=0)
 
     coord_sub = state["coord"][part_nodes]
-    x_sub = _normalize(state, node_props, node_stats, input_keys)[part_nodes]
+    x_sub = _normalize(
+        state, node_props, node_stats, input_keys, needle_idx_t, tissue_idx_t
+    )[part_nodes]
 
     src, dst = all_ei
     rel_pos = coord_sub[src] - coord_sub[dst]
@@ -401,7 +446,8 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ---- Model -----------------------------------------------------------
-    model = MeshGraphNet(
+    model_type = str(OmegaConf.select(cfg, "model_type", default="mgn")).lower()
+    _shared_kwargs = dict(
         input_dim_nodes=input_dim_nodes,
         input_dim_edges=cfg.input_dim_edges,
         output_dim=output_dim,
@@ -411,10 +457,19 @@ def main(cfg: DictConfig) -> None:
         hidden_dim_node_decoder=cfg.hidden_dim_node_decoder,
         hidden_dim_processor=cfg.hidden_dim_processor,
         aggregation=cfg.aggregation,
-        use_fourier_features=cfg.get("use_fourier_features", False),
-        n_fourier_features=cfg.get("n_fourier_features", 64),
-        fourier_scale=cfg.get("fourier_scale", 1.0),
     )
+    if model_type == "kan":
+        model = MeshGraphKAN(
+            **_shared_kwargs,
+            num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
+        )
+    else:
+        model = MeshGraphNet(
+            **_shared_kwargs,
+            use_fourier_features=cfg.get("use_fourier_features", False),
+            n_fourier_features=cfg.get("n_fourier_features", 64),
+            fourier_scale=cfg.get("fourier_scale", 1.0),
+        )
     model = model.to(dist.device)
     load_checkpoint(to_absolute_path(cfg.ckpt_path), models=model, device=dist.device)
     model.eval()
@@ -422,6 +477,10 @@ def main(cfg: DictConfig) -> None:
     # ---- Stats and cache -------------------------------------------------
     node_stats = load_json(os.path.join(stats_dir, "node_stats.json"))
     target_stats = load_json(os.path.join(stats_dir, "target_stats.json"))
+
+    # Per-region normalization: detected automatically from the stats file.
+    # When enabled, needle and tissue nodes use separate mean/std for each feature.
+    per_region_norm = f"u_needle_mean" in node_stats
 
     raw_cache_path = os.path.join(data_dir, cache_filename)
     _need_rebuild = not os.path.exists(raw_cache_path)
@@ -458,6 +517,10 @@ def main(cfg: DictConfig) -> None:
         f"Node sets: {len(needle_node_indices)} needle, "
         f"{len(tissue_node_indices)} tissue (total {n_nodes})"
     )
+    if per_region_norm:
+        print("Per-region normalization: enabled (detected from stats file)")
+    needle_idx_t = torch.from_numpy(needle_node_indices.astype(np.int64)) if per_region_norm else None
+    tissue_idx_t = torch.from_numpy(tissue_node_indices.astype(np.int64)) if per_region_norm else None
 
     # Fixed KD-tree on tissue positions (Eulerian — positions don't change)
     tissue_pos_np = frame_tensors["coord"][infer_start][tissue_node_indices].numpy()
@@ -547,10 +610,22 @@ def main(cfg: DictConfig) -> None:
                 hex_edge_index, hex_edge_type_onehot,
                 world_ei, world_et,
                 n_nodes, node_stats, input_keys,
+                needle_idx_t=needle_idx_t,
+                tissue_idx_t=tissue_idx_t,
             )
             graph = graph.to(dist.device)
             pred_sub = model(graph.x, graph.edge_attr, graph).cpu()
-            next_uvw_sub = _denorm_target(pred_sub, target_stats, target_keys, target_dims)
+
+            # Per-region denorm: compute needle/tissue masks in crop-local index space
+            if per_region_norm:
+                part_nodes_np = part_nodes.numpy()
+                needle_mask = torch.from_numpy(np.isin(part_nodes_np, needle_node_indices))
+                tissue_mask = ~needle_mask
+            else:
+                needle_mask = tissue_mask = None
+            next_uvw_sub = _denorm_target(
+                pred_sub, target_stats, target_keys, target_dims, needle_mask, tissue_mask
+            )
 
             # --- Consensus filter on needle displacement ----------------------
             # part_nodes is the full mesh here, so needle_local_ei (global) maps directly.
