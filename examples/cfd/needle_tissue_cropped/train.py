@@ -37,7 +37,7 @@ except Exception:
 
 from dataset import NeedleTissueDataset
 from physicsnemo.distributed.manager import DistributedManager
-from physicsnemo.models.meshgraphnet import MeshGraphNet
+from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils.logging.wandb import initialize_wandb
@@ -59,6 +59,10 @@ class MGNTrainer:
 
         crop_strategy_weights = tuple(cfg.crop_strategy_weights)
         use_cpress = bool(cfg.get("use_cpress", True))
+        per_region_norm = bool(cfg.get("per_region_norm", False))
+        max_frames_per_run = cfg.get("max_frames_per_run", None)
+        if max_frames_per_run is not None:
+            max_frames_per_run = int(max_frames_per_run)
         train_dataset = NeedleTissueDataset(
             data_dir=data_dir,
             split="train",
@@ -73,6 +77,8 @@ class MGNTrainer:
             cache_dir=data_dir,
             timestep_stride=cfg.get("timestep_stride", 1),
             use_cpress=use_cpress,
+            per_region_norm=per_region_norm,
+            max_frames_per_run=max_frames_per_run,
         )
         val_dataset = NeedleTissueDataset(
             data_dir=data_dir,
@@ -88,6 +94,8 @@ class MGNTrainer:
             cache_dir=data_dir,
             timestep_stride=cfg.get("timestep_stride", 1),
             use_cpress=use_cpress,
+            per_region_norm=per_region_norm,
+            max_frames_per_run=max_frames_per_run,
         )
 
         train_sampler = DistributedSampler(
@@ -116,7 +124,8 @@ class MGNTrainer:
             num_workers=cfg.num_workers,
         )
 
-        self.model = MeshGraphNet(
+        model_type = str(cfg.get("model_type", "mgn")).lower()
+        _shared_kwargs = dict(
             input_dim_nodes=train_dataset.input_dim_nodes,
             input_dim_edges=cfg.input_dim_edges,
             output_dim=train_dataset.output_dim,
@@ -126,10 +135,19 @@ class MGNTrainer:
             hidden_dim_node_decoder=cfg.hidden_dim_node_decoder,
             hidden_dim_processor=cfg.hidden_dim_processor,
             aggregation=cfg.aggregation,
-            use_fourier_features=cfg.get("use_fourier_features", False),
-            n_fourier_features=cfg.get("n_fourier_features", 64),
-            fourier_scale=cfg.get("fourier_scale", 1.0),
         )
+        if model_type == "kan":
+            self.model = MeshGraphKAN(
+                **_shared_kwargs,
+                num_harmonics=int(cfg.get("num_harmonics", 5)),
+            )
+        else:
+            self.model = MeshGraphNet(
+                **_shared_kwargs,
+                use_fourier_features=cfg.get("use_fourier_features", False),
+                n_fourier_features=cfg.get("n_fourier_features", 64),
+                fourier_scale=cfg.get("fourier_scale", 1.0),
+            )
 
         if cfg.jit:
             self.model = torch.compile(self.model.to(dist.device))

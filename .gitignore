@@ -224,3 +224,7 @@ pyproject.toml
 *.csv
 examples/cfd/needle_tissue_domino/outputs/wandb/
 examples/cfd/needle_tissue_cropped/outputs/wandb/
+*.out
+*.err
+*.sif
+*hydra
