@@ -148,6 +148,7 @@ class MGNTrainer:
                 bistride_pos_dim=3,
                 num_layers_bistride=int(cfg.get("num_layers_bistride", 2)),
                 bistride_unet_levels=int(cfg.get("bistride_unet_levels", 1)),
+                num_processor_checkpoint_segments=int(cfg.get("num_processor_checkpoint_segments", 0)),
             )
         elif model_type == "kan":
             self.model = MeshGraphKAN(
@@ -236,7 +237,10 @@ class MGNTrainer:
                 x[:, 3:12] = x[:, 3:12] + noise
                 y = y.clone()
                 y[:, :9] = y[:, :9] - noise
-            pred = self.model(x, graph.edge_attr, graph, ms_edges, ms_ids)
+            if self.use_bsms:
+                pred = self.model(x, graph.edge_attr, graph, ms_edges, ms_ids)
+            else:
+                pred = self.model(x, graph.edge_attr, graph)
             return self.criterion(pred, y)
 
     def backward(self, loss):
@@ -264,7 +268,10 @@ class MGNTrainer:
 
         for batch in self.val_dataloader:
             graph, ms_edges, ms_ids = self._unpack_batch(batch)
-            pred = self.model(graph.x, graph.edge_attr, graph, ms_edges, ms_ids)
+            if self.use_bsms:
+                pred = self.model(graph.x, graph.edge_attr, graph, ms_edges, ms_ids)
+            else:
+                pred = self.model(graph.x, graph.edge_attr, graph)
             offset = 0
             for key, d in zip(keys, dims):
                 p = pred[:, offset : offset + d]

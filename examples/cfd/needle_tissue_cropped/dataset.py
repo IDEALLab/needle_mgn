@@ -679,10 +679,10 @@ def _precompute_bsms_full(
 
     ms_edges = [torch.tensor(e, dtype=torch.long) for e in ms_edges_raw]
     ms_ids = [torch.tensor(ids, dtype=torch.long) for ids in ms_ids_raw]
-    print(
-        f"BSMS: {n_nodes} nodes → "
-        + ", ".join(f"L{i}={e.shape[1]}e/{ms_ids[i].shape[0]}n" for i, e in enumerate(ms_edges))
-    )
+    level_strs = [f"L{i}={e.shape[1]}e" for i, e in enumerate(ms_edges)]
+    for i, ids in enumerate(ms_ids):
+        level_strs[i] += f"/{ids.shape[0]}n"
+    print(f"BSMS: {n_nodes} nodes → " + ", ".join(level_strs))
     return ms_edges, ms_ids
 
 
