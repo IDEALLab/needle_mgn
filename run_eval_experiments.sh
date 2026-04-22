@@ -52,6 +52,12 @@ run_experiment() {
         return
     fi
 
+    if [ -f "${eval_out}/summary.csv" ]; then
+        echo "  [SKIP] Eval already complete (${eval_out}/summary.csv exists)"
+        echo ""
+        return
+    fi
+
     mkdir -p "${infer_out}" "${eval_out}"
 
     # --- Inference: run infer.py on every test run ---------------------------
