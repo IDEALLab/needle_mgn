@@ -27,7 +27,7 @@ stats_dir: "./stats"
 
 # CUDA device selection.  Set to a string like "0", "1", or "0,1" to restrict
 # which GPUs are visible.  null means use whatever is available.
-cuda_devices: 1
+cuda_devices: null
 
 # Dataset split fractions
 train_fraction: 0.8
@@ -40,6 +40,10 @@ val_fraction: 0.1
 # train/val/test.  timestep_stride subsamples frames within each run:
 # stride=1 uses all frames; stride=10 uses every 10th frame.
 timestep_stride: 10
+# Cap on frames kept in RAM per run.  null = no cap (keep all strided frames).
+# Use this with timestep_stride=1 to limit memory: e.g. max_frames_per_run=25
+# gives ~same memory as stride=10 while training on finer-grained timesteps.
+max_frames_per_run: null
 
 # -------------------------
 # Spatial cropping (the key difference from needle_tissue/)
@@ -69,6 +73,13 @@ crop_strategy_weights: [0.7, 0.15, 0.15]
 # Without cpress: input_dim_nodes=29, output_dim=16
 use_cpress: true
 
+# Compute separate normalisation statistics for needle and tissue nodes.
+# Corrects the scale mismatch for features like cpress (non-zero only on needle
+# contact nodes) and stress S (order-of-magnitude difference between the stiff
+# needle and soft tissue).  Stats are saved into node_stats.json / target_stats.json
+# alongside the global stats, so infer.py detects this automatically.
+per_region_norm: false
+
 # -------------------------
 # Model architecture
 # -------------------------
@@ -76,7 +87,34 @@ use_cpress: true
 # the values below are the reference with use_cpress=true.
 input_dim_edges: 7
 
-# Random Fourier Feature encoding on node inputs.
+# model_type selects the GNN architecture:
+#   "mgn" — standard MeshGraphNet with MLP node encoder
+#   "kan" — MeshGraphKAN: MLP encoder replaced by a Kolmogorov-Arnold Network
+#            node encoder. use_fourier_features is ignored in KAN mode; set
+#            num_harmonics instead (controls the KAN Fourier basis width).
+model_type: "mgn"
+num_harmonics: 5
+
+# Bi-stride MeshGraphNet (bistride mode only).
+# use_bsms must be true when model_type=bistride.  Requires a fixed mesh
+# topology — disable dynamic cropping with needle_crop_mm=10000 tissue_crop_mm=10000
+# and crop_strategy_weights=[1,0,0].
+use_bsms: false
+num_bsms_levels: 2
+num_layers_bistride: 2
+bistride_unet_levels: 1
+# Gradient checkpointing: recompute activations during backprop to save memory.
+# Must be a factor of 2 × processor_size (e.g. processor_size=15 → use 6 or 10).
+# 0 = disabled.
+num_processor_checkpoint_segments: 0
+
+# Mesh reduction (beam + tissue downsampling).
+# beam_spacing_mm > 0: replace needle HEX nodes with a 1-D beam at this spacing.
+# tissue_downsample_mm > 0: keep one tissue node per voxel of this side length.
+beam_spacing_mm: 0.0
+tissue_downsample_mm: 0.0
+
+# Random Fourier Feature encoding on node inputs (mgn mode only).
 # When enabled, node features are mapped through [sin(xB), cos(xB)] before the
 # node encoder.  n_fourier_features controls the number of frequency projections
 # (output dim = 2 * n_fourier_features).  fourier_scale is the std of the
@@ -109,7 +147,7 @@ jit: false
 noise_std: 3e-3
 
 val_every: 10
-save_every: 50
+save_every: 10
 
 # -------------------------
 # Inference (infer.py)
