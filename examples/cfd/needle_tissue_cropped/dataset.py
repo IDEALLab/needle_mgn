@@ -38,9 +38,17 @@ import torch
 from scipy.spatial import cKDTree
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
+from torch_geometric.utils import coalesce as _pyg_coalesce
 from torch_geometric.utils import subgraph, to_undirected
 
 from physicsnemo.datapipes.gnn.utils import load_json
+
+try:
+    import sparse_dot_mkl  # noqa: F401 — presence check only
+
+    _BSMS_AVAILABLE = True
+except ImportError:
+    _BSMS_AVAILABLE = False
 
 
 def _atomic_torch_save(obj, path: str) -> None:
@@ -336,6 +344,348 @@ def _get_needle_tissue_node_sets(
     return needle_nodes, tissue_nodes
 
 
+# ---------------------------------------------------------------------------
+# Mesh reduction helpers
+# ---------------------------------------------------------------------------
+
+def _beam_assignment(
+    needle_coords_frame0: np.ndarray, beam_spacing_mm: float
+) -> Tuple[np.ndarray, int]:
+    """Assign needle nodes to 1-D beam nodes using PCA on frame-0 positions.
+
+    Cluster membership is computed in the Lagrangian reference configuration
+    so it remains fixed as the needle bends through later frames.
+
+    Parameters
+    ----------
+    needle_coords_frame0 : np.ndarray, shape (n_needle, 3)
+        Needle node coordinates in the reference (frame 0) configuration.
+    beam_spacing_mm : float
+        Target spacing between beam nodes (mm).
+
+    Returns
+    -------
+    beam_assignment : np.ndarray, shape (n_needle,) int64
+        Index in ``[0, N_beam)`` for each needle node.
+    N_beam : int
+        Number of beam nodes.
+    """
+    centered = needle_coords_frame0 - needle_coords_frame0.mean(axis=0)
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    proj = centered @ Vt[0]
+    proj_min, proj_max = float(proj.min()), float(proj.max())
+    proj_range = proj_max - proj_min
+    N_beam = max(2, int(np.ceil(proj_range / beam_spacing_mm)) + 1)
+    proj_norm = (proj - proj_min) / max(proj_range, 1e-8)
+    beam_asgn = np.round(proj_norm * (N_beam - 1)).astype(np.int64)
+    beam_asgn = np.clip(beam_asgn, 0, N_beam - 1)
+    return beam_asgn, N_beam
+
+
+def _apply_beam_reduction(raw_cache: Dict, beam_spacing_mm: float) -> Dict:
+    """Replace needle nodes with a coarse 1-D beam representation.
+
+    Needle nodes (edge type 0) are clustered into ``N_beam`` beam nodes using
+    PCA on frame-0 positions.  Per-frame beam features are cluster means.
+    Needle HEX edges are replaced by a bidirectional chain.  World edges are
+    remapped so needle endpoints become their beam node.  Tissue nodes are
+    unchanged.  Per-frame world edges are stored with original node indices so
+    that ``_build_graph`` can apply the ``_beam_old_to_new`` remapping at
+    sample time.
+
+    Parameters
+    ----------
+    raw_cache : Dict
+        Output of ``_process_all_frames``.
+    beam_spacing_mm : float
+        Target spacing between successive beam nodes (mm).
+
+    Returns
+    -------
+    Dict with the same structure as *raw_cache* plus beam metadata keys.
+    """
+    edge_index_orig = raw_cache["edge_index"]
+    edge_type_onehot_orig = raw_cache["edge_type_onehot"]
+    frame_tensors_orig = raw_cache["frame_tensors"]
+
+    n_frames = frame_tensors_orig["coord"].shape[0]
+    n_nodes_orig = frame_tensors_orig["coord"].shape[1]
+
+    needle_node_indices, tissue_node_indices = _get_needle_tissue_node_sets(
+        edge_index_orig, edge_type_onehot_orig
+    )
+    n_needle = len(needle_node_indices)
+    n_tissue = len(tissue_node_indices)
+
+    coords_f0 = frame_tensors_orig["coord"][0].numpy()
+    beam_asgn, N_beam = _beam_assignment(coords_f0[needle_node_indices], beam_spacing_mm)
+    n_nodes_new = n_tissue + N_beam
+
+    print(
+        f"Beam reduction: {n_needle} needle → {N_beam} beam nodes "
+        f"({beam_spacing_mm:.2g} mm spacing) | total: {n_nodes_orig} → {n_nodes_new}"
+    )
+
+    # old global index → new index (tissue first, then beam nodes)
+    old_to_new = np.full(n_nodes_orig, -1, dtype=np.int64)
+    for new_i, old_i in enumerate(tissue_node_indices):
+        old_to_new[old_i] = new_i
+    for j, old_i in enumerate(needle_node_indices):
+        old_to_new[old_i] = n_tissue + int(beam_asgn[j])
+
+    # Remap static HEX edges: drop needle-needle (et=0), keep tissue+world, remap endpoints
+    ei = edge_index_orig.numpy()
+    et = edge_type_onehot_orig.numpy()
+    keep = et[:, 0] == 0  # False where type=0 (needle HEX)
+    src_k = old_to_new[ei[0, keep]]
+    dst_k = old_to_new[ei[1, keep]]
+    et_k = et[keep]
+
+    # Bidirectional chain for beam nodes (edge type 0)
+    idx = np.arange(N_beam - 1, dtype=np.int64)
+    cs = np.concatenate([n_tissue + idx, n_tissue + idx + 1])
+    cd = np.concatenate([n_tissue + idx + 1, n_tissue + idx])
+    ce = np.zeros((len(cs), 3), dtype=np.float32)
+    ce[:, 0] = 1.0
+
+    all_src = np.concatenate([src_k, cs])
+    all_dst = np.concatenate([dst_k, cd])
+    all_et = np.concatenate([et_k, ce])
+
+    edge_index_new = torch.from_numpy(np.stack([all_src, all_dst])).long()
+    edge_type_onehot_new = torch.from_numpy(all_et)
+    edge_index_new, edge_type_onehot_new = _pyg_coalesce(
+        edge_index_new, edge_type_onehot_new, n_nodes_new, reduce="min"
+    )
+
+    # Build new frame tensors: scatter-mean needle features into beam nodes
+    tissue_idx_t = torch.tensor(tissue_node_indices, dtype=torch.long)
+    needle_idx_t = torch.tensor(needle_node_indices, dtype=torch.long)
+    ba = torch.tensor(beam_asgn, dtype=torch.long)
+
+    new_frame_tensors: Dict[str, torch.Tensor] = {}
+    for key, orig in frame_tensors_orig.items():
+        d = orig.shape[-1]
+        t_feat = orig[:, tissue_idx_t, :]
+        n_feat = orig[:, needle_idx_t, :]
+        ba_exp = ba.view(1, -1, 1).expand(n_frames, n_needle, d)
+        b_feat = torch.zeros(n_frames, N_beam, d, dtype=orig.dtype)
+        b_feat.scatter_add_(1, ba_exp, n_feat)
+        count = torch.zeros(N_beam).scatter_add_(0, ba, torch.ones(n_needle))
+        b_feat /= count.view(1, N_beam, 1).clamp(min=1.0)
+        new_frame_tensors[key] = torch.cat([t_feat, b_feat], dim=1)
+
+    # Remap static material properties
+    node_props_orig = raw_cache.get("node_props", {})
+    new_node_props: Dict[str, torch.Tensor] = {}
+    for key, prop in node_props_orig.items():
+        d = prop.shape[-1]
+        t_prop = prop[tissue_idx_t]
+        n_prop = prop[needle_idx_t].float()
+        ba_exp_1d = ba.view(-1, 1).expand(n_needle, d)
+        b_prop = torch.zeros(N_beam, d, dtype=n_prop.dtype)
+        b_prop.scatter_add_(0, ba_exp_1d, n_prop)
+        count_1d = torch.zeros(N_beam).scatter_add_(0, ba, torch.ones(n_needle))
+        b_prop /= count_1d.view(N_beam, 1).clamp(min=1.0)
+        new_node_props[key] = torch.cat([t_prop, b_prop], dim=0)
+
+    # Remap per-frame world edges to beam-reduced node space.
+    # Multiple original needle nodes may map to the same beam node, so we
+    # coalesce duplicates (keep first occurrence).
+    new_world_edges = []
+    for (w_ei, w_et) in raw_cache["world_edges"]:
+        if w_ei.shape[1] == 0:
+            new_world_edges.append((w_ei, w_et))
+            continue
+        src_r = torch.from_numpy(old_to_new[w_ei[0].numpy()])
+        dst_r = torch.from_numpy(old_to_new[w_ei[1].numpy()])
+        valid = (src_r >= 0) & (dst_r >= 0)
+        we_new = torch.stack([src_r[valid], dst_r[valid]], dim=0)
+        wet_new = w_et[valid]
+        # Deduplicate edges that collapsed to the same beam node
+        if we_new.shape[1] > 0:
+            we_new, wet_new = _pyg_coalesce(we_new, wet_new, n_nodes_new, reduce="min")
+        new_world_edges.append((we_new, wet_new))
+
+    return {
+        "edge_index": edge_index_new,
+        "edge_type_onehot": edge_type_onehot_new,
+        "frame_tensors": new_frame_tensors,
+        "node_props": new_node_props,
+        "world_edges": new_world_edges,
+        "tissue_node_indices": tissue_idx_t,
+        "needle_node_indices": needle_idx_t,
+        "beam_assignment": ba,
+        "n_nodes_orig": n_nodes_orig,
+        "n_tissue": n_tissue,
+    }
+
+
+def _downsample_tissue(cache: Dict, spacing_mm: float) -> Dict:
+    """Subsample tissue nodes so that no two kept nodes are closer than *spacing_mm*.
+
+    Uses a voxel-grid approach: each tissue node is assigned to a 3-D voxel of
+    side *spacing_mm*.  For each occupied voxel the node closest to the voxel
+    centre is kept.  All beam/needle nodes are always kept.  Per-frame world
+    edges that connect the needle to a removed tissue node are dropped.
+
+    Parameters
+    ----------
+    cache : Dict
+        Output of ``_apply_beam_reduction`` (or ``_process_all_frames`` if no
+        beam reduction was applied).  Must contain the beam metadata keys so
+        that needle vs tissue nodes can be identified.
+    spacing_mm : float
+        Voxel side length (mm).  Tissue nodes are subsampled to one per voxel.
+
+    Returns
+    -------
+    Dict with the same structure as *cache*, restricted to kept nodes.
+    """
+    edge_index = cache["edge_index"]
+    edge_type_onehot = cache["edge_type_onehot"]
+    frame_tensors = cache["frame_tensors"]
+
+    n_nodes = frame_tensors["coord"].shape[1]
+
+    # Identify needle vs tissue in the (possibly beam-reduced) node set.
+    needle_np, tissue_np = _get_needle_tissue_node_sets(edge_index, edge_type_onehot)
+
+    # Use frame-0 positions for voxel assignment (tissue nodes are Eulerian,
+    # so their positions are the same across all frames and runs).
+    coord_f0 = frame_tensors["coord"][0].numpy()  # (n_nodes, 3)
+    tissue_coords = coord_f0[tissue_np]            # (n_tissue, 3)
+
+    # Assign each tissue node to a voxel key, keep closest to voxel centre.
+    voxel_keys = np.floor(tissue_coords / spacing_mm).astype(np.int64)
+    voxel_best: Dict[tuple, Tuple[float, int]] = {}  # key → (dist, local_idx)
+    for local_i, (key_row, coord) in enumerate(zip(voxel_keys, tissue_coords)):
+        key = tuple(key_row.tolist())
+        centre = (key_row + 0.5) * spacing_mm
+        dist = float(np.linalg.norm(coord - centre))
+        if key not in voxel_best or dist < voxel_best[key][0]:
+            voxel_best[key] = (dist, local_i)
+    kept_local = sorted(v[1] for v in voxel_best.values())
+    kept_tissue = tissue_np[kept_local]  # global indices of kept tissue nodes
+
+    n_tissue_orig = len(tissue_np)
+    n_tissue_kept = len(kept_tissue)
+    n_needle = len(needle_np)
+    n_nodes_new = n_tissue_kept + n_needle
+    print(
+        f"Tissue downsampling ({spacing_mm:.2g} mm): "
+        f"{n_tissue_orig} → {n_tissue_kept} tissue nodes | "
+        f"total: {n_nodes} → {n_nodes_new}"
+    )
+
+    # Build old → new index map (kept tissue first, then needle nodes unchanged)
+    old_to_new = np.full(n_nodes, -1, dtype=np.int64)
+    for new_i, old_i in enumerate(kept_tissue):
+        old_to_new[old_i] = new_i
+    for new_i, old_i in enumerate(needle_np):
+        old_to_new[old_i] = n_tissue_kept + new_i
+
+    # Filter and remap edges
+    ei = edge_index.numpy()
+    et = edge_type_onehot.numpy()
+    src_new = old_to_new[ei[0]]
+    dst_new = old_to_new[ei[1]]
+    keep_mask = (src_new >= 0) & (dst_new >= 0)
+    edge_index_new = torch.from_numpy(np.stack([src_new[keep_mask], dst_new[keep_mask]])).long()
+    edge_type_onehot_new = torch.from_numpy(et[keep_mask])
+
+    # Remap frame tensors (tissue subset + all needle/beam nodes)
+    kept_all = np.concatenate([kept_tissue, needle_np])
+    kept_all_t = torch.from_numpy(kept_all.astype(np.int64))
+    new_frame_tensors = {k: v[:, kept_all_t, :] for k, v in frame_tensors.items()}
+
+    # Remap node properties
+    new_node_props = {k: v[kept_all_t] for k, v in cache.get("node_props", {}).items()}
+
+    # Filter per-frame world edges (drop edges to removed tissue nodes)
+    new_world_edges = []
+    for (w_ei, w_et) in cache["world_edges"]:
+        if w_ei.shape[1] == 0:
+            new_world_edges.append((w_ei, w_et))
+            continue
+        src_r = torch.from_numpy(old_to_new[w_ei[0].numpy()])
+        dst_r = torch.from_numpy(old_to_new[w_ei[1].numpy()])
+        valid = (src_r >= 0) & (dst_r >= 0)
+        new_world_edges.append((
+            torch.stack([src_r[valid], dst_r[valid]], dim=0),
+            w_et[valid],
+        ))
+
+    result = {
+        "edge_index": edge_index_new,
+        "edge_type_onehot": edge_type_onehot_new,
+        "frame_tensors": new_frame_tensors,
+        "node_props": new_node_props,
+        # World edges are already remapped here (tissue downsampling removes nodes
+        # permanently; we can't defer remapping to sample time).
+        "world_edges": new_world_edges,
+    }
+    # Carry beam metadata through if present, updating indices to new node space
+    if "tissue_node_indices" in cache:
+        # After downsampling the needle indices shift to n_tissue_kept..n_nodes_new-1
+        result["tissue_node_indices"] = torch.from_numpy(np.arange(n_tissue_kept, dtype=np.int64))
+        result["needle_node_indices"] = cache["needle_node_indices"]
+        result["beam_assignment"] = cache["beam_assignment"]
+        result["n_nodes_orig"] = cache["n_nodes_orig"]
+        result["n_tissue"] = n_tissue_kept
+    return result
+
+
+def _precompute_bsms_full(
+    edge_index: torch.Tensor,
+    coord_ref: torch.Tensor,
+    n_nodes: int,
+    num_levels: int,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Compute bi-stride multi-scale graph structure for the full (unpartitioned) mesh.
+
+    Parameters
+    ----------
+    edge_index : torch.Tensor, shape (2, E)
+        Static HEX edge index (full mesh).
+    coord_ref : torch.Tensor, shape (N, 3)
+        Node positions used for seed selection (frame-0 coordinates).
+    n_nodes : int
+        Total node count.
+    num_levels : int
+        Number of coarsening levels.
+
+    Returns
+    -------
+    ms_edges : list of tensors, one per level (shape (2, E_l) each)
+    ms_ids : list of tensors, one per level (shape (N_l,) each)
+    """
+    if not _BSMS_AVAILABLE:
+        raise ImportError(
+            "BiStride multi-scale graph requires sparse_dot_mkl. "
+            "Install with: uv add sparse-dot-mkl"
+        )
+    import importlib
+
+    BistrideMultiLayerGraph = importlib.import_module(
+        "physicsnemo.datapipes.gnn.bsms"
+    ).BistrideMultiLayerGraph
+
+    part_data = Data(edge_index=edge_index, num_nodes=n_nodes)
+    part_data.pos = coord_ref
+
+    mlg = BistrideMultiLayerGraph(part_data, num_levels)
+    _, ms_edges_raw, ms_ids_raw = mlg.get_multi_layer_graphs()
+
+    ms_edges = [torch.tensor(e, dtype=torch.long) for e in ms_edges_raw]
+    ms_ids = [torch.tensor(ids, dtype=torch.long) for ids in ms_ids_raw]
+    print(
+        f"BSMS: {n_nodes} nodes → "
+        + ", ".join(f"L{i}={e.shape[1]}e/{ms_ids[i].shape[0]}n" for i, e in enumerate(ms_edges))
+    )
+    return ms_edges, ms_ids
+
+
 class NeedleTissueDataset(Dataset):
     """
     Temporal needle-tissue dataset with dynamic spatial cropping.
@@ -413,6 +763,10 @@ class NeedleTissueDataset(Dataset):
         use_cpress: bool = True,
         per_region_norm: bool = False,
         max_frames_per_run: Optional[int] = None,
+        beam_spacing_mm: float = 0.0,
+        tissue_downsample_mm: float = 0.0,
+        use_bsms: bool = False,
+        num_bsms_levels: int = 2,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -445,6 +799,14 @@ class NeedleTissueDataset(Dataset):
         self._run_data: List[Dict] = []
         # Flat list of (run_local_idx, t_local) pairs — one entry per training sample.
         self._samples: List[Tuple[int, int]] = []
+
+        # Beam reduction: remap original needle indices → reduced node indices.
+        # None = no beam reduction.
+        self._beam_old_to_new: Optional[np.ndarray] = None
+
+        # Bi-stride BSMS: (ms_edges, ms_ids) precomputed for the full mesh.
+        self._bsms_data: Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]] = None
+        self._use_bsms = use_bsms
 
         if _is_multi_run(data_dir):
             # ---- Multi-run mode: split by run, subsample timesteps ----------
@@ -507,43 +869,64 @@ class NeedleTissueDataset(Dataset):
                     _atomic_torch_save(cache, cache_path)
                     print(f"  → saved to {cache_path}")
 
+                # ---- Optional mesh reduction (beam + tissue) ----------------
+                # Build a reduction cache tag so each (beam_mm, tissue_mm) combo
+                # gets its own file and won't conflict with other experiments.
+                _beam_tag = f"_b{beam_spacing_mm:.2g}mm" if beam_spacing_mm > 0.0 else ""
+                _tissue_tag = f"_t{tissue_downsample_mm:.2g}mm" if tissue_downsample_mm > 0.0 else ""
+                if _beam_tag or _tissue_tag:
+                    red_name = (
+                        f"reduced_cache_RUN-{run_id}{_beam_tag}{_tissue_tag}.pt"
+                    )
+                    red_path = os.path.join(cache_dir or data_dir, red_name)
+                    if os.path.exists(red_path):
+                        graph_cache = torch.load(red_path, weights_only=False)
+                    else:
+                        graph_cache = cache
+                        if beam_spacing_mm > 0.0:
+                            graph_cache = _apply_beam_reduction(graph_cache, beam_spacing_mm)
+                        if tissue_downsample_mm > 0.0:
+                            graph_cache = _downsample_tissue(graph_cache, tissue_downsample_mm)
+                        _atomic_torch_save(graph_cache, red_path)
+                        print(f"  → reduction cache saved to {red_path}")
+                else:
+                    graph_cache = cache
+
                 if self.edge_index is None:
-                    self.edge_index = cache["edge_index"]
-                    self.edge_type_onehot = cache["edge_type_onehot"]
+                    self.edge_index = graph_cache["edge_index"]
+                    self.edge_type_onehot = graph_cache["edge_type_onehot"]
                     self.n_nodes = int(self.edge_index.max().item()) + 1
 
-                # Optionally subsample frames within the run to cap RAM usage.
-                # Uniform subsampling preserves temporal coverage while keeping
-                # at most max_frames_per_run consecutive-pair samples in memory.
-                if max_frames_per_run is not None and n_frames_run > max_frames_per_run:
+                # ---- Optionally subsample frames to cap RAM ------------------
+                n_frames_graph = graph_cache["frame_tensors"]["coord"].shape[0]
+                if max_frames_per_run is not None and n_frames_graph > max_frames_per_run:
                     keep_idx = np.round(
-                        np.linspace(0, n_frames_run - 1, max_frames_per_run)
+                        np.linspace(0, n_frames_graph - 1, max_frames_per_run)
                     ).astype(int)
-                    # Deduplicate and sort (linspace can repeat endpoints at small N)
                     keep_idx = sorted(set(keep_idx.tolist()))
                     run_frames: Dict = {
-                        key: cache["frame_tensors"][key][keep_idx]
+                        key: graph_cache["frame_tensors"][key][keep_idx]
                         for key in self.INPUT_KEYS
                     }
-                    run_world_edges = [cache["world_edges"][i] for i in keep_idx]
+                    run_world_edges = [graph_cache["world_edges"][i] for i in keep_idx]
                     n_kept = len(keep_idx)
                     print(
-                        f"  RUN-{run_id}: subsampled {n_frames_run} → {n_kept} frames "
+                        f"  RUN-{run_id}: subsampled {n_frames_graph} → {n_kept} frames "
                         f"(max_frames_per_run={max_frames_per_run})"
                     )
                 else:
                     run_frames = {
-                        key: cache["frame_tensors"][key]
+                        key: graph_cache["frame_tensors"][key]
                         for key in self.INPUT_KEYS
                     }
-                    run_world_edges = cache["world_edges"]
-                    n_kept = n_frames_run
+                    run_world_edges = graph_cache["world_edges"]
+                    n_kept = n_frames_graph
 
                 self._run_data.append(
                     {
                         "frame_tensors": run_frames,
                         "world_edges": run_world_edges,
-                        "node_props": cache["node_props"],
+                        "node_props": graph_cache["node_props"],
                     }
                 )
                 for t in range(n_kept - 1):
@@ -604,6 +987,27 @@ class NeedleTissueDataset(Dataset):
             for t in range(n_pairs_split):
                 self._samples.append((0, t))
 
+        # ---- BSMS precomputation (bistride mode, fixed topology) ------------
+        if use_bsms:
+            _beam_tag = f"_b{beam_spacing_mm:.2g}mm" if beam_spacing_mm > 0.0 else ""
+            _tissue_tag = f"_t{tissue_downsample_mm:.2g}mm" if tissue_downsample_mm > 0.0 else ""
+            bsms_name = f"bsms_cache_l{num_bsms_levels}{_beam_tag}{_tissue_tag}.pt"
+            bsms_path = os.path.join(cache_dir or data_dir, bsms_name)
+            if os.path.exists(bsms_path):
+                print(f"Loading BSMS cache from {bsms_path} ...")
+                bsms_saved = torch.load(bsms_path, weights_only=False)
+                self._bsms_data = (bsms_saved["ms_edges"], bsms_saved["ms_ids"])
+            else:
+                print(f"Precomputing BSMS ({num_bsms_levels} levels, {self.n_nodes} nodes)...")
+                # Use frame-0 coordinates from first run for seed selection.
+                coord_ref = self._run_data[0]["frame_tensors"]["coord"][0]
+                ms_edges, ms_ids = _precompute_bsms_full(
+                    self.edge_index, coord_ref, self.n_nodes, num_bsms_levels
+                )
+                self._bsms_data = (ms_edges, ms_ids)
+                _atomic_torch_save({"ms_edges": ms_edges, "ms_ids": ms_ids}, bsms_path)
+                print(f"BSMS cache saved to {bsms_path}")
+
         # ---- Needle / tissue node index sets (topology-invariant) ----------
         needle_idx, tissue_idx = _get_needle_tissue_node_sets(
             self.edge_index, self.edge_type_onehot
@@ -658,8 +1062,12 @@ class NeedleTissueDataset(Dataset):
     def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx: int) -> Data:
-        return self._build_graph(idx)
+    def __getitem__(self, idx: int):
+        graph = self._build_graph(idx)
+        if not self._use_bsms:
+            return graph
+        ms_edges, ms_ids = self._bsms_data
+        return {"graph": graph, "ms_edges": ms_edges, "ms_ids": ms_ids}
 
     def _crop_nodes(self, coord_t: torch.Tensor) -> torch.Tensor:
         """Dispatch to a crop strategy, sampling randomly during training."""

@@ -38,6 +38,7 @@ except Exception:
 from dataset import NeedleTissueDataset
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN
+from physicsnemo.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils.logging.wandb import initialize_wandb
@@ -48,11 +49,23 @@ def _collate(batch):
     return Batch.from_data_list(batch)
 
 
+def _bsms_collate(batch):
+    """Collate for BSMS mode (batch_size=1).
+
+    The dataset returns dicts ``{"graph": Data, "ms_edges": [...], "ms_ids": [...]}``.
+    With batch_size=1 we unwrap the outer list so the training loop receives
+    the dict directly without any tensor stacking.
+    """
+    assert len(batch) == 1, "BSMS training requires batch_size=1"
+    return batch[0]
+
+
 class MGNTrainer:
     def __init__(self, cfg: DictConfig, dist, rank_zero_logger):
         self.dist = dist
         self.amp = cfg.amp
         self.noise_std = float(cfg.get("noise_std", 0.0))
+        self.use_bsms = bool(cfg.get("use_bsms", False))
 
         stats_dir = to_absolute_path(cfg.stats_dir)
         data_dir = to_absolute_path(cfg.data_dir)
@@ -63,9 +76,12 @@ class MGNTrainer:
         max_frames_per_run = cfg.get("max_frames_per_run", None)
         if max_frames_per_run is not None:
             max_frames_per_run = int(max_frames_per_run)
-        train_dataset = NeedleTissueDataset(
+        beam_spacing_mm = float(cfg.get("beam_spacing_mm", 0.0))
+        tissue_downsample_mm = float(cfg.get("tissue_downsample_mm", 0.0))
+        num_bsms_levels = int(cfg.get("num_bsms_levels", 2))
+
+        _shared_dataset_kwargs = dict(
             data_dir=data_dir,
-            split="train",
             needle_crop_mm=cfg.needle_crop_mm,
             tissue_crop_mm=cfg.tissue_crop_mm,
             slice_half_thickness_mm=cfg.slice_half_thickness_mm,
@@ -79,24 +95,13 @@ class MGNTrainer:
             use_cpress=use_cpress,
             per_region_norm=per_region_norm,
             max_frames_per_run=max_frames_per_run,
+            beam_spacing_mm=beam_spacing_mm,
+            tissue_downsample_mm=tissue_downsample_mm,
+            use_bsms=self.use_bsms,
+            num_bsms_levels=num_bsms_levels,
         )
-        val_dataset = NeedleTissueDataset(
-            data_dir=data_dir,
-            split="validation",
-            needle_crop_mm=cfg.needle_crop_mm,
-            tissue_crop_mm=cfg.tissue_crop_mm,
-            slice_half_thickness_mm=cfg.slice_half_thickness_mm,
-            full_needle_tissue_mm=cfg.full_needle_tissue_mm,
-            crop_strategy_weights=crop_strategy_weights,
-            train_fraction=cfg.train_fraction,
-            val_fraction=cfg.val_fraction,
-            stats_path=stats_dir,
-            cache_dir=data_dir,
-            timestep_stride=cfg.get("timestep_stride", 1),
-            use_cpress=use_cpress,
-            per_region_norm=per_region_norm,
-            max_frames_per_run=max_frames_per_run,
-        )
+        train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
+        val_dataset = NeedleTissueDataset(split="validation", **_shared_dataset_kwargs)
 
         train_sampler = DistributedSampler(
             train_dataset,
@@ -110,7 +115,7 @@ class MGNTrainer:
             train_dataset,
             batch_size=cfg.batch_size,
             sampler=train_sampler,
-            collate_fn=_collate,
+            collate_fn=_bsms_collate if self.use_bsms else _collate,
             pin_memory=True,
             num_workers=cfg.num_workers,
         )
@@ -119,7 +124,7 @@ class MGNTrainer:
             batch_size=cfg.batch_size,
             shuffle=False,
             drop_last=False,
-            collate_fn=_collate,
+            collate_fn=_bsms_collate if self.use_bsms else _collate,
             pin_memory=True,
             num_workers=cfg.num_workers,
         )
@@ -136,7 +141,15 @@ class MGNTrainer:
             hidden_dim_processor=cfg.hidden_dim_processor,
             aggregation=cfg.aggregation,
         )
-        if model_type == "kan":
+        if model_type == "bistride":
+            self.model = BiStrideMeshGraphNet(
+                **_shared_kwargs,
+                num_mesh_levels=int(cfg.get("num_bsms_levels", 2)),
+                bistride_pos_dim=3,
+                num_layers_bistride=int(cfg.get("num_layers_bistride", 2)),
+                bistride_unet_levels=int(cfg.get("bistride_unet_levels", 1)),
+            )
+        elif model_type == "kan":
             self.model = MeshGraphKAN(
                 **_shared_kwargs,
                 num_harmonics=int(cfg.get("num_harmonics", 5)),
@@ -192,15 +205,26 @@ class MGNTrainer:
             device=dist.device,
         )
 
+    def _unpack_batch(self, batch):
+        """Return (graph, ms_edges, ms_ids) regardless of BSMS mode."""
+        if self.use_bsms:
+            graph = batch["graph"].to(self.dist.device)
+            ms_edges = [e.to(self.dist.device) for e in batch["ms_edges"]]
+            ms_ids = [ids.to(self.dist.device) for ids in batch["ms_ids"]]
+        else:
+            graph = batch.to(self.dist.device)
+            ms_edges, ms_ids = [], []
+        return graph, ms_edges, ms_ids
+
     def train(self, batch):
-        graph = batch.to(self.dist.device)
         self.optimizer.zero_grad()
-        loss = self.forward(graph)
+        graph, ms_edges, ms_ids = self._unpack_batch(batch)
+        loss = self.forward(graph, ms_edges, ms_ids)
         self.backward(loss)
         self.scheduler.step()
         return loss
 
-    def forward(self, graph):
+    def forward(self, graph, ms_edges=(), ms_ids=()):
         with autocast(device_type=self.dist.device.type, enabled=self.amp):
             x, y = graph.x, graph.y
             if self.noise_std > 0.0:
@@ -212,7 +236,7 @@ class MGNTrainer:
                 x[:, 3:12] = x[:, 3:12] + noise
                 y = y.clone()
                 y[:, :9] = y[:, :9] - noise
-            pred = self.model(x, graph.edge_attr, graph)
+            pred = self.model(x, graph.edge_attr, graph, ms_edges, ms_ids)
             return self.criterion(pred, y)
 
     def backward(self, loss):
@@ -239,8 +263,8 @@ class MGNTrainer:
         errors = {k: 0.0 for k in keys}
 
         for batch in self.val_dataloader:
-            graph = batch.to(self.dist.device)
-            pred = self.model(graph.x, graph.edge_attr, graph)
+            graph, ms_edges, ms_ids = self._unpack_batch(batch)
+            pred = self.model(graph.x, graph.edge_attr, graph, ms_edges, ms_ids)
             offset = 0
             for key, d in zip(keys, dims):
                 p = pred[:, offset : offset + d]
