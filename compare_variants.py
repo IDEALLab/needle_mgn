@@ -34,8 +34,31 @@ both visible; the sign of the mean difference tells you the direction):
 
 Outputs written to --out_dir:
   variant_comparison.csv     — one row per (base, variant) pair
-  plot_variant_pvalues.png   — -log10(p) bar chart for all comparisons
-  plot_variant_errors.png    — bar chart of mean error ± std per experiment
+  plot_variant_pvalues.svg   — -log10(p) bar chart for all comparisons
+  plot_variant_errors.svg    — bar chart of mean error ± std per experiment
+
+Default comparisons
+-------------------
+Cropped MGN feature ablations  (base = cropped_base):
+  cropped_noise, cropped_fourier, cropped_cpress
+
+Per-region normalisation       (base = cropped_cpress, same cpress flag):
+  cropped_splitnorm
+
+Model size / architecture      (base = cropped_base):
+  cropped_large, cropped_kan
+
+Temporal stride                (base = cropped_base):
+  cropped_stride1
+
+Cropping vs full mesh          (base = cropped_base):
+  cropped_nocrop
+
+Full-mesh architecture variants (base = cropped_nocrop, same fixed topology):
+  cropped_bistride, cropped_downsampled
+
+DoMINO feature ablations       (base = domino_base):
+  domino_noise, domino_fourier, domino_cpress
 
 Usage:
     uv run python compare_variants.py --experiments_dir experiments/
@@ -62,9 +85,23 @@ from scipy import stats
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PAIRS = [
+    # --- Cropped MGN: feature ablations (vs vanilla base) --------------------
     ("cropped_base", "cropped_noise"),
     ("cropped_base", "cropped_fourier"),
     ("cropped_base", "cropped_cpress"),
+    # Per-region norm: compare against cpress (same features, isolates norm effect)
+    ("cropped_cpress", "cropped_splitnorm"),
+    # --- Cropped MGN: model size / architecture (vs vanilla base) ------------
+    ("cropped_base", "cropped_large"),
+    ("cropped_base", "cropped_kan"),
+    # --- Cropped MGN: temporal stride (vs vanilla base) ----------------------
+    ("cropped_base", "cropped_stride1"),
+    # --- Cropping strategy: full mesh vs dynamic crop ------------------------
+    ("cropped_base", "cropped_nocrop"),
+    # --- Full-mesh architecture variants (vs nocrop — same fixed topology) ---
+    ("cropped_nocrop", "cropped_bistride"),
+    ("cropped_nocrop", "cropped_downsampled"),
+    # --- DoMINO: feature ablations (vs vanilla base) -------------------------
     ("domino_base",  "domino_noise"),
     ("domino_base",  "domino_fourier"),
     ("domino_base",  "domino_cpress"),
@@ -184,7 +221,7 @@ def compare_pair(
 # Plots
 # ---------------------------------------------------------------------------
 
-_COLORS = plt.cm.tab10.colors
+_COLORS = plt.cm.tab20.colors
 
 
 def plot_pvalue_bars(rows: list[dict], out_path: str) -> None:
@@ -251,7 +288,7 @@ def plot_pvalue_bars(rows: list[dict], out_path: str) -> None:
 
     fig.suptitle("Variant vs base model comparison", fontsize=11)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
@@ -288,7 +325,7 @@ def plot_error_bars(
     ax.set_title("Mean tip error per experiment (all GT-available steps)")
     ax.grid(axis="y", lw=0.4, alpha=0.5)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
@@ -304,7 +341,7 @@ def main():
     parser.add_argument(
         "--experiments_dir", default=None,
         help="Directory containing experiment subdirectories. "
-             "Uses default pairs (cropped/domino base vs noise/fourier/cpress).",
+             "Uses default pairs — see module docstring for the full list.",
     )
     parser.add_argument(
         "--comparisons", nargs="+", default=None,
@@ -403,8 +440,8 @@ def main():
     print(f"\nSaved: {csv_path}")
 
     # --- Plots ---------------------------------------------------------------
-    plot_pvalue_bars(rows, os.path.join(args.out_dir, "plot_variant_pvalues.png"))
-    plot_error_bars(all_exps, pairs, os.path.join(args.out_dir, "plot_variant_errors.png"))
+    plot_pvalue_bars(rows, os.path.join(args.out_dir, "plot_variant_pvalues.svg"))
+    plot_error_bars(all_exps, pairs, os.path.join(args.out_dir, "plot_variant_errors.svg"))
 
     print(f"\nAll outputs written to: {args.out_dir}")
 

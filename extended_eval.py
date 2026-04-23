@@ -41,9 +41,10 @@ Outputs (written to --out_dir):
   experiment_metrics.csv  — per-step metrics for all experiments combined
   summary_stats.csv       — per-experiment mean/median/std of each metric
   pvalue_table.csv        — p-values and effect sizes vs no-deflection baseline
-  plot_pct_error.png      — percent error over rollout steps
-  plot_angle_error.png    — angle error over rollout steps
-  plot_summary_bars.png   — bar chart of mean metrics per experiment
+  plot_pct_error.svg      — percent error over rollout steps
+  plot_angle_error.svg    — angle error over rollout steps
+  plot_summary_bars.svg   — bar chart of mean metrics per experiment
+  plot_pvalue_bars.svg    — significance vs no-deflection baseline
 
 Usage:
     uv run python extended_eval.py --experiments_dir experiments/
@@ -272,7 +273,7 @@ def per_experiment_stats(df: pd.DataFrame, exp_name: str) -> dict:
 # Plots
 # ---------------------------------------------------------------------------
 
-_COLORS = plt.cm.tab10.colors
+_COLORS = plt.cm.tab20.colors
 
 
 def _mean_by_step(df: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray]:
@@ -282,41 +283,64 @@ def _mean_by_step(df: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray]:
     return mean.index.to_numpy(), mean.to_numpy()
 
 
-def plot_pct_error(all_dfs: dict[str, pd.DataFrame], out_path: str) -> None:
+def _steps_to_depth(steps: np.ndarray, total_mm: float) -> np.ndarray:
+    """Convert step indices to insertion depth (mm).
+
+    Each experiment covers the same physical insertion (total_mm) regardless
+    of temporal stride.  We normalise by the maximum step index so that the
+    last step always maps to total_mm, making stride-10 and stride-1 rollouts
+    directly comparable on the same x-axis.
+    """
+    if len(steps) == 0 or steps.max() == 0:
+        return steps.astype(float)
+    return steps / steps.max() * total_mm
+
+
+def plot_pct_error(
+    all_dfs: dict[str, pd.DataFrame],
+    out_path: str,
+    total_insertion_mm: float = 40.0,
+) -> None:
     fig, ax = plt.subplots(figsize=(10, 5))
     for i, (name, df) in enumerate(all_dfs.items()):
         steps, vals = _mean_by_step(df, "pct_error")
-        ax.plot(steps, vals, color=_COLORS[i % 10], lw=1.5, label=name)
-    ax.set_xlabel("Rollout step")
+        depth = _steps_to_depth(steps, total_insertion_mm)
+        ax.plot(depth, vals, color=_COLORS[i % 20], lw=1.5, label=name)
+    ax.set_xlabel("Insertion depth (mm)")
     ax.set_ylabel("Tip deflection percent error (%)")
     ax.set_title("Tip deflection percent error — mean across test runs")
     ax.legend(fontsize=8, ncol=2)
     ax.grid(True, lw=0.4, alpha=0.5)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
 
-def plot_angle_error(all_dfs: dict[str, pd.DataFrame], out_path: str) -> None:
+def plot_angle_error(
+    all_dfs: dict[str, pd.DataFrame],
+    out_path: str,
+    total_insertion_mm: float = 40.0,
+) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     for i, (name, df) in enumerate(all_dfs.items()):
-        c = _COLORS[i % 10]
-        steps, vals_deg  = _mean_by_step(df, "angle_error_deg")
-        _, vals_pct = _mean_by_step(df, "angle_error_pct")
-        axes[0].plot(steps, vals_deg, color=c, lw=1.5, label=name)
-        axes[1].plot(steps, vals_pct, color=c, lw=1.5, label=name)
+        c = _COLORS[i % 20]
+        steps, vals_deg = _mean_by_step(df, "angle_error_deg")
+        _, vals_pct     = _mean_by_step(df, "angle_error_pct")
+        depth = _steps_to_depth(steps, total_insertion_mm)
+        axes[0].plot(depth, vals_deg, color=c, lw=1.5, label=name)
+        axes[1].plot(depth, vals_pct, color=c, lw=1.5, label=name)
     axes[0].set_title("Angle error (degrees)")
     axes[1].set_title("Angle error (% of 180°)")
     for ax in axes:
-        ax.set_xlabel("Rollout step")
+        ax.set_xlabel("Insertion depth (mm)")
         ax.legend(fontsize=8, ncol=2)
         ax.grid(True, lw=0.4, alpha=0.5)
     axes[0].set_ylabel("Angle error (°)")
     axes[1].set_ylabel("Angle error (%)")
     fig.suptitle("X-Y plane angle error — mean across test runs", fontsize=11)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
@@ -333,7 +357,7 @@ def plot_summary_bars(summary_rows: list[dict], out_path: str) -> None:
 
     x    = np.arange(len(names))
     w    = 0.6
-    cols = [_COLORS[i % 10] for i in range(len(names))]
+    cols = [_COLORS[i % 20] for i in range(len(names))]
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
@@ -363,7 +387,7 @@ def plot_summary_bars(summary_rows: list[dict], out_path: str) -> None:
 
     fig.suptitle("Experiment summary — mean ± std across all test steps", fontsize=11)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
@@ -408,7 +432,7 @@ def plot_pvalue_bars(pvalue_rows: list[dict], out_path: str) -> None:
     # Panel 2: percent improvement over baseline
     valid_improv = [v if not (isinstance(v, float) and np.isnan(v)) else 0 for v in improv]
     bars = axes[1].bar(x, valid_improv, 0.6,
-                       color=[_COLORS[i % 10] for i in range(len(names))], alpha=0.85)
+                       color=[_COLORS[i % 20] for i in range(len(names))], alpha=0.85)
     axes[1].axhline(0, color="k", lw=0.8)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(names, rotation=25, ha="right", fontsize=8)
@@ -428,7 +452,7 @@ def plot_pvalue_bars(pvalue_rows: list[dict], out_path: str) -> None:
 
     fig.suptitle("Statistical significance vs no-deflection baseline", fontsize=11)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
@@ -458,6 +482,11 @@ def main():
         "--mag_threshold", type=float, default=0.05,
         help="Minimum GT tip deflection magnitude (mm) to include a step in "
              "percent-error and angle-error calculations (default: 0.05)",
+    )
+    parser.add_argument(
+        "--total_insertion_mm", type=float, default=40.0,
+        help="Total needle insertion depth (mm) used to convert rollout steps to "
+             "physical depth on the x-axis of time-series plots (default: 40.0)",
     )
     args = parser.parse_args()
 
@@ -542,10 +571,12 @@ def main():
     print(f"\nSaved: {metrics_path}")
 
     # --- Plots ---------------------------------------------------------------
-    plot_pct_error(all_dfs,   os.path.join(args.out_dir, "plot_pct_error.png"))
-    plot_angle_error(all_dfs, os.path.join(args.out_dir, "plot_angle_error.png"))
-    plot_summary_bars(summary_rows, os.path.join(args.out_dir, "plot_summary_bars.png"))
-    plot_pvalue_bars(pvalue_rows,   os.path.join(args.out_dir, "plot_pvalue_bars.png"))
+    plot_pct_error(all_dfs,   os.path.join(args.out_dir, "plot_pct_error.svg"),
+                   total_insertion_mm=args.total_insertion_mm)
+    plot_angle_error(all_dfs, os.path.join(args.out_dir, "plot_angle_error.svg"),
+                     total_insertion_mm=args.total_insertion_mm)
+    plot_summary_bars(summary_rows, os.path.join(args.out_dir, "plot_summary_bars.svg"))
+    plot_pvalue_bars(pvalue_rows,   os.path.join(args.out_dir, "plot_pvalue_bars.svg"))
 
     print(f"\nAll outputs written to: {args.out_dir}")
 

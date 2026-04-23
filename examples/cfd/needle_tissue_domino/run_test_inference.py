@@ -31,6 +31,7 @@ Usage (from examples/cfd/needle_tissue_domino/):
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 
@@ -117,7 +118,7 @@ def main():
         print(f"Auto-discovered {len(test_run_ids)} test runs: {test_run_ids}")
 
     infer_output_base = os.path.abspath(args.infer_output_base)
-    extra_overrides = args.extra.split() if args.extra else []
+    extra_overrides = shlex.split(args.extra) if args.extra else []
 
     # infer.py must be invoked from the same directory as this script so that
     # Hydra finds conf/config.yaml and relative paths (checkpoints, stats) resolve correctly.
