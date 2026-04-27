@@ -1055,6 +1055,59 @@ class NeedleTissueDataset(Dataset):
         """Total target output dimension."""
         return sum(self.TARGET_DIMS)
 
+    @property
+    def n_tfn_scalar(self) -> int:
+        """Number of scalar node features for TFNMeshGraphNet (excludes coord and vectors)."""
+        return 15 if self.use_cpress else 14
+
+    @property
+    def n_tfn_vec(self) -> int:
+        """Number of 3-D vector node features for TFNMeshGraphNet (u, v, a, mat_fiber)."""
+        return 4
+
+    def _split_tfn_features(
+        self, x: torch.Tensor
+    ) -> "Tuple[torch.Tensor, torch.Tensor]":
+        """Split the flat normalised feature vector into scalar and vector parts.
+
+        The flat ``x`` layout (with ``use_cpress=True``) is::
+
+            coord[0:3]  u[3:6]  v[6:9]  a[9:12]  evf[12:13]  s[13:19]
+            cpress[19:20]  mat_E[20:21]  mat_c10[21:22]  mat_density[22:23]
+            mat_fiber[23:26]  mat_k1[26:27]  mat_k2[27:28]
+            mat_kappa[28:29]  mat_nu[29:30]
+
+        ``coord`` is excluded for translational equivariance.
+        Vectors ``(u, v, a, mat_fiber)`` go to ``x_vec``; everything else to ``x_scalar``.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Node features, shape ``(N, input_dim_nodes)``.
+
+        Returns
+        -------
+        x_scalar : torch.Tensor
+            Shape ``(N, n_tfn_scalar)``.
+        x_vec : torch.Tensor
+            Shape ``(N, n_tfn_vec * 3)`` — consecutive xyz per vector.
+        """
+        if self.use_cpress:
+            # x_vec: u[3:6], v[6:9], a[9:12], mat_fiber[23:26]
+            x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
+            # x_scalar: evf[12:13], s[13:19], cpress[19:20],
+            #            mat_E[20:21], mat_c10[21:22], mat_density[22:23],
+            #            mat_k1[26:27], mat_k2[27:28], mat_kappa[28:29], mat_nu[29:30]
+            x_scalar = torch.cat([x[:, 12:23], x[:, 26:30]], dim=-1)
+        else:
+            # x_vec: u[3:6], v[6:9], a[9:12], mat_fiber[22:25]
+            x_vec = torch.cat([x[:, 3:12], x[:, 22:25]], dim=-1)
+            # x_scalar: evf[12:13], s[13:19],
+            #            mat_E[19:20], mat_c10[20:21], mat_density[21:22],
+            #            mat_k1[25:26], mat_k2[26:27], mat_kappa[27:28], mat_nu[28:29]
+            x_scalar = torch.cat([x[:, 12:22], x[:, 25:29]], dim=-1)
+        return x_scalar, x_vec
+
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
@@ -1242,6 +1295,9 @@ class NeedleTissueDataset(Dataset):
         fiber_norm = torch.linalg.norm(fiber_raw, dim=-1, keepdim=True).clamp(min=1e-8)
         fiber_dir = (fiber_raw / fiber_norm)[part_nodes]  # (n_sub, 3)
 
+        # Split x into scalar and vector parts for TFNMeshGraphNet.
+        x_scalar_sub, x_vec_sub = self._split_tfn_features(x_sub)
+
         return Data(
             x=x_sub,
             y=y_sub,
@@ -1249,6 +1305,8 @@ class NeedleTissueDataset(Dataset):
             edge_attr=edge_attr,
             pos=coord_sub,
             fiber_dir=fiber_dir,
+            x_scalar=x_scalar_sub,
+            x_vec=x_vec_sub,
         )
 
     # ------------------------------------------------------------------

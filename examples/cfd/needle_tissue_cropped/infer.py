@@ -59,7 +59,7 @@ from dataset import (
     _atomic_torch_save,
 )
 from physicsnemo.distributed.manager import DistributedManager
-from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN
+from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN, FiberEquivariantMGN, FiberEquivariantKAN, TFNMeshGraphNet
 from physicsnemo.utils import load_checkpoint
 from physicsnemo.datapipes.gnn.utils import load_json
 
@@ -308,6 +308,23 @@ def _apply_needle_edge_cap(
     return delta_u_needle * scale
 
 
+def _split_tfn_features(
+    x: torch.Tensor, use_cpress: bool
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Split flat node features into (x_scalar, x_vec) for TFNMeshGraphNet.
+
+    Mirrors ``NeedleTissueDataset._split_tfn_features``.  Coordinates are
+    excluded for translational equivariance.
+    """
+    if use_cpress:
+        x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
+        x_scalar = torch.cat([x[:, 12:23], x[:, 26:30]], dim=-1)
+    else:
+        x_vec = torch.cat([x[:, 3:12], x[:, 22:25]], dim=-1)
+        x_scalar = torch.cat([x[:, 12:22], x[:, 25:29]], dim=-1)
+    return x_scalar, x_vec
+
+
 def _build_step_graph(
     state: dict,
     node_props: dict,
@@ -322,6 +339,7 @@ def _build_step_graph(
     needle_idx_t: Optional[torch.Tensor] = None,
     tissue_idx_t: Optional[torch.Tensor] = None,
     fiber_dir_full: Optional[torch.Tensor] = None,
+    use_cpress: bool = True,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -356,6 +374,9 @@ def _build_step_graph(
     if fiber_dir_full is not None:
         fiber_dir_sub = fiber_dir_full[part_nodes]
 
+    # Split into scalar/vector parts for TFNMeshGraphNet.
+    x_scalar_sub, x_vec_sub = _split_tfn_features(x_sub, use_cpress)
+
     return Data(
         x=x_sub,
         edge_attr=edge_attr,
@@ -363,6 +384,8 @@ def _build_step_graph(
         pos=coord_sub,
         num_nodes=len(part_nodes),
         fiber_dir=fiber_dir_sub,
+        x_scalar=x_scalar_sub,
+        x_vec=x_vec_sub,
     )
 
 
@@ -515,6 +538,30 @@ def main(cfg: DictConfig) -> None:
         model = MeshGraphKAN(
             **_shared_kwargs,
             num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
+        )
+    elif model_type == "fiber":
+        model = FiberEquivariantMGN(
+            **_shared_kwargs,
+            n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
+        )
+    elif model_type == "fiber_kan":
+        model = FiberEquivariantKAN(
+            **_shared_kwargs,
+            n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
+            num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
+        )
+    elif model_type == "tfn":
+        n_tfn_scalar = 15 if use_cpress else 14
+        model = TFNMeshGraphNet(
+            n_node_scalar=n_tfn_scalar,
+            n_node_vec=4,
+            output_dim=output_dim,
+            irreps_hidden=str(OmegaConf.select(cfg, "irreps_hidden", default="16x0e + 8x1o + 4x2e")),
+            l_max=int(OmegaConf.select(cfg, "l_max", default=2)),
+            n_radial_basis=int(OmegaConf.select(cfg, "n_radial_basis", default=8)),
+            r_max=float(OmegaConf.select(cfg, "r_max", default=60.0)),
+            processor_size=cfg.processor_size,
+            n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
         )
     else:
         model = MeshGraphNet(
@@ -690,6 +737,7 @@ def main(cfg: DictConfig) -> None:
                 needle_idx_t=needle_idx_t,
                 tissue_idx_t=tissue_idx_t,
                 fiber_dir_full=fiber_dir_full,
+                use_cpress=use_cpress,
             )
             graph = graph.to(dist.device)
             pred_sub = model(graph.x, graph.edge_attr, graph).cpu()

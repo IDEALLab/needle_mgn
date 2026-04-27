@@ -98,9 +98,19 @@ input_dim_edges: 7
 #             (default 3 for u, v, a).
 model_type: "mgn"
 num_harmonics: 5
-# Number of 3-D vector outputs decoded equivariantly (fiber model only).
+# Number of 3-D vector outputs decoded equivariantly (fiber/tfn model only).
 # With use_cpress=true the first 9 outputs are u/v/a (3 × 3-D vectors).
 n_vec_outputs: 3
+
+# TFN (Tensor Field Network) model parameters (model_type=tfn only).
+# irreps_hidden: hidden irrep spec, e.g. "16x0e + 8x1o + 4x2e"
+# l_max: max spherical harmonic order (1=cheap, 2=default, 3=more angular)
+# n_radial_basis: number of Gaussian radial basis functions
+# r_max: radial basis cutoff in mm (should cover max edge length)
+irreps_hidden: "64x0e + 32x1o + 16x2e"
+l_max: 2
+n_radial_basis: 8
+r_max: 60.0
 
 # Bi-stride MeshGraphNet (bistride mode only).
 # use_bsms must be true when model_type=bistride.  Requires a fixed mesh

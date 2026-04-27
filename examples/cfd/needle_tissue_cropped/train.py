@@ -37,7 +37,7 @@ except Exception:
 
 from dataset import NeedleTissueDataset
 from physicsnemo.distributed.manager import DistributedManager
-from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN, FiberEquivariantMGN, FiberEquivariantKAN
+from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN, FiberEquivariantMGN, FiberEquivariantKAN, TFNMeshGraphNet
 from physicsnemo.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
@@ -165,6 +165,19 @@ class MGNTrainer:
                 **_shared_kwargs,
                 n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
                 num_harmonics=int(cfg.get("num_harmonics", 5)),
+            )
+        elif model_type == "tfn":
+            n_tfn_scalar = train_dataset.n_tfn_scalar
+            self.model = TFNMeshGraphNet(
+                n_node_scalar=n_tfn_scalar,
+                n_node_vec=train_dataset.n_tfn_vec,
+                output_dim=train_dataset.output_dim,
+                irreps_hidden=str(cfg.get("irreps_hidden", "16x0e + 8x1o + 4x2e")),
+                l_max=int(cfg.get("l_max", 2)),
+                n_radial_basis=int(cfg.get("n_radial_basis", 8)),
+                r_max=float(cfg.get("r_max", 60.0)),
+                processor_size=cfg.processor_size,
+                n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
             )
         else:
             self.model = MeshGraphNet(

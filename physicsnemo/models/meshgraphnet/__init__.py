@@ -19,3 +19,4 @@ from .bsms_mgn import BiStrideMeshGraphNet  # noqa: I001
 from .meshgraphkan import MeshGraphKAN
 from .hybrid_meshgraphnet import HybridMeshGraphNet  # noqa: I001
 from .fiber_mgn import FiberEquivariantMGN, FiberEquivariantKAN  # noqa: I001
+from .tfn_mgn import TFNMeshGraphNet  # noqa: I001
