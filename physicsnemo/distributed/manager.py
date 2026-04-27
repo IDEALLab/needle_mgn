@@ -584,8 +584,11 @@ class DistributedManager(object):
             f"cuda:{manager.local_rank}" if torch.cuda.is_available() else "cpu"
         )
 
-        if manager._distributed:
-            # Setup distributed process group
+        if manager._distributed and manager._world_size > 1:
+            # Setup distributed process group.
+            # Skipped for world_size=1: no inter-process communication is needed
+            # and some backends (e.g. Gloo on Windows) fail even for trivial
+            # single-process groups.
             try:
                 dist.init_process_group(
                     backend,
@@ -814,6 +817,7 @@ class DistributedManager(object):
             and DistributedManager._shared_state["_is_initialized"]
             and "_distributed" in DistributedManager._shared_state
             and DistributedManager._shared_state["_distributed"]
+            and dist.is_initialized()
         ):
             if barrier:
                 if torch.cuda.is_available():
