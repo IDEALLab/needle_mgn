@@ -562,6 +562,7 @@ def main(cfg: DictConfig) -> None:
             r_max=float(OmegaConf.select(cfg, "r_max", default=60.0)),
             processor_size=cfg.processor_size,
             n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
+            checkpoint_layers=False,  # not needed at inference; model.eval() disables it anyway
         )
     else:
         model = MeshGraphNet(

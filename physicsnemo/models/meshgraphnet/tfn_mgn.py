@@ -91,6 +91,7 @@ from typing import List, Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 try:
     from e3nn import o3
@@ -390,6 +391,13 @@ class TFNMeshGraphNet(Module):
         Number of 3-D vector outputs decoded equivariantly (e.g. 3 for u, v,
         a).  The first ``n_vec_outputs * 3`` columns of the output correspond
         to ``n_vec_outputs × 1o`` irreps; the remaining columns are scalars.
+    checkpoint_layers : bool, optional, default=False
+        When ``True``, wraps each processor layer in
+        ``torch.utils.checkpoint.checkpoint`` during training.  This trades
+        compute for memory: the per-edge TP weight tensor (shape
+        ``(E, weight_numel)``) is not stored across layers for backprop and is
+        instead recomputed on the backward pass.  Strongly recommended for
+        large meshes (E > 100 K edges) where ``irreps_hidden`` is non-trivial.
 
     Forward
     -------
@@ -450,6 +458,7 @@ class TFNMeshGraphNet(Module):
         processor_size: int = 5,
         radial_mlp_hidden: int = 64,
         n_vec_outputs: int = 3,
+        checkpoint_layers: bool = False,
     ):
         super().__init__(meta=MetaData())
 
@@ -457,6 +466,7 @@ class TFNMeshGraphNet(Module):
         self.n_node_vec = n_node_vec
         self.n_vec_outputs = n_vec_outputs
         self.output_dim = output_dim
+        self.checkpoint_layers = checkpoint_layers
 
         n_scalar_out = output_dim - n_vec_outputs * 3
         if n_scalar_out < 0:
@@ -534,7 +544,14 @@ class TFNMeshGraphNet(Module):
         # ---- Message passing ---------------------------------------------------
         src, dst = graph.edge_index
         for layer in self.layers:
-            h = layer(h, sh, radial, src, dst, N)
+            if self.checkpoint_layers and self.training:
+                # Recompute this layer's forward on the backward pass instead of
+                # storing its activations (especially the large per-edge weight
+                # tensor).  use_reentrant=False supports non-tensor args (N).
+                h = gradient_checkpoint(layer, h, sh, radial, src, dst, N,
+                                        use_reentrant=False)
+            else:
+                h = layer(h, sh, radial, src, dst, N)
 
         # ---- Decode ------------------------------------------------------------
         return self.node_decoder(h)  # (N, output_dim)

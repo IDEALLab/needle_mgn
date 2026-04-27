@@ -107,10 +107,15 @@ n_vec_outputs: 3
 # l_max: max spherical harmonic order (1=cheap, 2=default, 3=more angular)
 # n_radial_basis: number of Gaussian radial basis functions
 # r_max: radial basis cutoff in mm (should cover max edge length)
-irreps_hidden: "64x0e + 32x1o + 16x2e"
+irreps_hidden: "16x0e + 8x1o + 4x2e"
 l_max: 2
 n_radial_basis: 8
 r_max: 60.0
+# Gradient checkpointing for TFN processor layers.  Strongly recommended for
+# large meshes: recomputes each layer's per-edge weight tensor on the backward
+# pass instead of storing it, reducing peak memory from O(layers × E × W) to
+# O(E × W) where W = weight_numel per edge.  Has no effect at inference.
+tfn_checkpoint_layers: true
 
 # Bi-stride MeshGraphNet (bistride mode only).
 # use_bsms must be true when model_type=bistride.  Requires a fixed mesh

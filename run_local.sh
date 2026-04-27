@@ -289,11 +289,12 @@ cropped_tfn)
         timestep_stride=10
         model_type=tfn
         n_vec_outputs=3
-        irreps_hidden="64x0e + 32x1o + 16x2e"
+        irreps_hidden="16x0e + 8x1o + 4x2e"
         l_max=2
         n_radial_basis=8
         r_max=60.0
-        processor_size=10
+        processor_size=15
+        tfn_checkpoint_layers=true
         ++per_region_norm=false
     )
     ;;

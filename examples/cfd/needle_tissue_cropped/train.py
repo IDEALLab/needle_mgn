@@ -178,6 +178,7 @@ class MGNTrainer:
                 r_max=float(cfg.get("r_max", 60.0)),
                 processor_size=cfg.processor_size,
                 n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
+                checkpoint_layers=bool(cfg.get("tfn_checkpoint_layers", True)),
             )
         else:
             self.model = MeshGraphNet(
