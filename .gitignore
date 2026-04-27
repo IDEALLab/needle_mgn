@@ -228,3 +228,4 @@ examples/cfd/needle_tissue_cropped/outputs/wandb/
 *.err
 *.sif
 *hydra
+*.svg
