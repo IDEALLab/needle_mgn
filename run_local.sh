@@ -25,7 +25,7 @@ if [ -z "$EXP_NAME" ]; then
     echo "Available experiments:"
     echo "  cropped_base       cropped_noise      cropped_fourier    cropped_cpress"
     echo "  cropped_stride1    cropped_splitnorm  cropped_large      cropped_nocrop"
-    echo "  cropped_kan        cropped_bistride   cropped_downsampled  cropped_fiber"
+    echo "  cropped_kan        cropped_bistride   cropped_downsampled  cropped_fiber  cropped_fiber_kan"
     echo "  domino_base        domino_noise       domino_fourier     domino_cpress"
     exit 1
 fi
@@ -251,6 +251,25 @@ cropped_fiber)
         timestep_stride=10
         model_type=fiber
         n_vec_outputs=3
+        hidden_dim_node_encoder=256
+        hidden_dim_edge_encoder=256
+        hidden_dim_node_decoder=256
+        hidden_dim_processor=256
+        processor_size=15
+        ++per_region_norm=false
+    )
+    ;;
+
+cropped_fiber_kan)
+    SCRIPT="${PROJECT}/examples/cfd/needle_tissue_cropped/train.py"
+    OVERRIDES=(
+        wandb_project=PhysicsNeMo-Cropped-Ablation
+        noise_std=0
+        use_cpress=false
+        timestep_stride=10
+        model_type=fiber_kan
+        n_vec_outputs=3
+        num_harmonics=5
         hidden_dim_node_encoder=256
         hidden_dim_edge_encoder=256
         hidden_dim_node_decoder=256

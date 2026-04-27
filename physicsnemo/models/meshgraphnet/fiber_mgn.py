@@ -50,7 +50,7 @@ ordering ``[u (3), v (3), a (3), evf (1), s (6), cpress (1)]`` when
 """
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Union
 
 import torch
 import torch.nn as nn
@@ -58,7 +58,7 @@ import torch.nn as nn
 import physicsnemo  # noqa: F401
 from physicsnemo.core.meta import ModelMetaData
 from physicsnemo.core.module import Module
-from physicsnemo.nn import get_activation
+from physicsnemo.nn import KolmogorovArnoldNetwork, get_activation
 from physicsnemo.nn.module.gnn_layers.mesh_edge_block import MeshEdgeBlock
 from physicsnemo.nn.module.gnn_layers.mesh_graph_mlp import MeshGraphMLP
 from physicsnemo.nn.module.gnn_layers.utils import GraphType, aggregate_and_concat
@@ -497,3 +497,85 @@ class FiberEquivariantMGN(Module):
             scalar_out = self.scalar_decoder(decoder_in)               # (N, scalar_dim)
             return torch.cat([vec_out, scalar_out], dim=-1)
         return vec_out
+
+
+class FiberEquivariantKAN(FiberEquivariantMGN):
+    r"""Fiber-direction equivariant MeshGraphNet with a KAN node encoder.
+
+    Identical to :class:`FiberEquivariantMGN` except the MLP node encoder is
+    replaced by a Kolmogorov–Arnold Network (KAN), following the same pattern
+    as :class:`~physicsnemo.models.meshgraphnet.MeshGraphKAN`.
+
+    The KAN encoder maps ``input_dim_nodes`` → ``hidden_dim_processor`` using
+    Fourier-series basis functions parameterised by ``num_harmonics``.
+
+    Parameters
+    ----------
+    input_dim_nodes : int
+        Number of node features.
+    input_dim_edges : int
+        Number of edge features.
+    output_dim : int
+        Total number of output features (vector + scalar).
+    n_vec_outputs : int, optional, default=3
+        Number of 3-D vector outputs decoded equivariantly.
+    num_harmonics : int, optional, default=5
+        Number of Fourier harmonics for the KAN node encoder.
+    processor_size : int, optional, default=15
+        Number of message-passing steps.
+    hidden_dim_processor : int, optional, default=128
+        Hidden feature size throughout the model.
+    aggregation : str, optional, default="sum"
+        Edge aggregation method.
+
+    All other parameters are forwarded to :class:`FiberEquivariantMGN`.
+    """
+
+    def __init__(
+        self,
+        input_dim_nodes: int,
+        input_dim_edges: int,
+        output_dim: int,
+        n_vec_outputs: int = 3,
+        num_harmonics: int = 5,
+        processor_size: int = 15,
+        mlp_activation_fn: str = "relu",
+        num_layers_node_processor: int = 2,
+        num_layers_edge_processor: int = 2,
+        hidden_dim_processor: int = 128,
+        hidden_dim_node_encoder: int = 128,
+        num_layers_node_encoder: Union[int, None] = 2,  # ignored for KAN
+        hidden_dim_edge_encoder: int = 128,
+        num_layers_edge_encoder: int = 2,
+        hidden_dim_node_decoder: int = 128,
+        num_layers_node_decoder: int = 2,
+        aggregation: Literal["sum", "mean"] = "sum",
+        norm_type: Literal["LayerNorm", "TELayerNorm"] = "LayerNorm",
+    ):
+        super().__init__(
+            input_dim_nodes=input_dim_nodes,
+            input_dim_edges=input_dim_edges,
+            output_dim=output_dim,
+            n_vec_outputs=n_vec_outputs,
+            processor_size=processor_size,
+            mlp_activation_fn=mlp_activation_fn,
+            num_layers_node_processor=num_layers_node_processor,
+            num_layers_edge_processor=num_layers_edge_processor,
+            hidden_dim_processor=hidden_dim_processor,
+            hidden_dim_node_encoder=hidden_dim_node_encoder,
+            num_layers_node_encoder=num_layers_node_encoder,
+            hidden_dim_edge_encoder=hidden_dim_edge_encoder,
+            num_layers_edge_encoder=num_layers_edge_encoder,
+            hidden_dim_node_decoder=hidden_dim_node_decoder,
+            num_layers_node_decoder=num_layers_node_decoder,
+            aggregation=aggregation,
+            norm_type=norm_type,
+        )
+
+        # Replace the MLP node encoder with a KAN.
+        self.node_encoder = KolmogorovArnoldNetwork(
+            input_dim=input_dim_nodes,
+            output_dim=hidden_dim_processor,
+            num_harmonics=num_harmonics,
+            add_bias=True,
+        )
