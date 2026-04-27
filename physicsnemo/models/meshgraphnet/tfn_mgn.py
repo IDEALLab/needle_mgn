@@ -325,7 +325,7 @@ class _TFNLayer(nn.Module):
         messages = self.tp(h[src], sh, weights)  # (E, hidden_dim)
 
         # Scatter-add to destination nodes
-        agg = torch.zeros(n_nodes, messages.shape[1], device=h.device, dtype=h.dtype)
+        agg = torch.zeros(n_nodes, messages.shape[1], device=h.device, dtype=messages.dtype)
         agg.scatter_add_(0, dst.unsqueeze(-1).expand_as(messages), messages)
 
         # Self-connection + combine
@@ -508,8 +508,10 @@ class TFNMeshGraphNet(Module):
         # ---- Node features from graph attributes (not flat node_features) ----
         # graph.x_scalar: (N, n_node_scalar)
         # graph.x_vec:    (N, n_node_vec * 3)  — consecutive xyz per vector
-        x_scalar = graph.x_scalar
-        x_vec = graph.x_vec
+        # Cast to float32: e3nn ops (Linear, TensorProduct, SphericalHarmonics)
+        # always run in float32 regardless of AMP autocast context.
+        x_scalar = graph.x_scalar.float()
+        x_vec = graph.x_vec.float()
         N = x_scalar.shape[0]
 
         # Build equivariant input tensor: [scalars | vectors]  (matches irreps_node_input layout)
@@ -517,9 +519,9 @@ class TFNMeshGraphNet(Module):
         h = self.node_encoder(node_in)  # (N, irreps_hidden.dim)
 
         # ---- Edge preprocessing ------------------------------------------------
-        rel_pos = edge_features[:, :3]        # (E, 3) — physical displacement
-        r = edge_features[:, 3]               # (E,)   — edge length
-        edge_extra = edge_features[:, 3:]     # (E, n_edge_extra_scalar) — len + type
+        rel_pos = edge_features[:, :3].float()   # (E, 3) — physical displacement
+        r = edge_features[:, 3].float()          # (E,)   — edge length
+        edge_extra = edge_features[:, 3:].float()  # (E, n_edge_extra_scalar) — len + type
 
         # Unit edge vector → spherical harmonics
         r_hat = rel_pos / r.unsqueeze(-1).clamp(min=1e-8)
