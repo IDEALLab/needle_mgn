@@ -276,11 +276,11 @@ def per_experiment_stats(df: pd.DataFrame, exp_name: str) -> dict:
 _COLORS = plt.cm.tab20.colors
 
 
-def _mean_by_step(df: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray]:
-    """Return (steps, mean_values) averaged across runs for one metric column."""
+def _median_by_step(df: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return (steps, median_values) across runs for one metric column."""
     g = df[df["has_gt"]].groupby("step")[col]
-    mean = g.mean()
-    return mean.index.to_numpy(), mean.to_numpy()
+    median = g.median()
+    return median.index.to_numpy(), median.to_numpy()
 
 
 def _steps_to_depth(steps: np.ndarray, total_mm: float) -> np.ndarray:
@@ -300,15 +300,21 @@ def plot_pct_error(
     all_dfs: dict[str, pd.DataFrame],
     out_path: str,
     total_insertion_mm: float = 40.0,
+    ylim: float | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10, 5))
     for i, (name, df) in enumerate(all_dfs.items()):
-        steps, vals = _mean_by_step(df, "pct_error")
+        steps, vals = _median_by_step(df, "pct_error")
         depth = _steps_to_depth(steps, total_insertion_mm)
         ax.plot(depth, vals, color=_COLORS[i % 20], lw=1.5, label=name)
+    if ylim is not None:
+        ax.set_ylim(0, ylim)
     ax.set_xlabel("Insertion depth (mm)")
     ax.set_ylabel("Tip deflection percent error (%)")
-    ax.set_title("Tip deflection percent error — mean across test runs")
+    title = "Tip deflection percent error — median across test runs"
+    if ylim is not None:
+        title += f" (cropped to {ylim:.0f}%)"
+    ax.set_title(title)
     ax.legend(fontsize=8, ncol=2)
     ax.grid(True, lw=0.4, alpha=0.5)
     fig.tight_layout()
@@ -325,8 +331,8 @@ def plot_angle_error(
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     for i, (name, df) in enumerate(all_dfs.items()):
         c = _COLORS[i % 20]
-        steps, vals_deg = _mean_by_step(df, "angle_error_deg")
-        _, vals_pct     = _mean_by_step(df, "angle_error_pct")
+        steps, vals_deg = _median_by_step(df, "angle_error_deg")
+        _, vals_pct     = _median_by_step(df, "angle_error_pct")
         depth = _steps_to_depth(steps, total_insertion_mm)
         axes[0].plot(depth, vals_deg, color=c, lw=1.5, label=name)
         axes[1].plot(depth, vals_pct, color=c, lw=1.5, label=name)
@@ -338,7 +344,7 @@ def plot_angle_error(
         ax.grid(True, lw=0.4, alpha=0.5)
     axes[0].set_ylabel("Angle error (°)")
     axes[1].set_ylabel("Angle error (%)")
-    fig.suptitle("X-Y plane angle error — mean across test runs", fontsize=11)
+    fig.suptitle("X-Y plane angle error — median across test runs", fontsize=11)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -573,6 +579,8 @@ def main():
     # --- Plots ---------------------------------------------------------------
     plot_pct_error(all_dfs,   os.path.join(args.out_dir, "plot_pct_error.svg"),
                    total_insertion_mm=args.total_insertion_mm)
+    plot_pct_error(all_dfs,   os.path.join(args.out_dir, "plot_pct_error_capped.svg"),
+                   total_insertion_mm=args.total_insertion_mm, ylim=100.0)
     plot_angle_error(all_dfs, os.path.join(args.out_dir, "plot_angle_error.svg"),
                      total_insertion_mm=args.total_insertion_mm)
     plot_summary_bars(summary_rows, os.path.join(args.out_dir, "plot_summary_bars.svg"))

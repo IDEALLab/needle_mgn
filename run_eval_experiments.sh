@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run inference + evaluation for all 8 trained experiments.
+# Run inference + evaluation for all trained experiments.
 #
 # Usage:
 #   bash run_eval_experiments.sh /path/to/RUN-2
@@ -7,6 +7,10 @@
 # Each experiment gets:
 #   experiments/<name>/inference_output/RUN-<id>/  — predicted VTUs per test run
 #   experiments/<name>/eval/                       — summary CSVs and plots
+#
+# NOTE: cropped_bistride and cropped_downsampled require infer.py to be updated
+# to support BiStrideMeshGraphNet and beam/tissue mesh reduction respectively.
+# They are listed here but will fail at inference until infer.py is extended.
 
 set -euo pipefail
 
@@ -93,6 +97,46 @@ run_experiment cropped cropped_fourier \
 
 run_experiment cropped cropped_cpress \
     "use_cpress=true use_fourier_features=false"
+
+run_experiment cropped cropped_stride1 \
+    "use_cpress=false use_fourier_features=false per_region_norm=false timestep_stride=1 n_rollout=200"
+
+run_experiment cropped cropped_splitnorm \
+    "use_cpress=true use_fourier_features=false per_region_norm=true"
+
+run_experiment cropped cropped_large \
+    "use_cpress=false use_fourier_features=false per_region_norm=false \
+     hidden_dim_node_encoder=384 hidden_dim_edge_encoder=384 \
+     hidden_dim_node_decoder=384 hidden_dim_processor=384 processor_size=20"
+
+run_experiment cropped cropped_nocrop \
+    "use_cpress=false use_fourier_features=false per_region_norm=false \
+     needle_crop_mm=10000 tissue_crop_mm=10000 'crop_strategy_weights=[1,0,0]'"
+
+run_experiment cropped cropped_kan \
+    "use_cpress=false per_region_norm=false model_type=kan num_harmonics=5 \
+     hidden_dim_node_encoder=256 hidden_dim_edge_encoder=256 \
+     hidden_dim_node_decoder=256 hidden_dim_processor=256 processor_size=15"
+
+# NOTE: cropped_bistride requires infer.py to support model_type=bistride
+# (BiStrideMeshGraphNet) before inference will succeed.
+run_experiment cropped cropped_bistride \
+    "use_cpress=false per_region_norm=false \
+     needle_crop_mm=10000 tissue_crop_mm=10000 'crop_strategy_weights=[1,0,0]' \
+     model_type=bistride use_bsms=true num_bsms_levels=2 \
+     num_layers_bistride=2 bistride_unet_levels=1 \
+     hidden_dim_node_encoder=256 hidden_dim_edge_encoder=256 \
+     hidden_dim_node_decoder=256 hidden_dim_processor=256 processor_size=15"
+
+# NOTE: cropped_downsampled requires infer.py to apply beam reduction and
+# tissue downsampling (beam_spacing_mm / tissue_downsample_mm) before
+# inference will succeed.
+run_experiment cropped cropped_downsampled \
+    "use_cpress=false per_region_norm=false \
+     needle_crop_mm=10000 tissue_crop_mm=10000 'crop_strategy_weights=[1,0,0]' \
+     beam_spacing_mm=2.0 tissue_downsample_mm=3.0 \
+     hidden_dim_node_encoder=256 hidden_dim_edge_encoder=256 \
+     hidden_dim_node_decoder=256 hidden_dim_processor=256 processor_size=15"
 
 # ---------------------------------------------------------------------------
 # DoMINO experiments
