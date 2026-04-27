@@ -1236,12 +1236,19 @@ class NeedleTissueDataset(Dataset):
         edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
         edge_attr = torch.cat([rel_pos, edge_len, all_et], dim=-1)
 
+        # Unit fiber direction per node (for FiberEquivariantMGN).
+        # mat_fiber is a 3-D material axis stored in node_props; normalise to unit length.
+        fiber_raw = node_props["mat_fiber"]  # (n_nodes, 3) float32
+        fiber_norm = torch.linalg.norm(fiber_raw, dim=-1, keepdim=True).clamp(min=1e-8)
+        fiber_dir = (fiber_raw / fiber_norm)[part_nodes]  # (n_sub, 3)
+
         return Data(
             x=x_sub,
             y=y_sub,
             edge_index=all_ei,
             edge_attr=edge_attr,
             pos=coord_sub,
+            fiber_dir=fiber_dir,
         )
 
     # ------------------------------------------------------------------

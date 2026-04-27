@@ -33,6 +33,7 @@ Override config values with Hydra syntax:
     uv run python infer.py needle_crop_mm=15.0 tissue_crop_mm=40.0
 """
 
+import json
 import os
 import re
 import time
@@ -262,6 +263,51 @@ def _build_world_edges(
     return world_ei, world_et
 
 
+def _apply_needle_edge_cap(
+    delta_u_needle: torch.Tensor,
+    coord_needle: torch.Tensor,
+    needle_local_ei: torch.Tensor,
+    max_delta_mm: float,
+) -> torch.Tensor:
+    """Scale needle displacement so no edge changes length by more than max_delta_mm.
+
+    Parameters
+    ----------
+    delta_u_needle : Tensor, shape (n_needle, 3)
+        Predicted displacement for needle nodes in needle-local index space.
+    coord_needle : Tensor, shape (n_needle, 3)
+        Current needle node positions in needle-local index space.
+    needle_local_ei : Tensor, shape (2, E_needle)
+        Needle-to-needle edge index in needle-local space.
+    max_delta_mm : float
+        Maximum allowed change in edge length (mm).  From needle_edge_stats.json.
+
+    Returns
+    -------
+    Tensor, shape (n_needle, 3)
+        Displacement scaled so all edge length changes are within the cap.
+        Returned unchanged if no edge exceeds the cap.
+    """
+    if needle_local_ei.shape[1] == 0:
+        return delta_u_needle
+
+    src, dst = needle_local_ei
+    len_current = torch.linalg.norm(
+        coord_needle[src] - coord_needle[dst], dim=-1
+    )
+    new_coord = coord_needle + delta_u_needle
+    len_predicted = torch.linalg.norm(
+        new_coord[src] - new_coord[dst], dim=-1
+    )
+    max_delta = (len_predicted - len_current).abs().max().item()
+
+    if max_delta <= max_delta_mm or max_delta == 0.0:
+        return delta_u_needle
+
+    scale = max_delta_mm / max_delta
+    return delta_u_needle * scale
+
+
 def _build_step_graph(
     state: dict,
     node_props: dict,
@@ -275,6 +321,7 @@ def _build_step_graph(
     input_keys: list,
     needle_idx_t: Optional[torch.Tensor] = None,
     tissue_idx_t: Optional[torch.Tensor] = None,
+    fiber_dir_full: Optional[torch.Tensor] = None,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -304,12 +351,18 @@ def _build_step_graph(
     edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
     edge_attr = torch.cat([rel_pos, edge_len, all_et], dim=-1)
 
+    # Unit fiber direction per node (passed through to FiberEquivariantMGN).
+    fiber_dir_sub = None
+    if fiber_dir_full is not None:
+        fiber_dir_sub = fiber_dir_full[part_nodes]
+
     return Data(
         x=x_sub,
         edge_attr=edge_attr,
         edge_index=all_ei,
         pos=coord_sub,
         num_nodes=len(part_nodes),
+        fiber_dir=fiber_dir_sub,
     )
 
 
@@ -509,6 +562,14 @@ def main(cfg: DictConfig) -> None:
     node_props = cache.get("node_props", {})
     n_nodes = int(hex_edge_index.max().item()) + 1
 
+    # Pre-compute unit fiber direction for every node (used by FiberEquivariantMGN).
+    if "mat_fiber" in node_props:
+        _fiber_raw = node_props["mat_fiber"].float()   # (N, 3)
+        _fiber_norm = torch.linalg.norm(_fiber_raw, dim=-1, keepdim=True).clamp(min=1e-8)
+        fiber_dir_full = _fiber_raw / _fiber_norm       # (N, 3) unit vectors
+    else:
+        fiber_dir_full = None
+
     # ---- Needle / tissue node index sets ---------------------------------
     needle_node_indices, tissue_node_indices = _get_needle_tissue_node_sets(
         hex_edge_index, hex_edge_type_onehot
@@ -551,7 +612,7 @@ def main(cfg: DictConfig) -> None:
         f"(from {n_frames_with_edges}/{len(cache['world_edges'])} GT frames with edges)"
     )
 
-    # ---- Consensus filter precomputation ------------------------------------
+    # ---- Consensus filter + needle edge cap precomputation ------------------
     consensus_attenuation = float(OmegaConf.select(cfg, "consensus_attenuation", default=0.0))
     needle_local_ei = _build_needle_local_edge_index(
         hex_edge_index, needle_node_indices, n_nodes
@@ -560,6 +621,22 @@ def main(cfg: DictConfig) -> None:
         print(
             f"Consensus filter: attenuation={consensus_attenuation:.2f}, "
             f"needle-needle edges={needle_local_ei.shape[1]}"
+        )
+
+    needle_edge_cap_mm: Optional[float] = None
+    if bool(OmegaConf.select(cfg, "needle_edge_cap", default=False)):
+        stats_file = os.path.join(stats_dir, "needle_edge_stats.json")
+        if not os.path.isfile(stats_file):
+            raise FileNotFoundError(
+                f"needle_edge_cap=true but {stats_file} not found. "
+                f"Run compute_needle_edge_stats.py first."
+            )
+        with open(stats_file) as f:
+            _edge_stats = json.load(f)
+        needle_edge_cap_mm = float(_edge_stats["max_needle_edge_delta_mm"])
+        print(
+            f"Needle edge cap: {needle_edge_cap_mm:.6f} mm  "
+            f"(from {stats_file})"
         )
 
     # ---- Initial state ---------------------------------------------------
@@ -612,6 +689,7 @@ def main(cfg: DictConfig) -> None:
                 n_nodes, node_stats, input_keys,
                 needle_idx_t=needle_idx_t,
                 tissue_idx_t=tissue_idx_t,
+                fiber_dir_full=fiber_dir_full,
             )
             graph = graph.to(dist.device)
             pred_sub = model(graph.x, graph.edge_attr, graph).cpu()
@@ -627,19 +705,26 @@ def main(cfg: DictConfig) -> None:
                 pred_sub, target_stats, target_keys, target_dims, needle_mask, tissue_mask
             )
 
-            # --- Consensus filter on needle displacement ----------------------
-            # part_nodes is the full mesh here, so needle_local_ei (global) maps directly.
-            # Re-index needle displacement via the local_ei which is already in needle-local space.
+            # --- Post-processing on needle displacement -----------------------
+            # Both the consensus filter and the edge-length cap operate in
+            # needle-local index space (0..n_needle-1).  Since part_nodes is
+            # the full mesh, next_uvw_sub["u"][needle_node_indices] maps
+            # directly to needle-local displacement.
+            needle_idx_t_np = needle_node_indices  # np.ndarray, global indices
+            needle_idx_local = torch.from_numpy(needle_idx_t_np.astype("int64"))
+
             if consensus_attenuation > 0.0:
-                needle_in_part = torch.isin(
-                    torch.from_numpy(needle_node_indices), part_nodes
+                u_needle = next_uvw_sub["u"][needle_idx_local]
+                u_needle = _consensus_filter(u_needle, needle_local_ei, consensus_attenuation)
+                next_uvw_sub["u"][needle_idx_local] = u_needle
+
+            if needle_edge_cap_mm is not None:
+                coord_needle = state["coord"][needle_idx_local]
+                u_needle = next_uvw_sub["u"][needle_idx_local]
+                u_needle = _apply_needle_edge_cap(
+                    u_needle, coord_needle, needle_local_ei, needle_edge_cap_mm
                 )
-                local_map_filter = torch.full((n_nodes,), -1, dtype=torch.long)
-                local_map_filter[part_nodes] = torch.arange(len(part_nodes))
-                needle_local_in_part = local_map_filter[needle_node_indices[needle_in_part.numpy()]]
-                u_needle = next_uvw_sub["u"][needle_local_in_part]
-                u_needle_filtered = _consensus_filter(u_needle, needle_local_ei, consensus_attenuation)
-                next_uvw_sub["u"][needle_local_in_part] = u_needle_filtered
+                next_uvw_sub["u"][needle_idx_local] = u_needle
 
             # --- Integrate increments — only for nodes inside the crop ---
             for _key in target_keys:

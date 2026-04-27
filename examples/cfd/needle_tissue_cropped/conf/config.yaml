@@ -88,12 +88,19 @@ per_region_norm: false
 input_dim_edges: 7
 
 # model_type selects the GNN architecture:
-#   "mgn" — standard MeshGraphNet with MLP node encoder
-#   "kan" — MeshGraphKAN: MLP encoder replaced by a Kolmogorov-Arnold Network
-#            node encoder. use_fourier_features is ignored in KAN mode; set
-#            num_harmonics instead (controls the KAN Fourier basis width).
+#   "mgn"   — standard MeshGraphNet with MLP node encoder
+#   "kan"   — MeshGraphKAN: MLP encoder replaced by a Kolmogorov-Arnold Network
+#             node encoder. use_fourier_features is ignored in KAN mode; set
+#             num_harmonics instead (controls the KAN Fourier basis width).
+#   "fiber" — FiberEquivariantMGN: adds fiber-direction invariant edge features
+#             (cos θ, cos φ) and equivariant vector message passing.  Set
+#             n_vec_outputs to match the number of 3-D vector output fields
+#             (default 3 for u, v, a).
 model_type: "mgn"
 num_harmonics: 5
+# Number of 3-D vector outputs decoded equivariantly (fiber model only).
+# With use_cpress=true the first 9 outputs are u/v/a (3 × 3-D vectors).
+n_vec_outputs: 3
 
 # Bi-stride MeshGraphNet (bistride mode only).
 # use_bsms must be true when model_type=bistride.  Requires a fixed mesh
@@ -160,6 +167,11 @@ infer_run_id: null
 # Consensus filter: fraction of per-needle-node displacement not correlated
 # with neighbours to remove.  0.0 = disabled.  Try 0.9–0.99.
 consensus_attenuation: 0.0
+# Needle edge length cap: if true, scale needle displacements each rollout step
+# so that no needle-to-needle edge changes length by more than the maximum
+# observed during training.  Requires needle_edge_stats.json in stats_dir
+# (run compute_needle_edge_stats.py once after training to generate it).
+needle_edge_cap: false
 
 # -------------------------
 # WandB

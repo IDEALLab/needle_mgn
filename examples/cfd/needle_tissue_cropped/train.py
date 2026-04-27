@@ -37,7 +37,7 @@ except Exception:
 
 from dataset import NeedleTissueDataset
 from physicsnemo.distributed.manager import DistributedManager
-from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN
+from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN, FiberEquivariantMGN
 from physicsnemo.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
@@ -154,6 +154,11 @@ class MGNTrainer:
             self.model = MeshGraphKAN(
                 **_shared_kwargs,
                 num_harmonics=int(cfg.get("num_harmonics", 5)),
+            )
+        elif model_type == "fiber":
+            self.model = FiberEquivariantMGN(
+                **_shared_kwargs,
+                n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
             )
         else:
             self.model = MeshGraphNet(
