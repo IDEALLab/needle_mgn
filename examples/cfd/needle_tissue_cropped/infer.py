@@ -74,6 +74,7 @@ from dataset import (
 )
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.models.meshgraphnet import MeshGraphNet, MeshGraphKAN, FiberEquivariantMGN, FiberEquivariantKAN, TFNMeshGraphNet
+from physicsnemo.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
 from physicsnemo.utils import load_checkpoint
 from physicsnemo.datapipes.gnn.utils import load_json
 
@@ -249,22 +250,121 @@ def _crop_nodes(
     return torch.from_numpy(kept.astype(np.int64))
 
 
+def _build_tissue_refinement(
+    hex_cells_flat: np.ndarray,
+    hex_cell_data: dict,
+    coord0: np.ndarray,
+) -> "tuple[cKDTree, np.ndarray]":
+    """Build a centroid-based tissue search structure for coarse-mesh fallback.
+
+    The tissue mesh is typically fine near the surface but coarser at depth.
+    When the needle is deeply embedded, the nearest tissue *node* can exceed
+    ``contact_radius`` even though the needle is physically inside a tissue
+    element.  This function builds a KD-tree of tissue element centroids so
+    that a k=1 search can identify the single nearest element and connect the
+    needle node to its 8 corner nodes.
+
+    Using centroids only (not edge midpoints) ensures each needle node
+    connects to exactly one element's 8 nodes, avoiding spurious connections
+    to fine surface elements whose midpoints might fall within a large search
+    radius.
+
+    Parameters
+    ----------
+    hex_cells_flat : np.ndarray
+        PyVista ``cells`` array for the HEX-only submesh (groups of [8, n0..n7]).
+    hex_cell_data : dict
+        Cell data from the HEX submesh; must contain ``"element_type"`` with
+        0 = needle, 1 = tissue.
+    coord0 : np.ndarray, shape (N_nodes, 3)
+        Reference node coordinates (frame 0).
+
+    Returns
+    -------
+    centroid_kdtree : cKDTree
+        KD-tree over tissue element centroids (one point per tissue element).
+    tissue_cell_nodes : np.ndarray, shape (N_tissue, 8)
+        Global node indices for each tissue element (indexed by centroid order).
+    """
+    n_hex = len(hex_cell_data["element_type"])
+    # PyVista cells: each group is [8, n0, n1, ..., n7] → reshape to (N, 9)
+    cell_nodes = hex_cells_flat.reshape(n_hex, 9)[:, 1:]  # (N_hex, 8)
+    element_types = hex_cell_data["element_type"]
+    tissue_mask = element_types == 1
+    tissue_cell_nodes = cell_nodes[tissue_mask]  # (N_tissue, 8)
+
+    centroids = coord0[tissue_cell_nodes].mean(axis=1)  # (N_tissue, 3)
+    centroid_kdtree = cKDTree(centroids.astype(np.float64))
+    print(f"Tissue refinement: {len(tissue_cell_nodes)} element centroids")
+    return centroid_kdtree, tissue_cell_nodes
+
+
 def _build_world_edges(
     needle_pos: np.ndarray,
     tissue_kdtree: cKDTree,
     contact_radius: float,
     needle_node_indices: np.ndarray,
     tissue_node_indices: np.ndarray,
+    refined_tissue: "tuple | None" = None,
+    max_fallback_dist: float = 0.0,
 ) -> tuple:
-    """Build bidirectional world edges by proximity search on full needle nodes."""
+    """Build bidirectional world edges by proximity search on full needle nodes.
+
+    For needle nodes that find no tissue neighbor within ``contact_radius``
+    (orphaned nodes, typical when the needle is embedded in a coarse mesh
+    region), a k=1 search against tissue element centroids is used to find
+    the single nearest element and connect the needle node to its 8 corner
+    nodes.  This avoids the surface-edge explosion that occurs when a large
+    radius search inadvertently reaches fine surface elements.
+
+    Parameters
+    ----------
+    needle_pos : np.ndarray, shape (N_needle, 3)
+    tissue_kdtree : cKDTree
+        KD-tree of real tissue node positions.
+    contact_radius : float
+        Primary search radius (calibrated from GT contact edges).
+    needle_node_indices, tissue_node_indices : np.ndarray
+        Global indices for needle / tissue nodes.
+    refined_tissue : (cKDTree, np.ndarray) or None
+        Output of :func:`_build_tissue_refinement`; enables the coarse-mesh
+        fallback.  Pass ``None`` to use only the primary radius search.
+    max_fallback_dist : float
+        Maximum centroid distance for the fallback to fire.  Needle nodes
+        whose nearest centroid exceeds this distance are genuinely outside the
+        tissue and should remain edge-free.  Typically set to
+        ``0.87 × p95_tissue_edge_length`` (≈ half the diagonal of a typical
+        coarse element).
+    """
     pairs = tissue_kdtree.query_ball_point(needle_pos, contact_radius)
     src_list, dst_list = [], []
+    orphan_indices = []
+
     for needle_j, tissue_neighbors in enumerate(pairs):
         needle_global = int(needle_node_indices[needle_j])
-        for t_local_idx in tissue_neighbors:
-            tissue_global = int(tissue_node_indices[t_local_idx])
-            src_list.append(needle_global)
-            dst_list.append(tissue_global)
+        if tissue_neighbors:
+            for t_local_idx in tissue_neighbors:
+                src_list.append(needle_global)
+                dst_list.append(int(tissue_node_indices[t_local_idx]))
+        else:
+            orphan_indices.append(needle_j)
+
+    # Fallback: k=1 centroid search for orphaned needle nodes.
+    # Each miss gets connected to the 8 nodes of the single nearest tissue
+    # element, capped by max_fallback_dist so needle nodes that are genuinely
+    # outside the tissue (e.g. above the surface) stay edge-free.
+    if refined_tissue is not None and orphan_indices and max_fallback_dist > 0.0:
+        centroid_kdtree, tissue_cell_nodes = refined_tissue
+        orphan_pos = needle_pos[orphan_indices]
+        dists, elem_indices = centroid_kdtree.query(orphan_pos, k=1)
+        for needle_j, dist, elem_idx in zip(orphan_indices, dists, elem_indices):
+            if dist > max_fallback_dist:
+                continue
+            needle_global = int(needle_node_indices[needle_j])
+            for real_node in tissue_cell_nodes[elem_idx]:
+                src_list.append(needle_global)
+                dst_list.append(int(real_node))
+
     if not src_list:
         return (
             torch.zeros((2, 0), dtype=torch.long),
@@ -548,7 +648,16 @@ def main(cfg: DictConfig) -> None:
         hidden_dim_processor=cfg.hidden_dim_processor,
         aggregation=cfg.aggregation,
     )
-    if model_type == "kan":
+    if model_type == "bistride":
+        model = BiStrideMeshGraphNet(
+            **_shared_kwargs,
+            num_mesh_levels=int(OmegaConf.select(cfg, "num_bsms_levels", default=2)),
+            bistride_pos_dim=3,
+            num_layers_bistride=int(OmegaConf.select(cfg, "num_layers_bistride", default=2)),
+            bistride_unet_levels=int(OmegaConf.select(cfg, "bistride_unet_levels", default=1)),
+            num_processor_checkpoint_segments=int(OmegaConf.select(cfg, "num_processor_checkpoint_segments", default=0)),
+        )
+    elif model_type == "kan":
         model = MeshGraphKAN(
             **_shared_kwargs,
             num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
@@ -624,6 +733,34 @@ def main(cfg: DictConfig) -> None:
     node_props = cache.get("node_props", {})
     n_nodes = int(hex_edge_index.max().item()) + 1
 
+    # ---- BSMS multi-scale edges (BiStride model only) ----------------------
+    # Load from the cache file written by dataset.py during training, or
+    # compute on the fly if it is missing (requires sparse_dot_mkl / MKL).
+    bsms_ms_edges: list = []
+    bsms_ms_ids: list = []
+    if model_type == "bistride":
+        num_bsms_levels = int(OmegaConf.select(cfg, "num_bsms_levels", default=2))
+        beam_spacing_mm = float(OmegaConf.select(cfg, "beam_spacing_mm", default=0.0))
+        tissue_downsample_mm = float(OmegaConf.select(cfg, "tissue_downsample_mm", default=0.0))
+        _beam_tag = f"_b{beam_spacing_mm:.2g}mm" if beam_spacing_mm > 0.0 else ""
+        _tissue_tag = f"_t{tissue_downsample_mm:.2g}mm" if tissue_downsample_mm > 0.0 else ""
+        bsms_name = f"bsms_cache_l{num_bsms_levels}{_beam_tag}{_tissue_tag}.pt"
+        bsms_path = os.path.join(data_dir, bsms_name)
+        if os.path.exists(bsms_path):
+            print(f"Loading BSMS cache from {bsms_path} ...")
+            bsms_saved = torch.load(bsms_path, weights_only=False)
+            bsms_ms_edges = [e.to(dist.device) for e in bsms_saved["ms_edges"]]
+            bsms_ms_ids = [ids.to(dist.device) for ids in bsms_saved["ms_ids"]]
+        else:
+            print(f"BSMS cache not found at {bsms_path}, computing from frame {infer_start} ...")
+            from dataset import _precompute_bsms_full
+            coord_ref = frame_tensors["coord"][infer_start]
+            ms_edges_cpu, ms_ids_cpu = _precompute_bsms_full(
+                hex_edge_index, coord_ref, n_nodes, num_bsms_levels
+            )
+            bsms_ms_edges = [e.to(dist.device) for e in ms_edges_cpu]
+            bsms_ms_ids = [ids.to(dist.device) for ids in ms_ids_cpu]
+
     # Pre-compute unit fiber direction for every node (used by FiberEquivariantMGN).
     if "mat_fiber" in node_props:
         _fiber_raw = node_props["mat_fiber"].float()   # (N, 3)
@@ -674,6 +811,46 @@ def main(cfg: DictConfig) -> None:
         f"(from {n_frames_with_edges}/{len(cache['world_edges'])} GT frames with edges)"
     )
 
+    # ---- Refined tissue search structure (handles coarse mesh at depth) ------
+    # The tissue mesh is typically fine near the insertion surface but coarser
+    # at depth.  When the needle is deeply embedded the nearest tissue *node*
+    # may exceed contact_radius even though the needle is physically inside a
+    # tissue element.  We build a refined KD-tree of tissue element centroids
+    # and edge midpoints so that every element interior is covered.
+    #
+    # max_fallback_dist caps the k=1 centroid search so needle nodes that are
+    # genuinely outside the tissue (e.g. above the surface) stay edge-free.
+    # We use 0.87 × p95_tissue_edge_length as the threshold; this is roughly
+    # half the space diagonal of a typical coarse element (sqrt(3)/2 ≈ 0.87),
+    # so any needle node inside an element will be within this distance of its
+    # centroid.
+    coord0_np = frame_tensors["coord"][infer_start].numpy()
+    tissue_ei_mask = hex_edge_type_onehot[:, 1] > 0.5      # tissue-tissue edges
+    t_src_all = hex_edge_index[0][tissue_ei_mask].numpy()
+    t_dst_all = hex_edge_index[1][tissue_ei_mask].numpy()
+    tissue_edge_lens = np.linalg.norm(
+        coord0_np[t_src_all] - coord0_np[t_dst_all], axis=1
+    )
+    _p95_tissue_edge = float(np.percentile(tissue_edge_lens, 95)) if len(tissue_edge_lens) else contact_radius * 3.0
+    max_fallback_dist = 0.87 * _p95_tissue_edge
+
+    # Build the refined structure from the reference mesh HEX topology.
+    # We read the start VTU here; the same object is reused for output mesh
+    # topology below (avoiding a second disk read).
+    ref_mesh_start = pv.read(vtu_files[infer_start])
+    _hex_cell_idx_ref = np.where(ref_mesh_start.celltypes == 12)[0]
+    _hex_submesh_ref = ref_mesh_start.extract_cells(_hex_cell_idx_ref)
+    refined_tissue = _build_tissue_refinement(
+        _hex_submesh_ref.cells.copy(),
+        {k: _hex_submesh_ref.cell_data[k].copy() for k in _hex_submesh_ref.cell_data.keys()},
+        coord0_np,
+    )
+    print(
+        f"  Coarse-mesh fallback: p95_tissue_edge = {_p95_tissue_edge:.4f} mm, "
+        f"max_fallback_dist = {max_fallback_dist:.4f} mm "
+        f"({len(refined_tissue[1])} element centroids)"
+    )
+
     # ---- Consensus filter + needle edge cap precomputation ------------------
     consensus_attenuation = float(OmegaConf.select(cfg, "consensus_attenuation", default=0.0))
     needle_local_ei = _build_needle_local_edge_index(
@@ -706,7 +883,7 @@ def main(cfg: DictConfig) -> None:
 
     # ---- Output mesh topology -----------------------------------------------
     # HEX cells are fixed; LINE cells (world/contact edges) update each step.
-    ref_mesh_start = pv.read(vtu_files[infer_start])
+    # ref_mesh_start was already loaded above for the tissue refinement structure.
     pred_points = ref_mesh_start.points.copy()  # (n_nodes, 3), updated each step
 
     hex_cell_idx = np.where(ref_mesh_start.celltypes == 12)[0]
@@ -741,6 +918,8 @@ def main(cfg: DictConfig) -> None:
                 contact_radius,
                 needle_node_indices,
                 tissue_node_indices,
+                refined_tissue=refined_tissue,
+                max_fallback_dist=max_fallback_dist,
             )
 
             # --- Build and run model on cropped subgraph ---
@@ -755,7 +934,10 @@ def main(cfg: DictConfig) -> None:
                 use_cpress=use_cpress,
             )
             graph = graph.to(dist.device)
-            pred_sub = model(graph.x, graph.edge_attr, graph).cpu()
+            if model_type == "bistride":
+                pred_sub = model(graph.x, graph.edge_attr, graph, bsms_ms_edges, bsms_ms_ids).cpu()
+            else:
+                pred_sub = model(graph.x, graph.edge_attr, graph).cpu()
 
             # Per-region denorm: compute needle/tissue masks in crop-local index space
             if per_region_norm:

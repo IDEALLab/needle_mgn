@@ -23,11 +23,11 @@ DATA_DIR=$(realpath "$DATA_DIR")
 
 # Confirm the directory actually contains VTU files (catches the common mistake
 # of passing the experiments/ directory instead of the data directory).
-if ! ls "${DATA_DIR}"/*.vtu >/dev/null 2>&1; then
-    echo "ERROR: No .vtu files found in ${DATA_DIR}"
-    echo "Pass the RUN-2 simulation data directory, not the experiments directory."
-    exit 1
-fi
+# if ! ls "${DATA_DIR}"/*.vtu >/dev/null 2>&1; then
+#     echo "ERROR: No .vtu files found in ${DATA_DIR}"
+#     echo "Pass the RUN-2 simulation data directory, not the experiments directory."
+#     exit 1
+# fi
 
 PROJECT=$(realpath "$(dirname "$0")")
 EXPERIMENTS=${PROJECT}/experiments
@@ -126,8 +126,6 @@ run_experiment cropped cropped_kan \
      hidden_dim_node_encoder=256 hidden_dim_edge_encoder=256 \
      hidden_dim_node_decoder=256 hidden_dim_processor=256 processor_size=15"
 
-# NOTE: cropped_bistride requires infer.py to support model_type=bistride
-# (BiStrideMeshGraphNet) before inference will succeed.
 run_experiment cropped cropped_bistride \
     "use_cpress=false per_region_norm=false \
      needle_crop_mm=10000 tissue_crop_mm=10000 'crop_strategy_weights=[1,0,0]' \
