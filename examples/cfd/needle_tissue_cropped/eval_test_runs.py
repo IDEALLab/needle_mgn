@@ -238,10 +238,23 @@ def main():
     )
     print(f"Test run IDs ({len(test_run_ids)}): {test_run_ids}")
 
+    # --- Validate data_dir contains VTU files --------------------------------
+    vtu_files_all = _sorted_vtu_files(args.data_dir)
+    if not vtu_files_all:
+        print(
+            f"\nERROR: No .vtu files found in data_dir='{args.data_dir}'.\n"
+            "Pass --data_dir pointing to the RUN-2 simulation data directory\n"
+            "(the one containing *-RUN-N_T.vtu files), not the experiments directory."
+        )
+        return
+
+    if not test_run_ids:
+        print("\nNo test runs found — nothing to evaluate.")
+        return
+
     # --- Shared needle geometry (same mesh topology across all runs) ----------
     needle_idx = _get_needle_indices(args.data_dir)
     print(f"Found {len(needle_idx)} needle nodes.")
-    vtu_files_all = _sorted_vtu_files(args.data_dir)
     ref_mesh = pv.read(vtu_files_all[0])
     ref_pos_needle = ref_mesh.points[needle_idx]
     principal = _principal_axis(ref_pos_needle)

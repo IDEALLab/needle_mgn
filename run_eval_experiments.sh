@@ -21,6 +21,14 @@ if [ -z "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
 fi
 DATA_DIR=$(realpath "$DATA_DIR")
 
+# Confirm the directory actually contains VTU files (catches the common mistake
+# of passing the experiments/ directory instead of the data directory).
+if ! ls "${DATA_DIR}"/*.vtu >/dev/null 2>&1; then
+    echo "ERROR: No .vtu files found in ${DATA_DIR}"
+    echo "Pass the RUN-2 simulation data directory, not the experiments directory."
+    exit 1
+fi
+
 PROJECT=$(realpath "$(dirname "$0")")
 EXPERIMENTS=${PROJECT}/experiments
 
