@@ -17,6 +17,7 @@
 """Training script for needle-tissue MeshGraphNet with dynamic spatial cropping."""
 
 import os
+import re
 import time
 
 import hydra
@@ -26,6 +27,20 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
+
+
+def _abspath(p: str) -> str:
+    """Resolve a Hydra config path to an absolute OS path.
+
+    On Windows, Git Bash passes paths as POSIX-style absolute paths
+    (``/c/Users/...``).  Python's ``os.path.isabs`` returns ``False`` for
+    these, so ``to_absolute_path`` treats them as relative and incorrectly
+    prepends the Hydra working directory.  This helper converts the leading
+    ``/X/`` drive prefix to ``X:/`` before resolution.
+    """
+    if os.name == "nt":
+        p = re.sub(r"^/([A-Za-z])/", lambda m: m.group(1).upper() + ":/", p)
+    return to_absolute_path(p)
 from torch_geometric.data import Batch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -67,8 +82,8 @@ class MGNTrainer:
         self.noise_std = float(cfg.get("noise_std", 0.0))
         self.use_bsms = bool(cfg.get("use_bsms", False))
 
-        stats_dir = to_absolute_path(cfg.stats_dir)
-        data_dir = to_absolute_path(cfg.data_dir)
+        stats_dir = _abspath(cfg.stats_dir)
+        data_dir = _abspath(cfg.data_dir)
 
         crop_strategy_weights = tuple(cfg.crop_strategy_weights)
         use_cpress = bool(cfg.get("use_cpress", True))
@@ -223,7 +238,7 @@ class MGNTrainer:
         if dist.world_size > 1:
             torch.distributed.barrier()
         self.epoch_init = load_checkpoint(
-            to_absolute_path(cfg.ckpt_path),
+            _abspath(cfg.ckpt_path),
             models=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
@@ -359,7 +374,7 @@ def main(cfg: DictConfig) -> None:
         if dist.world_size > 1:
             torch.distributed.barrier()
         if dist.rank == 0 and (epoch + 1) % cfg.save_every == 0:
-            ckpt_path = to_absolute_path(cfg.ckpt_path)
+            ckpt_path = _abspath(cfg.ckpt_path)
             save_checkpoint(
                 ckpt_path,
                 models=trainer.model,

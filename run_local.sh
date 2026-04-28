@@ -286,15 +286,15 @@ cropped_tfn)
         wandb_project=PhysicsNeMo-Cropped-Ablation
         noise_std=0
         use_cpress=false
-        timestep_stride=10
+        timestep_stride=15
         model_type=tfn
         n_vec_outputs=3
-        irreps_hidden="16x0e + 8x1o + 4x2e"
-        l_max=2
+        irreps_hidden="8x0e + 4x1o + 2x2e"
+        l_max=1
         n_radial_basis=8
         r_max=60.0
-        processor_size=15
-        tfn_checkpoint_layers=true
+        processor_size=5
+        tfn_checkpoint_layers=false
         ++per_region_norm=false
     )
     ;;

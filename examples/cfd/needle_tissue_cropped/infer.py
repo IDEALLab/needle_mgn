@@ -47,6 +47,20 @@ import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from scipy.spatial import cKDTree
+
+
+def _abspath(p: str) -> str:
+    """Resolve a Hydra config path to an absolute OS path.
+
+    On Windows, Git Bash passes paths as POSIX-style absolute paths
+    (``/c/Users/...``).  Python's ``os.path.isabs`` returns ``False`` for
+    these, so ``to_absolute_path`` treats them as relative and incorrectly
+    prepends the Hydra working directory.  This helper converts the leading
+    ``/X/`` drive prefix to ``X:/`` before resolution.
+    """
+    if os.name == "nt":
+        p = re.sub(r"^/([A-Za-z])/", lambda m: m.group(1).upper() + ":/", p)
+    return to_absolute_path(p)
 from torch_geometric.data import Data
 from torch_geometric.utils import subgraph
 
@@ -445,8 +459,8 @@ def main(cfg: DictConfig) -> None:
     DistributedManager.initialize()
     dist = DistributedManager()
 
-    data_dir = to_absolute_path(cfg.data_dir)
-    stats_dir = to_absolute_path(cfg.stats_dir)
+    data_dir = _abspath(cfg.data_dir)
+    stats_dir = _abspath(cfg.stats_dir)
 
     # ---- Select VTU files for inference -------------------------------------
     # Multi-run: pick the run specified by infer_run_id (or first test run).
@@ -490,7 +504,7 @@ def main(cfg: DictConfig) -> None:
     infer_start = default_start if (_raw_start is None) else int(_raw_start)
     n_rollout = int(OmegaConf.select(cfg, "n_rollout", default=20))
     n_steps_with_gt = n_frames - 1 - infer_start
-    out_dir = to_absolute_path(
+    out_dir = _abspath(
         OmegaConf.select(cfg, "infer_output_dir", default="./inference_output")
     )
     os.makedirs(out_dir, exist_ok=True)
@@ -572,7 +586,7 @@ def main(cfg: DictConfig) -> None:
             fourier_scale=cfg.get("fourier_scale", 1.0),
         )
     model = model.to(dist.device)
-    load_checkpoint(to_absolute_path(cfg.ckpt_path), models=model, device=dist.device)
+    load_checkpoint(_abspath(cfg.ckpt_path), models=model, device=dist.device)
     model.eval()
 
     # ---- Stats and cache -------------------------------------------------
