@@ -8,9 +8,9 @@
 #   experiments/<name>/inference_output/RUN-<id>/  — predicted VTUs per test run
 #   experiments/<name>/eval/                       — summary CSVs and plots
 #
-# NOTE: cropped_bistride and cropped_downsampled require infer.py to be updated
-# to support BiStrideMeshGraphNet and beam/tissue mesh reduction respectively.
-# They are listed here but will fail at inference until infer.py is extended.
+# NOTE: cropped_bistride and cropped_downsampled may require infer.py to be
+# updated to support BiStrideMeshGraphNet and beam/tissue mesh reduction
+# respectively if those paths have not yet been wired up.
 
 set -euo pipefail
 
@@ -137,6 +137,24 @@ run_experiment cropped cropped_downsampled \
      beam_spacing_mm=2.0 tissue_downsample_mm=3.0 \
      hidden_dim_node_encoder=256 hidden_dim_edge_encoder=256 \
      hidden_dim_node_decoder=256 hidden_dim_processor=256 processor_size=15"
+
+run_experiment cropped cropped_fiber \
+    "use_cpress=false per_region_norm=false \
+     model_type=fiber n_vec_outputs=3 \
+     hidden_dim_node_encoder=256 hidden_dim_edge_encoder=256 \
+     hidden_dim_node_decoder=256 hidden_dim_processor=256 processor_size=15"
+
+run_experiment cropped cropped_fiber_kan \
+    "use_cpress=false per_region_norm=false \
+     model_type=fiber_kan n_vec_outputs=3 num_harmonics=5 \
+     hidden_dim_node_encoder=256 hidden_dim_edge_encoder=256 \
+     hidden_dim_node_decoder=256 hidden_dim_processor=256 processor_size=15"
+
+run_experiment cropped cropped_tfn \
+    "use_cpress=false per_region_norm=false \
+     model_type=tfn n_vec_outputs=3 \
+     'irreps_hidden=8x0e + 4x1o + 2x2e' l_max=1 \
+     n_radial_basis=8 r_max=60.0 processor_size=15"
 
 # ---------------------------------------------------------------------------
 # DoMINO experiments
