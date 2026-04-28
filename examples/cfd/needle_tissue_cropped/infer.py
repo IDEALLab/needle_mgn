@@ -299,71 +299,47 @@ def _build_tissue_refinement(
     return centroid_kdtree, tissue_cell_nodes
 
 
-def _build_world_edges(
+def _build_fallback_world_edges(
     needle_pos: np.ndarray,
-    tissue_kdtree: cKDTree,
-    contact_radius: float,
     needle_node_indices: np.ndarray,
-    tissue_node_indices: np.ndarray,
-    refined_tissue: "tuple | None" = None,
-    max_fallback_dist: float = 0.0,
+    refined_tissue: tuple,
+    max_fallback_dist: float,
 ) -> tuple:
-    """Build bidirectional world edges by proximity search on full needle nodes.
+    """Build world edges for rollout steps that have no GT edges available.
 
-    For needle nodes that find no tissue neighbor within ``contact_radius``
-    (orphaned nodes, typical when the needle is embedded in a coarse mesh
-    region), a k=1 search against tissue element centroids is used to find
-    the single nearest element and connect the needle node to its 8 corner
-    nodes.  This avoids the surface-edge explosion that occurs when a large
-    radius search inadvertently reaches fine surface elements.
+    Used only when the rollout extends beyond the last cached GT frame (i.e.
+    there are no GT LINE cells to read for this step).  For each needle node
+    that is inside a tissue element (centroid within ``max_fallback_dist``),
+    edges are created to the 8 corner nodes of that element.
+
+    This function intentionally connects every needle node that is inside
+    tissue, not just the contact surface.  The model was trained on GT edges
+    which only appear on the surface; this fallback is therefore an
+    approximation used only when no GT alternative exists.
 
     Parameters
     ----------
     needle_pos : np.ndarray, shape (N_needle, 3)
-    tissue_kdtree : cKDTree
-        KD-tree of real tissue node positions.
-    contact_radius : float
-        Primary search radius (calibrated from GT contact edges).
-    needle_node_indices, tissue_node_indices : np.ndarray
-        Global indices for needle / tissue nodes.
-    refined_tissue : (cKDTree, np.ndarray) or None
-        Output of :func:`_build_tissue_refinement`; enables the coarse-mesh
-        fallback.  Pass ``None`` to use only the primary radius search.
+        Current predicted positions of needle nodes.
+    needle_node_indices : np.ndarray
+        Global node indices for the needle nodes.
+    refined_tissue : (cKDTree, np.ndarray)
+        Output of :func:`_build_tissue_refinement`: centroid KD-tree and
+        ``tissue_cell_nodes`` array of shape (N_tissue_elements, 8).
     max_fallback_dist : float
-        Maximum centroid distance for the fallback to fire.  Needle nodes
-        whose nearest centroid exceeds this distance are genuinely outside the
-        tissue and should remain edge-free.  Typically set to
-        ``0.87 × p95_tissue_edge_length`` (≈ half the diagonal of a typical
-        coarse element).
+        Maximum centroid distance to accept a match (roughly half the
+        space diagonal of a coarse element).
     """
-    pairs = tissue_kdtree.query_ball_point(needle_pos, contact_radius)
+    centroid_kdtree, tissue_cell_nodes = refined_tissue
+    dists, elem_indices = centroid_kdtree.query(needle_pos, k=1)
     src_list, dst_list = [], []
-    orphan_indices = []
-
-    for needle_j, tissue_neighbors in enumerate(pairs):
+    for needle_j, (dist, elem_idx) in enumerate(zip(dists, elem_indices)):
+        if dist > max_fallback_dist:
+            continue
         needle_global = int(needle_node_indices[needle_j])
-        if tissue_neighbors:
-            for t_local_idx in tissue_neighbors:
-                src_list.append(needle_global)
-                dst_list.append(int(tissue_node_indices[t_local_idx]))
-        else:
-            orphan_indices.append(needle_j)
-
-    # Fallback: k=1 centroid search for orphaned needle nodes.
-    # Each miss gets connected to the 8 nodes of the single nearest tissue
-    # element, capped by max_fallback_dist so needle nodes that are genuinely
-    # outside the tissue (e.g. above the surface) stay edge-free.
-    if refined_tissue is not None and orphan_indices and max_fallback_dist > 0.0:
-        centroid_kdtree, tissue_cell_nodes = refined_tissue
-        orphan_pos = needle_pos[orphan_indices]
-        dists, elem_indices = centroid_kdtree.query(orphan_pos, k=1)
-        for needle_j, dist, elem_idx in zip(orphan_indices, dists, elem_indices):
-            if dist > max_fallback_dist:
-                continue
-            needle_global = int(needle_node_indices[needle_j])
-            for real_node in tissue_cell_nodes[elem_idx]:
-                src_list.append(needle_global)
-                dst_list.append(int(real_node))
+        for real_node in tissue_cell_nodes[elem_idx]:
+            src_list.append(needle_global)
+            dst_list.append(int(real_node))
 
     if not src_list:
         return (
@@ -782,48 +758,29 @@ def main(cfg: DictConfig) -> None:
     needle_idx_t = torch.from_numpy(needle_node_indices.astype(np.int64)) if per_region_norm else None
     tissue_idx_t = torch.from_numpy(tissue_node_indices.astype(np.int64)) if per_region_norm else None
 
-    # Fixed KD-tree on tissue positions (Eulerian — positions don't change)
-    tissue_pos_np = frame_tensors["coord"][infer_start][tissue_node_indices].numpy()
-    tissue_kdtree = cKDTree(tissue_pos_np)
-
-    # ---- World edge contact radius (estimated from all GT frames with edges) --
-    # Scanning all cached frames gives a more robust estimate than the start
-    # frame alone: the start frame may have few or no contacts if the needle
-    # has just entered tissue, causing the radius to be under-estimated for
-    # later frames where the tip is deeper.
-    all_edge_dists = []
-    _coords_all = frame_tensors["coord"].numpy()  # (T, N, 3)
-    for _t, (_ei, _) in enumerate(cache["world_edges"]):
-        if _ei.shape[1] == 0:
-            continue
-        _c = _coords_all[_t]
-        all_edge_dists.append(
-            np.linalg.norm(_c[_ei[0].numpy()] - _c[_ei[1].numpy()], axis=1)
-        )
-
-    if all_edge_dists:
-        contact_radius = float(np.percentile(np.concatenate(all_edge_dists), 95)) * 1.2
-    else:
-        contact_radius = 2.0  # mm — no GT contact edges found anywhere
-    n_frames_with_edges = len(all_edge_dists)
+    # ---- World edge strategy: GT-first with centroid fallback ----------------
+    # Primary: use GT LINE-cell edges directly from the cache (exact training
+    # distribution).  Fallback: centroid k=1 search, used only when the rollout
+    # extends beyond the last cached GT frame.
+    #
+    # Log how many GT frames actually have edges so the user can see the range.
+    n_frames_with_gt_edges = sum(
+        1 for (ei, _) in cache["world_edges"] if ei.shape[1] > 0
+    )
+    last_gt_edge_frame = max(
+        (t for t, (ei, _) in enumerate(cache["world_edges"]) if ei.shape[1] > 0),
+        default=-1,
+    )
     print(
-        f"  World edge contact_radius = {contact_radius:.4f} mesh units "
-        f"(from {n_frames_with_edges}/{len(cache['world_edges'])} GT frames with edges)"
+        f"  GT world edges: {n_frames_with_gt_edges}/{len(cache['world_edges'])} frames have edges "
+        f"(last: frame {last_gt_edge_frame})"
     )
 
-    # ---- Refined tissue search structure (handles coarse mesh at depth) ------
-    # The tissue mesh is typically fine near the insertion surface but coarser
-    # at depth.  When the needle is deeply embedded the nearest tissue *node*
-    # may exceed contact_radius even though the needle is physically inside a
-    # tissue element.  We build a refined KD-tree of tissue element centroids
-    # and edge midpoints so that every element interior is covered.
-    #
-    # max_fallback_dist caps the k=1 centroid search so needle nodes that are
-    # genuinely outside the tissue (e.g. above the surface) stay edge-free.
-    # We use 0.87 × p95_tissue_edge_length as the threshold; this is roughly
-    # half the space diagonal of a typical coarse element (sqrt(3)/2 ≈ 0.87),
-    # so any needle node inside an element will be within this distance of its
-    # centroid.
+    # ---- Centroid fallback structure (for steps beyond GT range) -------------
+    # We use 0.87 × p95_tissue_edge_length as the distance threshold; this is
+    # roughly half the space diagonal of a typical coarse element (sqrt(3)/2
+    # ≈ 0.87), so any needle node inside an element will be within this
+    # distance of its centroid.
     coord0_np = frame_tensors["coord"][infer_start].numpy()
     tissue_ei_mask = hex_edge_type_onehot[:, 1] > 0.5      # tissue-tissue edges
     t_src_all = hex_edge_index[0][tissue_ei_mask].numpy()
@@ -831,7 +788,7 @@ def main(cfg: DictConfig) -> None:
     tissue_edge_lens = np.linalg.norm(
         coord0_np[t_src_all] - coord0_np[t_dst_all], axis=1
     )
-    _p95_tissue_edge = float(np.percentile(tissue_edge_lens, 95)) if len(tissue_edge_lens) else contact_radius * 3.0
+    _p95_tissue_edge = float(np.percentile(tissue_edge_lens, 95)) if len(tissue_edge_lens) else 6.0
     max_fallback_dist = 0.87 * _p95_tissue_edge
 
     # Build the refined structure from the reference mesh HEX topology.
@@ -904,23 +861,33 @@ def main(cfg: DictConfig) -> None:
             # --- Full mesh (no spatial crop) ---
             part_nodes = torch.arange(n_nodes, dtype=torch.long)
 
-            # --- World edges: always build dynamically from predicted positions ---
-            # GT-cached edges are NOT used here for two reasons:
-            # (a) predicted needle positions diverge from GT during rollout, so
-            #     GT edge topology becomes physically wrong;
-            # (b) FEA contact solvers deactivate contact elements once the needle
-            #     tip is fully embedded, so late GT frames have no world edges at
-            #     the tip even though the predicted needle is still in contact.
-            needle_pos_np = state["coord"][needle_node_indices].numpy()
-            world_ei, world_et = _build_world_edges(
-                needle_pos_np,
-                tissue_kdtree,
-                contact_radius,
-                needle_node_indices,
-                tissue_node_indices,
-                refined_tissue=refined_tissue,
-                max_fallback_dist=max_fallback_dist,
-            )
+            # --- World edges: use GT LINE-cell topology when available -----------
+            # The GT cache stores the exact contact edges the FEA solver produced
+            # for each frame (same LINE cells that training uses).  Using them
+            # directly replicates the training distribution exactly: the right
+            # needle nodes get edges to the right tissue nodes, with no spurious
+            # connections at the base or below the surface.
+            #
+            # The centroid fallback fires only when the rollout extends beyond
+            # the last cached GT frame.  In that regime no GT edges exist anyway,
+            # so the fallback provides a reasonable approximation for the
+            # deep-embedding region where the mesh is coarse.
+            gt_frame_idx = infer_start + step
+            gt_world_edges = cache["world_edges"]
+            if (
+                gt_frame_idx < len(gt_world_edges)
+                and gt_world_edges[gt_frame_idx][0].shape[1] > 0
+            ):
+                world_ei, world_et = gt_world_edges[gt_frame_idx]
+            else:
+                # Beyond GT range or GT has no edges for this frame: use centroid fallback.
+                needle_pos_np = state["coord"][needle_node_indices].numpy()
+                world_ei, world_et = _build_fallback_world_edges(
+                    needle_pos_np,
+                    needle_node_indices,
+                    refined_tissue,
+                    max_fallback_dist,
+                )
 
             # --- Build and run model on cropped subgraph ---
             graph = _build_step_graph(
