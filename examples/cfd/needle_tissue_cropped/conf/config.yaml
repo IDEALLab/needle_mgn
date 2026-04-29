@@ -107,15 +107,14 @@ n_vec_outputs: 3
 # l_max: max spherical harmonic order (1=cheap, 2=default, 3=more angular)
 # n_radial_basis: number of Gaussian radial basis functions
 # r_max: radial basis cutoff in mm (should cover max edge length)
-irreps_hidden: "16x0e + 8x1o + 4x2e"
-l_max: 2
+irreps_hidden: "8x0e + 4x1o + 2x2e"
+l_max: 1
 n_radial_basis: 8
 r_max: 60.0
-# Gradient checkpointing for TFN processor layers.  Strongly recommended for
-# large meshes: recomputes each layer's per-edge weight tensor on the backward
-# pass instead of storing it, reducing peak memory from O(layers × E × W) to
-# O(E × W) where W = weight_numel per edge.  Has no effect at inference.
-tfn_checkpoint_layers: true
+# Gradient checkpointing for TFN processor layers.  Enable if memory is tight
+# (large E with higher-multiplicity irreps_hidden); not needed for the default
+# small config.  Has no effect at inference.
+tfn_checkpoint_layers: false
 
 # Bi-stride MeshGraphNet (bistride mode only).
 # use_bsms must be true when model_type=bistride.  Requires a fixed mesh
@@ -179,9 +178,38 @@ n_rollout: 20
 infer_output_dir: "./inference_output"
 # For multi-run datasets: which run to infer on.  null = first test run.
 infer_run_id: null
+# World edge radius (mm): needle nodes within this distance of a tissue node
+# get a world/contact edge.  Must match the EDGE_RADIUS used in
+# odb_to_mgn_input.py (default 1.2) to reproduce the training distribution.
+world_edge_radius: 1.2
 # Consensus filter: fraction of per-needle-node displacement not correlated
 # with neighbours to remove.  0.0 = disabled.  Try 0.9–0.99.
 consensus_attenuation: 0.0
+# Tissue consensus filter: same idea as consensus_attenuation but applied to
+# tissue-tissue edges.  Damps random per-node spatial noise on tissue nodes
+# that accumulates during long rollouts.  0.0 = disabled.  Try 0.1–0.5.
+tissue_consensus_attenuation: 0.0
+# Procrustes rigid-body blend on needle displacement.  Each rollout step,
+# Kabsch-fits a rigid (R, t) to the predicted needle motion and blends:
+#   final_disp = alpha * rigid_disp + (1 - alpha) * predicted_disp
+# alpha=0 disables; alpha=1 forces fully rigid needle motion (no bending).
+# Intermediate values dampen non-rigid network noise while preserving real
+# bending.  Reasonable starting values: 0.3–0.7.
+# NOTE: this also kills bending modes — see axial_polyfit_alpha for a more
+# permissive alternative that preserves smooth-along-axis bending.
+procrustes_alpha: 0.0
+
+# Axial-polynomial-fit blend on needle displacement.  Per spatial component,
+# fit predicted Δu as a polynomial of degree axial_polyfit_degree along the
+# needle's principal axis, then blend:
+#   final_disp = alpha * polyfit + (1 - alpha) * predicted_disp
+# Preserves smooth-along-axis modes (translation, tilt, parabolic / cubic
+# bending) and rejects per-node high-frequency noise.  alpha=0 disables;
+# alpha=1 replaces the prediction with its polynomial fit.
+# degree=1 ≈ Procrustes (rigid-only); degree=3 captures clamped-cantilever
+# bending; degree=5 admits S-curves.
+axial_polyfit_alpha: 0.0
+axial_polyfit_degree: 3
 # Needle edge length cap: if true, scale needle displacements each rollout step
 # so that no needle-to-needle edge changes length by more than the maximum
 # observed during training.  Requires needle_edge_stats.json in stats_dir
