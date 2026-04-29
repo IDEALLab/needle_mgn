@@ -48,6 +48,10 @@ run_experiment() {
     local model="$1"
     local exp="$2"
     local extra="$3"
+    # n_rollout_override: how many steps to roll out.  Caller passes the 4th
+    # argument to override the default.  With timestep_stride=10 (default),
+    # 16 steps covers VTU timesteps 0–160; stride=1 experiments use 160.
+    local n_rollout="${4:-16}"
 
     local script_dir="${PROJECT}/examples/cfd/needle_tissue_${model}"
     local exp_dir="${EXPERIMENTS}/${exp}"
@@ -73,12 +77,12 @@ run_experiment() {
     mkdir -p "${infer_out}" "${eval_out}"
 
     # --- Inference: run infer.py on every test run ---------------------------
-    echo "  [inference] ${exp}"
+    echo "  [inference] ${exp}  (n_rollout=${n_rollout})"
     uv run python "${script_dir}/run_test_inference.py" \
         --data_dir "${DATA_DIR}" \
         --infer_output_base "${infer_out}" \
         --skip_existing \
-        --extra "data_dir=${DATA_DIR} ckpt_path=${exp_dir}/checkpoints stats_dir=${exp_dir}/stats ${extra}"
+        --extra "data_dir=${DATA_DIR} ckpt_path=${exp_dir}/checkpoints stats_dir=${exp_dir}/stats n_rollout=${n_rollout} ${extra}"
 
     # --- Eval: compare predictions against GT --------------------------------
     echo "  [eval] ${exp}"
@@ -107,7 +111,8 @@ run_experiment cropped cropped_cpress \
     "use_cpress=true use_fourier_features=false"
 
 run_experiment cropped cropped_stride1 \
-    "use_cpress=false use_fourier_features=false per_region_norm=false timestep_stride=1 n_rollout=200"
+    "use_cpress=false use_fourier_features=false per_region_norm=false timestep_stride=1" \
+    160
 
 run_experiment cropped cropped_splitnorm \
     "use_cpress=true use_fourier_features=false per_region_norm=true"

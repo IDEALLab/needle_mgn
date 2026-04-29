@@ -250,96 +250,44 @@ def _crop_nodes(
     return torch.from_numpy(kept.astype(np.int64))
 
 
-def _build_tissue_refinement(
-    hex_cells_flat: np.ndarray,
-    hex_cell_data: dict,
-    coord0: np.ndarray,
-) -> "tuple[cKDTree, np.ndarray]":
-    """Build a centroid-based tissue search structure for coarse-mesh fallback.
-
-    The tissue mesh is typically fine near the surface but coarser at depth.
-    When the needle is deeply embedded, the nearest tissue *node* can exceed
-    ``contact_radius`` even though the needle is physically inside a tissue
-    element.  This function builds a KD-tree of tissue element centroids so
-    that a k=1 search can identify the single nearest element and connect the
-    needle node to its 8 corner nodes.
-
-    Using centroids only (not edge midpoints) ensures each needle node
-    connects to exactly one element's 8 nodes, avoiding spurious connections
-    to fine surface elements whose midpoints might fall within a large search
-    radius.
-
-    Parameters
-    ----------
-    hex_cells_flat : np.ndarray
-        PyVista ``cells`` array for the HEX-only submesh (groups of [8, n0..n7]).
-    hex_cell_data : dict
-        Cell data from the HEX submesh; must contain ``"element_type"`` with
-        0 = needle, 1 = tissue.
-    coord0 : np.ndarray, shape (N_nodes, 3)
-        Reference node coordinates (frame 0).
-
-    Returns
-    -------
-    centroid_kdtree : cKDTree
-        KD-tree over tissue element centroids (one point per tissue element).
-    tissue_cell_nodes : np.ndarray, shape (N_tissue, 8)
-        Global node indices for each tissue element (indexed by centroid order).
-    """
-    n_hex = len(hex_cell_data["element_type"])
-    # PyVista cells: each group is [8, n0, n1, ..., n7] → reshape to (N, 9)
-    cell_nodes = hex_cells_flat.reshape(n_hex, 9)[:, 1:]  # (N_hex, 8)
-    element_types = hex_cell_data["element_type"]
-    tissue_mask = element_types == 1
-    tissue_cell_nodes = cell_nodes[tissue_mask]  # (N_tissue, 8)
-
-    centroids = coord0[tissue_cell_nodes].mean(axis=1)  # (N_tissue, 3)
-    centroid_kdtree = cKDTree(centroids.astype(np.float64))
-    print(f"Tissue refinement: {len(tissue_cell_nodes)} element centroids")
-    return centroid_kdtree, tissue_cell_nodes
-
-
-def _build_fallback_world_edges(
+def _build_world_edges(
     needle_pos: np.ndarray,
+    tissue_kdtree: cKDTree,
+    radius: float,
     needle_node_indices: np.ndarray,
-    refined_tissue: tuple,
-    max_fallback_dist: float,
+    tissue_node_indices: np.ndarray,
 ) -> tuple:
-    """Build world edges for rollout steps that have no GT edges available.
+    """Build bidirectional world edges matching the odb_to_mgn_input.py algorithm.
 
-    Used only when the rollout extends beyond the last cached GT frame (i.e.
-    there are no GT LINE cells to read for this step).  For each needle node
-    that is inside a tissue element (centroid within ``max_fallback_dist``),
-    edges are created to the 8 corner nodes of that element.
+    Replicates the dataset creation step exactly: for each needle node, find
+    all tissue (Eulerian) nodes within ``radius`` using the fixed tissue
+    KD-tree, and add a bidirectional edge.
 
-    This function intentionally connects every needle node that is inside
-    tissue, not just the contact surface.  The model was trained on GT edges
-    which only appear on the surface; this fallback is therefore an
-    approximation used only when no GT alternative exists.
+    The tissue KD-tree is built once from the reference (undeformed) Eulerian
+    positions because the Eulerian mesh does not move.  Needle positions are
+    the current predicted/deformed positions, updated every rollout step.
 
     Parameters
     ----------
     needle_pos : np.ndarray, shape (N_needle, 3)
         Current predicted positions of needle nodes.
+    tissue_kdtree : cKDTree
+        KD-tree of reference Eulerian tissue node positions (built once).
+    radius : float
+        Search radius in mesh units (mm).  Must match ``EDGE_RADIUS`` in
+        ``odb_to_mgn_input.py`` (default 1.2 mm).
     needle_node_indices : np.ndarray
-        Global node indices for the needle nodes.
-    refined_tissue : (cKDTree, np.ndarray)
-        Output of :func:`_build_tissue_refinement`: centroid KD-tree and
-        ``tissue_cell_nodes`` array of shape (N_tissue_elements, 8).
-    max_fallback_dist : float
-        Maximum centroid distance to accept a match (roughly half the
-        space diagonal of a coarse element).
+        Global node indices for needle nodes.
+    tissue_node_indices : np.ndarray
+        Global node indices for tissue nodes.
     """
-    centroid_kdtree, tissue_cell_nodes = refined_tissue
-    dists, elem_indices = centroid_kdtree.query(needle_pos, k=1)
+    neighbor_lists = tissue_kdtree.query_ball_point(needle_pos, r=radius)
     src_list, dst_list = [], []
-    for needle_j, (dist, elem_idx) in enumerate(zip(dists, elem_indices)):
-        if dist > max_fallback_dist:
-            continue
-        needle_global = int(needle_node_indices[needle_j])
-        for real_node in tissue_cell_nodes[elem_idx]:
+    for local_ndl, neighbors in enumerate(neighbor_lists):
+        needle_global = int(needle_node_indices[local_ndl])
+        for local_eul in neighbors:
             src_list.append(needle_global)
-            dst_list.append(int(real_node))
+            dst_list.append(int(tissue_node_indices[local_eul]))
 
     if not src_list:
         return (
@@ -758,55 +706,20 @@ def main(cfg: DictConfig) -> None:
     needle_idx_t = torch.from_numpy(needle_node_indices.astype(np.int64)) if per_region_norm else None
     tissue_idx_t = torch.from_numpy(tissue_node_indices.astype(np.int64)) if per_region_norm else None
 
-    # ---- World edge strategy: GT-first with centroid fallback ----------------
-    # Primary: use GT LINE-cell edges directly from the cache (exact training
-    # distribution).  Fallback: centroid k=1 search, used only when the rollout
-    # extends beyond the last cached GT frame.
-    #
-    # Log how many GT frames actually have edges so the user can see the range.
-    n_frames_with_gt_edges = sum(
-        1 for (ei, _) in cache["world_edges"] if ei.shape[1] > 0
+    # ---- World edge radius -----------------------------------------------
+    # Must match EDGE_RADIUS in odb_to_mgn_input.py (default 1.2 mm) so that
+    # inference generates exactly the same connectivity pattern as training.
+    # The tissue (Eulerian) mesh is fixed, so we build the KD-tree once from
+    # the reference frame and reuse it for all rollout steps.
+    world_edge_radius = float(
+        OmegaConf.select(cfg, "world_edge_radius", default=1.2)
     )
-    last_gt_edge_frame = max(
-        (t for t, (ei, _) in enumerate(cache["world_edges"]) if ei.shape[1] > 0),
-        default=-1,
-    )
-    print(
-        f"  GT world edges: {n_frames_with_gt_edges}/{len(cache['world_edges'])} frames have edges "
-        f"(last: frame {last_gt_edge_frame})"
-    )
+    tissue_pos_np = frame_tensors["coord"][infer_start][tissue_node_indices].numpy()
+    tissue_kdtree = cKDTree(tissue_pos_np)
+    print(f"  World edge radius = {world_edge_radius:.4f} mm (Eulerian tissue KD-tree built)")
 
-    # ---- Centroid fallback structure (for steps beyond GT range) -------------
-    # We use 0.87 × p95_tissue_edge_length as the distance threshold; this is
-    # roughly half the space diagonal of a typical coarse element (sqrt(3)/2
-    # ≈ 0.87), so any needle node inside an element will be within this
-    # distance of its centroid.
-    coord0_np = frame_tensors["coord"][infer_start].numpy()
-    tissue_ei_mask = hex_edge_type_onehot[:, 1] > 0.5      # tissue-tissue edges
-    t_src_all = hex_edge_index[0][tissue_ei_mask].numpy()
-    t_dst_all = hex_edge_index[1][tissue_ei_mask].numpy()
-    tissue_edge_lens = np.linalg.norm(
-        coord0_np[t_src_all] - coord0_np[t_dst_all], axis=1
-    )
-    _p95_tissue_edge = float(np.percentile(tissue_edge_lens, 95)) if len(tissue_edge_lens) else 6.0
-    max_fallback_dist = 0.87 * _p95_tissue_edge
-
-    # Build the refined structure from the reference mesh HEX topology.
-    # We read the start VTU here; the same object is reused for output mesh
-    # topology below (avoiding a second disk read).
+    # Read the start VTU for output mesh topology (HEX cells are fixed across frames).
     ref_mesh_start = pv.read(vtu_files[infer_start])
-    _hex_cell_idx_ref = np.where(ref_mesh_start.celltypes == 12)[0]
-    _hex_submesh_ref = ref_mesh_start.extract_cells(_hex_cell_idx_ref)
-    refined_tissue = _build_tissue_refinement(
-        _hex_submesh_ref.cells.copy(),
-        {k: _hex_submesh_ref.cell_data[k].copy() for k in _hex_submesh_ref.cell_data.keys()},
-        coord0_np,
-    )
-    print(
-        f"  Coarse-mesh fallback: p95_tissue_edge = {_p95_tissue_edge:.4f} mm, "
-        f"max_fallback_dist = {max_fallback_dist:.4f} mm "
-        f"({len(refined_tissue[1])} element centroids)"
-    )
 
     # ---- Consensus filter + needle edge cap precomputation ------------------
     consensus_attenuation = float(OmegaConf.select(cfg, "consensus_attenuation", default=0.0))
@@ -840,7 +753,6 @@ def main(cfg: DictConfig) -> None:
 
     # ---- Output mesh topology -----------------------------------------------
     # HEX cells are fixed; LINE cells (world/contact edges) update each step.
-    # ref_mesh_start was already loaded above for the tissue refinement structure.
     pred_points = ref_mesh_start.points.copy()  # (n_nodes, 3), updated each step
 
     hex_cell_idx = np.where(ref_mesh_start.celltypes == 12)[0]
@@ -861,33 +773,20 @@ def main(cfg: DictConfig) -> None:
             # --- Full mesh (no spatial crop) ---
             part_nodes = torch.arange(n_nodes, dtype=torch.long)
 
-            # --- World edges: use GT LINE-cell topology when available -----------
-            # The GT cache stores the exact contact edges the FEA solver produced
-            # for each frame (same LINE cells that training uses).  Using them
-            # directly replicates the training distribution exactly: the right
-            # needle nodes get edges to the right tissue nodes, with no spurious
-            # connections at the base or below the surface.
-            #
-            # The centroid fallback fires only when the rollout extends beyond
-            # the last cached GT frame.  In that regime no GT edges exist anyway,
-            # so the fallback provides a reasonable approximation for the
-            # deep-embedding region where the mesh is coarse.
-            gt_frame_idx = infer_start + step
-            gt_world_edges = cache["world_edges"]
-            if (
-                gt_frame_idx < len(gt_world_edges)
-                and gt_world_edges[gt_frame_idx][0].shape[1] > 0
-            ):
-                world_ei, world_et = gt_world_edges[gt_frame_idx]
-            else:
-                # Beyond GT range or GT has no edges for this frame: use centroid fallback.
-                needle_pos_np = state["coord"][needle_node_indices].numpy()
-                world_ei, world_et = _build_fallback_world_edges(
-                    needle_pos_np,
-                    needle_node_indices,
-                    refined_tissue,
-                    max_fallback_dist,
-                )
+            # --- World edges: KD-tree matching odb_to_mgn_input.py --------------
+            # Build edges from predicted needle positions using the same fixed
+            # radius (world_edge_radius) and fixed Eulerian tissue KD-tree that
+            # odb_to_mgn_input.py used when creating the training VTU files.
+            # This exactly replicates the training distribution for any rollout
+            # step, adapting to the predicted needle geometry as it evolves.
+            needle_pos_np = state["coord"][needle_node_indices].numpy()
+            world_ei, world_et = _build_world_edges(
+                needle_pos_np,
+                tissue_kdtree,
+                world_edge_radius,
+                needle_node_indices,
+                tissue_node_indices,
+            )
 
             # --- Build and run model on cropped subgraph ---
             graph = _build_step_graph(

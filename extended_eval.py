@@ -494,6 +494,13 @@ def main():
         help="Total needle insertion depth (mm) used to convert rollout steps to "
              "physical depth on the x-axis of time-series plots (default: 40.0)",
     )
+    parser.add_argument(
+        "--max_rollout_step", type=int, default=15,
+        help="Discard summary rows with step > this value before computing metrics.  "
+             "With timestep_stride=10 the default of 15 corresponds to VTU timestep 160 "
+             "(step 15 is the last prediction whose input came from VTU 150, and the "
+             "output is compared against VTU 160).  Set to a large number to disable.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -516,9 +523,13 @@ def main():
         if df is None:
             print(f"[skip] {name}: no eval/summary.csv found")
             continue
+        n_before = len(df)
+        df = df[df["step"] <= args.max_rollout_step].reset_index(drop=True)
+        n_trimmed = n_before - len(df)
         df = compute_metrics(df, args.mag_threshold)
         all_dfs[name] = df
-        print(f"Loaded {name}: {len(df)} rows, {df['has_gt'].sum()} with GT")
+        trim_note = f", trimmed {n_trimmed} rows beyond step {args.max_rollout_step}" if n_trimmed else ""
+        print(f"Loaded {name}: {len(df)} rows, {df['has_gt'].sum()} with GT{trim_note}")
 
     if not all_dfs:
         print("No experiments with eval/summary.csv found. Run eval_test_runs.py first.")
