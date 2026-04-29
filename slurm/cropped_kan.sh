@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ndl_crp_bst
+#SBATCH --job-name=ndl_crp_kan
 #SBATCH --account=fuge-prj-eng
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,23 +7,19 @@
 #SBATCH --gpus=a100:1
 #SBATCH --time=18:00:00
 #SBATCH --partition=gpu
-#SBATCH --output=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_bistride/slurm-%j.out
-#SBATCH --error=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_bistride/slurm-%j.err
+#SBATCH --output=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_kan/slurm-%j.out
+#SBATCH --error=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_kan/slurm-%j.err
 
-# Experiment: BiStride MeshGraphNet on the full (uncropped) mesh.
+# Experiment: Cropped MeshGraphKAN — KAN node encoder, base feature set.
 #
-# BiStrideMGN augments vanilla MGN with a U-Net multi-scale message passing
-# that alternates coarsening and refinement passes, improving long-range
-# interaction modelling.  The bi-stride coarsening is precomputed once for the
-# fixed mesh topology (bsms_cache_l2.pt) and reused across all training steps.
+# MeshGraphKAN replaces the standard MLP node encoder with a Kolmogorov-Arnold
+# Network (KAN) using a Fourier basis with num_harmonics=5 frequency components.
+# All other architecture parameters (hidden dims, processor size, aggregation)
+# and training settings match cropped_base exactly so any difference is
+# attributable to the KAN encoder alone.
 #
-# Dynamic cropping is disabled (crop radii = 10000 mm) so the topology is fixed
-# every step and the precomputed BSMS hierarchy remains valid.
-#
-# First run will build both the raw VTU caches and the BSMS cache — expect a
-# longer startup time.  Subsequent runs load from disk.
-#
-# Compare against: cropped_nocrop (same mesh, vanilla MGN).
+# The KAN encoder is parameterised by the Fourier basis width (num_harmonics)
+# rather than use_fourier_features/n_fourier_features.
 
 module load apptainer
 
@@ -39,9 +35,9 @@ export WARP_CACHE_PATH=/tmp/warp-cache-${SLURM_JOB_ID}
 export WANDB_DATA_DIR=/tmp/wandb-${SLURM_JOB_ID}
 export LOCAL_CACHE=/tmp/physicsnemo-cache-${SLURM_JOB_ID}
 
-SIF=/home/nhoffma1/scratch.fuge-prj/needle_mgn/needle_mgn2.sif
+SIF=/home/nhoffma1/scratch.fuge-prj/needle_mgn/needle_mgn.sif
 DATA=/scratch/zt1/project/fuge-prj/user/nhoffma1/needle_mgn/RUN-2
-EXP=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_bistride
+EXP=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_kan
 
 mkdir -p ${EXP}/checkpoints ${EXP}/stats ${EXP}/outputs
 
@@ -60,21 +56,13 @@ apptainer exec --nv \
         batch_size=1 \
         noise_std=0.0 \
         use_cpress=false \
-        per_region_norm=false \
         timestep_stride=10 \
-        needle_crop_mm=10000 \
-        tissue_crop_mm=10000 \
-        'crop_strategy_weights=[1,0,0]' \
-        model_type=bistride \
-        use_bsms=true \
-        num_bsms_levels=2 \
-        num_layers_bistride=2 \
-        bistride_unet_levels=1 \
+        model_type=kan \
+        num_harmonics=5 \
         hidden_dim_node_encoder=256 \
         hidden_dim_edge_encoder=256 \
         hidden_dim_node_decoder=256 \
         hidden_dim_processor=256 \
         processor_size=15 \
-        num_processor_checkpoint_segments=10 \
         save_every=10 \
         cuda_devices=null

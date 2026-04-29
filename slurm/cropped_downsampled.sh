@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ndl_crp_bst
+#SBATCH --job-name=ndl_crp_dws
 #SBATCH --account=fuge-prj-eng
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,23 +7,25 @@
 #SBATCH --gpus=a100:1
 #SBATCH --time=18:00:00
 #SBATCH --partition=gpu
-#SBATCH --output=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_bistride/slurm-%j.out
-#SBATCH --error=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_bistride/slurm-%j.err
+#SBATCH --output=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_downsampled/slurm-%j.out
+#SBATCH --error=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_downsampled/slurm-%j.err
 
-# Experiment: BiStride MeshGraphNet on the full (uncropped) mesh.
+# Experiment: Standard MGN on a reduced mesh (needle beam + downsampled tissue).
 #
-# BiStrideMGN augments vanilla MGN with a U-Net multi-scale message passing
-# that alternates coarsening and refinement passes, improving long-range
-# interaction modelling.  The bi-stride coarsening is precomputed once for the
-# fixed mesh topology (bsms_cache_l2.pt) and reused across all training steps.
+# Needle: 7936 HEX nodes replaced by a 1-D beam chain at 2 mm spacing
+#   (~100 nodes at PCA-projected intervals along the needle axis).
+#   Beam node features are scatter-means of the original HEX cluster.
+#   World (contact) edges are remapped from original needle nodes to their beam
+#   cluster representative, preserving needle-tissue interaction signals.
 #
-# Dynamic cropping is disabled (crop radii = 10000 mm) so the topology is fixed
-# every step and the precomputed BSMS hierarchy remains valid.
+# Tissue: 39025 nodes subsampled to one per 3 mm voxel (voxel-grid approach,
+#   keeping the actual node closest to each voxel centre).  The tissue mesh is
+#   finer near the needle, so contact-zone coverage is preserved at 3 mm.
+#   World edges to removed tissue nodes are dropped.
 #
-# First run will build both the raw VTU caches and the BSMS cache — expect a
-# longer startup time.  Subsequent runs load from disk.
+# Reduction caches (reduced_cache_RUN-*.pt) are built on first run and reused.
 #
-# Compare against: cropped_nocrop (same mesh, vanilla MGN).
+# Compare against: cropped_nocrop (full mesh, same MGN).
 
 module load apptainer
 
@@ -39,9 +41,9 @@ export WARP_CACHE_PATH=/tmp/warp-cache-${SLURM_JOB_ID}
 export WANDB_DATA_DIR=/tmp/wandb-${SLURM_JOB_ID}
 export LOCAL_CACHE=/tmp/physicsnemo-cache-${SLURM_JOB_ID}
 
-SIF=/home/nhoffma1/scratch.fuge-prj/needle_mgn/needle_mgn2.sif
+SIF=/home/nhoffma1/scratch.fuge-prj/needle_mgn/needle_mgn3.sif
 DATA=/scratch/zt1/project/fuge-prj/user/nhoffma1/needle_mgn/RUN-2
-EXP=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_bistride
+EXP=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_downsampled
 
 mkdir -p ${EXP}/checkpoints ${EXP}/stats ${EXP}/outputs
 
@@ -65,16 +67,13 @@ apptainer exec --nv \
         needle_crop_mm=10000 \
         tissue_crop_mm=10000 \
         'crop_strategy_weights=[1,0,0]' \
-        model_type=bistride \
-        use_bsms=true \
-        num_bsms_levels=2 \
-        num_layers_bistride=2 \
-        bistride_unet_levels=1 \
+        model_type=mgn \
+        beam_spacing_mm=2.0 \
+        tissue_downsample_mm=3.0 \
         hidden_dim_node_encoder=256 \
         hidden_dim_edge_encoder=256 \
         hidden_dim_node_decoder=256 \
         hidden_dim_processor=256 \
         processor_size=15 \
-        num_processor_checkpoint_segments=10 \
         save_every=10 \
         cuda_devices=null

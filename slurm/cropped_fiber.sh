@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ndl_crp_fiber_iso
+#SBATCH --job-name=ndl_crp_fiber
 #SBATCH --account=fuge-prj-eng
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,32 +7,17 @@
 #SBATCH --gpus=a100:1
 #SBATCH --time=18:00:00
 #SBATCH --partition=gpu
-#SBATCH --output=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_fiber_iso/slurm-%j.out
-#SBATCH --error=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_fiber_iso/slurm-%j.err
+#SBATCH --output=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_fiber/slurm-%j.out
+#SBATCH --error=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_fiber/slurm-%j.err
 
-# Experiment: FiberEquivariantMGN with the two equivariance fixes applied.
+# Experiment: FiberEquivariantMGN — fiber-direction invariant edge features and
+# equivariant vector message passing with {V, d, V×d} decoder basis.
 #
-#   vector_iso_norm=true
-#       Normalises u, v, a, mat_fiber by a single scalar std (mean=0) instead
-#       of per-component (mean, std).  Per-component normalisation breaks the
-#       1o-vector property of the targets — under rotation, the normalised
-#       components don't transform as a vector — and the equivariant decoder
-#       (whose weights can only uniformly scale a 1o irrep's xyz components)
-#       cannot compensate.  This caused the un-fixed cropped_fiber to
-#       underpredict needle xy-deflection by ~70% across all test runs.
-#
-#   needle_fiber_axis=true
-#       Replaces mat_fiber on needle nodes (which odb_to_mgn_input.py exports
-#       as zero) with the unit principal SVD axis of each run's frame-0 needle
-#       coordinates.  Without this, the fiber decoder's {V, d, V×d} basis
-#       collapses on needle nodes to just V (which lies along the needle axis
-#       due to cylindrical symmetry of the message graph), so the model has no
-#       equivariant basis vector pointing transverse to the needle and cannot
-#       express deflection.  After the override, V × axis spans the bending
-#       plane.
-#
-# All other architecture/training settings match cropped_fiber for a clean
-# comparison.
+# Augments each edge with two scalar dot-products (cos θ = d·ê_ij, cos φ = d_i·d_j)
+# encoding the angle between the fiber axis and the edge.  The decoder projects
+# hidden node features into the local {V, fiber_dir, V×fiber_dir} frame to
+# produce equivariantly decoded u/v/a displacement vectors (n_vec_outputs=3).
+# All other hidden dimensions and processor size match cropped_base.
 
 module load apptainer
 
@@ -50,7 +35,7 @@ export LOCAL_CACHE=/tmp/physicsnemo-cache-${SLURM_JOB_ID}
 
 SIF=/home/nhoffma1/scratch.fuge-prj/needle_mgn/needle_mgn.sif
 DATA=/scratch/zt1/project/fuge-prj/user/nhoffma1/needle_mgn/RUN-2
-EXP=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_fiber_iso
+EXP=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_fiber
 
 mkdir -p ${EXP}/checkpoints ${EXP}/stats ${EXP}/outputs
 
@@ -78,7 +63,5 @@ apptainer exec --nv \
         hidden_dim_processor=256 \
         processor_size=15 \
         ++per_region_norm=false \
-        ++vector_iso_norm=true \
-        ++needle_fiber_axis=true \
         save_every=10 \
         cuda_devices=null
