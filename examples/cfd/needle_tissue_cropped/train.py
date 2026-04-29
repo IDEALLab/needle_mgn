@@ -114,6 +114,8 @@ class MGNTrainer:
             tissue_downsample_mm=tissue_downsample_mm,
             use_bsms=self.use_bsms,
             num_bsms_levels=num_bsms_levels,
+            vector_iso_norm=bool(cfg.get("vector_iso_norm", False)),
+            needle_fiber_axis=bool(cfg.get("needle_fiber_axis", False)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         val_dataset = NeedleTissueDataset(split="validation", **_shared_dataset_kwargs)

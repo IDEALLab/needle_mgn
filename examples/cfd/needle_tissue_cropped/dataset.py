@@ -228,6 +228,11 @@ def _cell_features_to_nodes(
 _STATIC_PROP_KEYS = ["mat_E", "mat_c10", "mat_density", "mat_fiber", "mat_k1", "mat_k2", "mat_kappa", "mat_nu"]
 _STATIC_PROP_DIMS = [1, 1, 1, 3, 1, 1, 1, 1]
 
+# Keys whose features transform as 3-D vectors under rotation (1o irreps).
+# Used by ``vector_iso_norm`` to apply isotropic (single-scalar) normalization
+# instead of per-component (mean, std), preserving SE(3) equivariance.
+_VECTOR_KEYS = {"u", "v", "a", "mat_fiber"}
+
 
 def _load_node_props(mesh: pv.UnstructuredGrid) -> Dict[str, torch.Tensor]:
     """Load static material node properties from the reference VTU frame.
@@ -767,12 +772,22 @@ class NeedleTissueDataset(Dataset):
         tissue_downsample_mm: float = 0.0,
         use_bsms: bool = False,
         num_bsms_levels: int = 2,
+        vector_iso_norm: bool = False,
+        needle_fiber_axis: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
 
+        if vector_iso_norm and per_region_norm:
+            raise ValueError(
+                "vector_iso_norm and per_region_norm are mutually exclusive "
+                "(per-region stats reintroduce anisotropic per-component scaling)."
+            )
+
         self.use_cpress = use_cpress
         self.per_region_norm = per_region_norm
+        self.vector_iso_norm = vector_iso_norm
+        self.needle_fiber_axis = needle_fiber_axis
         if use_cpress:
             self.INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s", "cpress"]
             self.INPUT_DIMS = [3, 3, 3, 3, 1, 6, 1]
@@ -1031,6 +1046,24 @@ class NeedleTissueDataset(Dataset):
             f"| {len(self._run_data)} run(s) "
             f"| crops: {', '.join(active)}"
         )
+
+        # ---- Needle-tangent override of mat_fiber ---------------------------
+        # mat_fiber as exported by odb_to_mgn_input.py is zero on needle nodes
+        # (only tissue gets the orientation axis1).  When needle_fiber_axis=true
+        # we replace the zero with the unit principal axis of each run's frame-0
+        # needle coordinates, giving the FiberEquivariantMGN decoder a transverse
+        # basis (V × axis) it can use to produce deflection.
+        if self.needle_fiber_axis:
+            for run in self._run_data:
+                ref_coord = run["frame_tensors"]["coord"][0].float()
+                needle_pts = ref_coord[self._needle_idx_t]
+                centered = needle_pts - needle_pts.mean(dim=0, keepdim=True)
+                _, _, Vt = torch.linalg.svd(centered, full_matrices=False)
+                axis = Vt[0]
+                axis = axis / axis.norm().clamp(min=1e-8)
+                new_mf = run["node_props"]["mat_fiber"].clone().float()
+                new_mf[self._needle_idx_t] = axis.expand(self._needle_idx_t.numel(), 3)
+                run["node_props"]["mat_fiber"] = new_mf
 
         # ---- Normalisation statistics ---------------------------------------
         if split == "train":
@@ -1346,8 +1379,9 @@ class NeedleTissueDataset(Dataset):
             # all_data: (total_pairs, n_nodes, dim)
             all_data = torch.cat(key_data[key], dim=0).float()
             flat = all_data.reshape(-1, dim)
-            node_stats[f"{key}_mean"] = flat.mean(0)
-            node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
+            mean, std = self._stats_for_key(key, flat, dim)
+            node_stats[f"{key}_mean"] = mean
+            node_stats[f"{key}_std"] = std
 
             if self.per_region_norm:
                 flat_n = all_data[:, self._needle_idx_t, :].reshape(-1, dim)
@@ -1359,16 +1393,18 @@ class NeedleTissueDataset(Dataset):
 
         for key, dim in zip(self.STATIC_PROP_KEYS, self.STATIC_PROP_DIMS):
             flat = torch.cat(prop_data[key], dim=0).float()
-            node_stats[f"{key}_mean"] = flat.mean(0)
-            node_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
+            mean, std = self._stats_for_key(key, flat, dim)
+            node_stats[f"{key}_mean"] = mean
+            node_stats[f"{key}_std"] = std
 
         target_stats: Dict[str, torch.Tensor] = {}
 
         for key, dim in zip(self.TARGET_KEYS, self.TARGET_DIMS):
             all_data = torch.cat(tgt_data[key], dim=0).float()
             flat = all_data.reshape(-1, dim)
-            target_stats[f"{key}_mean"] = flat.mean(0)
-            target_stats[f"{key}_std"] = flat.std(0).clamp(min=1e-8)
+            mean, std = self._stats_for_key(key, flat, dim)
+            target_stats[f"{key}_mean"] = mean
+            target_stats[f"{key}_std"] = std
 
             if self.per_region_norm:
                 flat_n = all_data[:, self._needle_idx_t, :].reshape(-1, dim)
@@ -1379,6 +1415,26 @@ class NeedleTissueDataset(Dataset):
                 target_stats[f"{key}_tissue_std"] = flat_t.std(0).clamp(min=1e-8)
 
         return node_stats, target_stats
+
+    def _stats_for_key(
+        self, key: str, flat: torch.Tensor, dim: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute (mean, std) tensors for a feature key.
+
+        Returns per-component (mean, std) by default.  When ``vector_iso_norm``
+        is enabled and ``key`` is one of the 3-D vector keys (u, v, a,
+        mat_fiber), returns ``(zeros(dim), ones(dim) * iso_std)`` where
+        ``iso_std`` is the std of all xyz components flattened together.  This
+        preserves the 1o-vector property of the normalised feature: rotating
+        the input rotates the normalised input by the same matrix.
+        """
+        if self.vector_iso_norm and key in _VECTOR_KEYS:
+            iso_std = flat.reshape(-1).std().clamp(min=1e-8)
+            return (
+                torch.zeros(dim, dtype=flat.dtype),
+                torch.full((dim,), float(iso_std), dtype=flat.dtype),
+            )
+        return flat.mean(0), flat.std(0).clamp(min=1e-8)
 
     @staticmethod
     def denormalize(tensor: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:

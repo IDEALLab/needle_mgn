@@ -786,6 +786,35 @@ def main(cfg: DictConfig) -> None:
             bsms_ms_edges = [e.to(dist.device) for e in ms_edges_cpu]
             bsms_ms_ids = [ids.to(dist.device) for ids in ms_ids_cpu]
 
+    # ---- Needle / tissue node index sets ---------------------------------
+    needle_node_indices, tissue_node_indices = _get_needle_tissue_node_sets(
+        hex_edge_index, hex_edge_type_onehot
+    )
+
+    # Override mat_fiber on needle nodes with the principal axis of the
+    # frame-0 needle geometry — must match dataset.py's training-time override
+    # when needle_fiber_axis=true so the equivariant decoder receives a
+    # transverse basis and the input mat_fiber statistics line up with the
+    # training stats.
+    needle_fiber_axis = bool(OmegaConf.select(cfg, "needle_fiber_axis", default=False))
+    if needle_fiber_axis:
+        _needle_idx_t = torch.from_numpy(needle_node_indices.astype(np.int64))
+        _ref_coord = frame_tensors["coord"][0].float()
+        _needle_pts = _ref_coord[_needle_idx_t]
+        _centered = _needle_pts - _needle_pts.mean(dim=0, keepdim=True)
+        _, _, _Vt_axis = torch.linalg.svd(_centered, full_matrices=False)
+        _axis = _Vt_axis[0]
+        _axis = _axis / _axis.norm().clamp(min=1e-8)
+        if "mat_fiber" not in node_props:
+            node_props["mat_fiber"] = torch.zeros(n_nodes, 3, dtype=torch.float32)
+        _new_mf = node_props["mat_fiber"].clone().float()
+        _new_mf[_needle_idx_t] = _axis.expand(_needle_idx_t.numel(), 3)
+        node_props["mat_fiber"] = _new_mf
+        print(
+            f"  needle_fiber_axis: overrode mat_fiber on {_needle_idx_t.numel()} "
+            f"needle nodes with principal axis {_axis.tolist()}"
+        )
+
     # Pre-compute unit fiber direction for every node (used by FiberEquivariantMGN).
     if "mat_fiber" in node_props:
         _fiber_raw = node_props["mat_fiber"].float()   # (N, 3)
@@ -793,11 +822,6 @@ def main(cfg: DictConfig) -> None:
         fiber_dir_full = _fiber_raw / _fiber_norm       # (N, 3) unit vectors
     else:
         fiber_dir_full = None
-
-    # ---- Needle / tissue node index sets ---------------------------------
-    needle_node_indices, tissue_node_indices = _get_needle_tissue_node_sets(
-        hex_edge_index, hex_edge_type_onehot
-    )
     print(
         f"Node sets: {len(needle_node_indices)} needle, "
         f"{len(tissue_node_indices)} tissue (total {n_nodes})"
