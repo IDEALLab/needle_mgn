@@ -37,6 +37,7 @@ export WANDB_API_KEY=$(cat ~/.wandb_api_key)
 export UV_CACHE_DIR=/tmp/uv-cache-${SLURM_JOB_ID}
 export WARP_CACHE_PATH=/tmp/warp-cache-${SLURM_JOB_ID}
 export WANDB_DATA_DIR=/tmp/wandb-${SLURM_JOB_ID}
+export LOCAL_CACHE=/tmp/physicsnemo-cache-${SLURM_JOB_ID}
 
 SIF=/home/nhoffma1/scratch.fuge-prj/needle_mgn/needle_mgn2.sif
 DATA=/scratch/zt1/project/fuge-prj/user/nhoffma1/needle_mgn/RUN-2

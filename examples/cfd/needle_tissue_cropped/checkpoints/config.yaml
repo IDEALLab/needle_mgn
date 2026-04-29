@@ -1,7 +1,7 @@
-data_dir: /home/nathanielhoffman/Desktop/cel/physicsnemo/RUN-2
+data_dir: ../../../RUN-2
 ckpt_path: ./checkpoints
 stats_dir: ./stats
-cuda_devices: null
+cuda_devices: 1
 train_fraction: 0.8
 val_fraction: 0.1
 timestep_stride: 10
@@ -15,7 +15,7 @@ crop_strategy_weights:
 - 0.15
 input_dim_nodes: 30
 input_dim_edges: 7
-output_dim: 9
+output_dim: 17
 use_fourier_features: false
 n_fourier_features: 64
 fourier_scale: 0.36
@@ -25,13 +25,13 @@ hidden_dim_node_decoder: 256
 hidden_dim_processor: 256
 processor_size: 15
 aggregation: sum
-epochs: 350
+epochs: 200
 batch_size: 1
 num_workers: 2
 lr: 0.0001
-amp: false
+amp: true
 jit: false
-noise_std: 0.0
+noise_std: 0.003
 val_every: 10
 save_every: 50
 infer_start_frame: null
