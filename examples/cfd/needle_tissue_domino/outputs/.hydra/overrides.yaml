@@ -1,7 +1,1 @@
-- infer_run_id=199
-- infer_output_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/inference_output/RUN-199
-- data_dir=/home/nathanielhoffman/Desktop/needle_mgn/RUN-2
-- ckpt_path=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/checkpoints
-- stats_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/stats
-- use_cpress=true
-- use_fourier_features_state=false
+[]

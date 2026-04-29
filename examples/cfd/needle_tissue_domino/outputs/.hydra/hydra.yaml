@@ -111,18 +111,11 @@ hydra:
   overrides:
     hydra:
     - hydra.mode=RUN
-    task:
-    - infer_run_id=199
-    - infer_output_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/inference_output/RUN-199
-    - data_dir=/home/nathanielhoffman/Desktop/needle_mgn/RUN-2
-    - ckpt_path=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/checkpoints
-    - stats_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/stats
-    - use_cpress=true
-    - use_fourier_features_state=false
+    task: []
   job:
-    name: infer
+    name: train
     chdir: true
-    override_dirname: ckpt_path=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/checkpoints,data_dir=/home/nathanielhoffman/Desktop/needle_mgn/RUN-2,infer_output_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/inference_output/RUN-199,infer_run_id=199,stats_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/stats,use_cpress=true,use_fourier_features_state=false
+    override_dirname: ''
     id: ???
     num: ???
     config_name: config
@@ -136,18 +129,18 @@ hydra:
   runtime:
     version: 1.3.2
     version_base: '1.3'
-    cwd: /home/nathanielhoffman/Desktop/needle_mgn/examples/cfd/needle_tissue_domino
+    cwd: /home/nathanielhoffman/Desktop/cel/physicsnemo/examples/cfd/needle_tissue_domino
     config_sources:
     - path: hydra.conf
       schema: pkg
       provider: hydra
-    - path: /home/nathanielhoffman/Desktop/needle_mgn/examples/cfd/needle_tissue_domino/conf
+    - path: /home/nathanielhoffman/Desktop/cel/physicsnemo/examples/cfd/needle_tissue_domino/conf
       schema: file
       provider: main
     - path: ''
       schema: structured
       provider: schema
-    output_dir: /home/nathanielhoffman/Desktop/needle_mgn/examples/cfd/needle_tissue_domino/outputs
+    output_dir: /home/nathanielhoffman/Desktop/cel/physicsnemo/examples/cfd/needle_tissue_domino/outputs
     choices:
       hydra/env: default
       hydra/callbacks: null

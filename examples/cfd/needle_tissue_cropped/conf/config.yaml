@@ -80,24 +80,6 @@ use_cpress: true
 # alongside the global stats, so infer.py detects this automatically.
 per_region_norm: false
 
-# Isotropic vector normalization for u, v, a, mat_fiber.  Stores stats as
-# (mean=0, std=[s,s,s]) where s is a single scalar across xyz components.
-# Required for SE(3)-equivariant models (fiber, fiber_kan, tfn): per-component
-# (mean, std) breaks the 1o-vector property of the normalised target, forcing
-# equivariant decoders (which can only scale all 3 components together) to
-# underpredict whichever axis has the smallest std.  Mutually exclusive with
-# per_region_norm.
-vector_iso_norm: false
-
-# Override mat_fiber on needle nodes with the principal SVD axis of the
-# frame-0 needle geometry.  As exported by odb_to_mgn_input.py, mat_fiber is
-# zero on needle nodes (only tissue gets the orientation axis1), which
-# collapses the fiber decoder's {V, d, V×d} basis to just V (axial direction)
-# and leaves equivariant models unable to express transverse deflection.
-# When true, every needle node gets a non-zero mat_fiber pointing along the
-# needle axis, restoring the transverse basis vector V×axis.
-needle_fiber_axis: false
-
 # -------------------------
 # Model architecture
 # -------------------------

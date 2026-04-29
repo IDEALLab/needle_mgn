@@ -1,6 +1,6 @@
-data_dir: /home/nathanielhoffman/Desktop/needle_mgn/RUN-2
-ckpt_path: /home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/checkpoints
-stats_dir: /home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/stats
+data_dir: /home/nathanielhoffman/Desktop/cel/physicsnemo/RUN-2
+ckpt_path: ./checkpoints
+stats_dir: ./stats
 cuda_devices: null
 train_fraction: 0.8
 val_fraction: 0.1
@@ -10,7 +10,7 @@ grid_res:
 - 16
 - 16
 num_sample_nodes: 2048
-output_dim: 17
+output_dim: 9
 global_features: 1
 model:
   model_type: volume
@@ -103,17 +103,16 @@ model:
     fourier_features: false
     num_modes: 5
     activation: ${model.activation}
-use_cpress: true
-node_state_dim_vol: 27
-use_fourier_features_state: false
+node_state_dim_vol: 30
+use_fourier_features_state: true
 n_fourier_features_state: 64
 fourier_scale_state: 0.36
 infer_start_frame: null
 n_rollout: 20
-infer_output_dir: /home/nathanielhoffman/Desktop/needle_mgn/experiments/domino_cpress/inference_output/RUN-199
-infer_run_id: 199
+infer_output_dir: ./inference_output
+infer_run_id: null
 consensus_attenuation: 0.0
-epochs: 400
+epochs: 300
 num_workers: 2
 lr: 0.0001
 amp: true
