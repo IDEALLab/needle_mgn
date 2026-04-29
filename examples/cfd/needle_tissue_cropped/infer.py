@@ -162,27 +162,128 @@ def _denorm_target(
     return out
 
 
+def _build_part_local_edge_index(
+    edge_index: torch.Tensor,
+    part_node_indices: np.ndarray,
+    n_nodes: int,
+) -> torch.Tensor:
+    """Extract edges with both endpoints in *part_node_indices* and relabel locally.
+
+    Returns a (2, E_part) tensor of local indices into ``part_node_indices``, or
+    (2, 0) if no qualifying edges exist.
+    """
+    part_idx_t = torch.from_numpy(part_node_indices.astype(np.int64))
+    in_part = torch.zeros(n_nodes, dtype=torch.bool)
+    in_part[part_idx_t] = True
+
+    src, dst = edge_index
+    mask = in_part[src] & in_part[dst]
+    if mask.sum() == 0:
+        return torch.zeros(2, 0, dtype=torch.long)
+
+    global_to_local = torch.full((n_nodes,), -1, dtype=torch.long)
+    global_to_local[part_idx_t] = torch.arange(len(part_node_indices), dtype=torch.long)
+    return torch.stack([global_to_local[src[mask]], global_to_local[dst[mask]]])
+
+
 def _build_needle_local_edge_index(
     edge_index: torch.Tensor,
     needle_node_indices: np.ndarray,
     n_nodes: int,
 ) -> torch.Tensor:
-    """Extract needle-only edges and re-index to local needle indices.
+    """Backwards-compatible wrapper — equivalent to :func:`_build_part_local_edge_index`."""
+    return _build_part_local_edge_index(edge_index, needle_node_indices, n_nodes)
 
-    Returns a (2, E_needle) tensor of local indices, or (2, 0) if none found.
+
+def _axial_polyfit_blend(
+    disp: torch.Tensor,
+    axial_coords: torch.Tensor,
+    degree: int,
+    alpha: float,
+) -> torch.Tensor:
+    """Project per-node displacement onto a polynomial-of-axial-coordinate subspace.
+
+    For each spatial component, fit ``disp[:, c]`` as a polynomial of degree
+    ``degree`` in ``axial_coords`` (least-squares), then blend:
+
+        ``alpha * fit + (1 - alpha) * disp``
+
+    The polynomial subspace captures displacement modes that vary smoothly
+    along the needle axis: rigid translation (deg≥0), tilt (deg≥1), parabolic
+    bending (deg≥2), cubic / S-curve (deg≥3).  Per-node high-frequency noise
+    that doesn't lie in this subspace is suppressed by ``1 - alpha``.
+
+    This is more permissive than :func:`_procrustes_blend` — Procrustes only
+    keeps the 6-DoF rigid subspace, while a degree-3 polyfit keeps a
+    ``3 * (degree + 1)``-dimensional subspace that includes real bending.
+
+    Parameters
+    ----------
+    disp : torch.Tensor
+        Per-node displacement, shape ``(N, 3)``.
+    axial_coords : torch.Tensor
+        Axial parametrisation of each node, shape ``(N,)``.  Computed once
+        from the reference needle geometry by projecting onto its principal
+        axis.
+    degree : int
+        Polynomial degree.  3 is a good default for clamped-cantilever
+        bending; 1 ≈ Procrustes (rigid only); 5 admits S-curves.
+    alpha : float
+        Blend factor in ``[0, 1]``.  ``alpha=0`` disables; ``alpha=1``
+        replaces ``disp`` entirely with the polynomial fit.
     """
-    needle_idx_t = torch.from_numpy(needle_node_indices.astype(np.int64))
-    is_needle = torch.zeros(n_nodes, dtype=torch.bool)
-    is_needle[needle_idx_t] = True
+    if alpha <= 0.0 or disp.shape[0] < degree + 1 or degree < 0:
+        return disp
 
-    src, dst = edge_index
-    mask = is_needle[src] & is_needle[dst]
-    if mask.sum() == 0:
-        return torch.zeros(2, 0, dtype=torch.long)
+    s_c = axial_coords - axial_coords.mean()
+    s_max = s_c.abs().max()
+    if s_max < 1e-8:
+        return disp
+    s_c = s_c / s_max  # rescale to [-1, 1] for numerical conditioning
 
-    global_to_local = torch.full((n_nodes,), -1, dtype=torch.long)
-    global_to_local[needle_idx_t] = torch.arange(len(needle_node_indices), dtype=torch.long)
-    return torch.stack([global_to_local[src[mask]], global_to_local[dst[mask]]])
+    V = torch.stack([s_c ** k for k in range(degree + 1)], dim=1)  # (N, deg+1)
+    coeffs = torch.linalg.lstsq(V, disp).solution                   # (deg+1, 3)
+    fitted = V @ coeffs                                             # (N, 3)
+    return alpha * fitted + (1.0 - alpha) * disp
+
+
+def _procrustes_blend(
+    prev_pos: torch.Tensor,
+    disp: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Blend a predicted displacement field toward its rigid-body Kabsch fit.
+
+    Given previous positions ``prev_pos`` (N, 3) and the model's predicted
+    per-node displacement ``disp`` (N, 3), find the best rigid transform
+    (R, t) that maps ``prev_pos`` onto ``prev_pos + disp`` in least-squares,
+    and return:
+
+        ``alpha * (rigid_pos - prev_pos) + (1 - alpha) * disp``
+
+    With ``alpha=0`` the displacement is unchanged; with ``alpha=1`` the
+    displacement is replaced by its rigid projection so the part moves as a
+    perfectly rigid body.  Intermediate values dampen non-rigid per-node
+    deviations (which are typically network noise on a quasi-rigid part)
+    while preserving coherent translation/rotation.
+    """
+    if alpha <= 0.0 or prev_pos.shape[0] < 3:
+        return disp
+    pred_pos = prev_pos + disp
+    mu_p = prev_pos.mean(dim=0, keepdim=True)
+    mu_q = pred_pos.mean(dim=0, keepdim=True)
+    P = prev_pos - mu_p
+    Q = pred_pos - mu_q
+    H = P.t() @ Q  # (3, 3) cross-covariance
+    U, S, Vt = torch.linalg.svd(H)
+    d = torch.sign(torch.linalg.det(Vt.t() @ U.t()))
+    D = torch.eye(3, dtype=H.dtype, device=H.device)
+    D[2, 2] = d
+    R = Vt.t() @ D @ U.t()
+    t = mu_q.squeeze(0) - mu_p.squeeze(0) @ R.t()
+    rigid_pos = prev_pos @ R.t() + t
+    rigid_disp = rigid_pos - prev_pos
+    return alpha * rigid_disp + (1.0 - alpha) * disp
 
 
 def _consensus_filter(
@@ -721,15 +822,52 @@ def main(cfg: DictConfig) -> None:
     # Read the start VTU for output mesh topology (HEX cells are fixed across frames).
     ref_mesh_start = pv.read(vtu_files[infer_start])
 
-    # ---- Consensus filter + needle edge cap precomputation ------------------
+    # ---- Post-processing precomputation ------------------------------------
     consensus_attenuation = float(OmegaConf.select(cfg, "consensus_attenuation", default=0.0))
-    needle_local_ei = _build_needle_local_edge_index(
+    tissue_consensus_attenuation = float(
+        OmegaConf.select(cfg, "tissue_consensus_attenuation", default=0.0)
+    )
+    procrustes_alpha = float(OmegaConf.select(cfg, "procrustes_alpha", default=0.0))
+    axial_polyfit_alpha = float(OmegaConf.select(cfg, "axial_polyfit_alpha", default=0.0))
+    axial_polyfit_degree = int(OmegaConf.select(cfg, "axial_polyfit_degree", default=3))
+
+    needle_local_ei = _build_part_local_edge_index(
         hex_edge_index, needle_node_indices, n_nodes
     )
+    tissue_local_ei = _build_part_local_edge_index(
+        hex_edge_index, tissue_node_indices, n_nodes
+    )
+    needle_idx_local = torch.from_numpy(needle_node_indices.astype(np.int64))
+    tissue_idx_local = torch.from_numpy(tissue_node_indices.astype(np.int64))
+
     if consensus_attenuation > 0.0:
         print(
-            f"Consensus filter: attenuation={consensus_attenuation:.2f}, "
+            f"Needle consensus filter: attenuation={consensus_attenuation:.2f}, "
             f"needle-needle edges={needle_local_ei.shape[1]}"
+        )
+    if tissue_consensus_attenuation > 0.0:
+        print(
+            f"Tissue consensus filter: attenuation={tissue_consensus_attenuation:.2f}, "
+            f"tissue-tissue edges={tissue_local_ei.shape[1]}"
+        )
+    if procrustes_alpha > 0.0:
+        print(
+            f"Procrustes rigid blend on needle: alpha={procrustes_alpha:.2f} "
+            f"({len(needle_node_indices)} needle nodes)"
+        )
+
+    # Axial parametrisation of the needle from the reference (start) frame.
+    # Each needle node's coordinate along the principal SVD axis is computed
+    # once and reused every rollout step for the polyfit projection.
+    _ref_needle_pos = frame_tensors["coord"][infer_start][needle_node_indices].float()
+    _ref_centered = _ref_needle_pos - _ref_needle_pos.mean(dim=0, keepdim=True)
+    _, _, _Vt_needle = torch.linalg.svd(_ref_centered, full_matrices=False)
+    needle_axial_coords = _ref_centered @ _Vt_needle[0]  # (n_needle,)
+    if axial_polyfit_alpha > 0.0:
+        print(
+            f"Axial polyfit on needle: alpha={axial_polyfit_alpha:.2f}, "
+            f"degree={axial_polyfit_degree}, "
+            f"axial range={needle_axial_coords.min():.1f}..{needle_axial_coords.max():.1f} mm"
         )
 
     needle_edge_cap_mm: Optional[float] = None
@@ -816,17 +954,28 @@ def main(cfg: DictConfig) -> None:
                 pred_sub, target_stats, target_keys, target_dims, needle_mask, tissue_mask
             )
 
-            # --- Post-processing on needle displacement -----------------------
-            # Both the consensus filter and the edge-length cap operate in
-            # needle-local index space (0..n_needle-1).  Since part_nodes is
-            # the full mesh, next_uvw_sub["u"][needle_node_indices] maps
-            # directly to needle-local displacement.
-            needle_idx_t_np = needle_node_indices  # np.ndarray, global indices
-            needle_idx_local = torch.from_numpy(needle_idx_t_np.astype("int64"))
-
+            # --- Post-processing on predicted displacement --------------------
+            # All filters operate in part-local index space (0..n_part-1).
+            # Since part_nodes is the full mesh, indexing next_uvw_sub["u"]
+            # by global node indices works directly.
             if consensus_attenuation > 0.0:
                 u_needle = next_uvw_sub["u"][needle_idx_local]
                 u_needle = _consensus_filter(u_needle, needle_local_ei, consensus_attenuation)
+                next_uvw_sub["u"][needle_idx_local] = u_needle
+
+            if axial_polyfit_alpha > 0.0:
+                u_needle = next_uvw_sub["u"][needle_idx_local]
+                u_needle = _axial_polyfit_blend(
+                    u_needle, needle_axial_coords,
+                    degree=axial_polyfit_degree,
+                    alpha=axial_polyfit_alpha,
+                )
+                next_uvw_sub["u"][needle_idx_local] = u_needle
+
+            if procrustes_alpha > 0.0:
+                prev_needle_pos = state["coord"][needle_idx_local]
+                u_needle = next_uvw_sub["u"][needle_idx_local]
+                u_needle = _procrustes_blend(prev_needle_pos, u_needle, procrustes_alpha)
                 next_uvw_sub["u"][needle_idx_local] = u_needle
 
             if needle_edge_cap_mm is not None:
@@ -836,6 +985,13 @@ def main(cfg: DictConfig) -> None:
                     u_needle, coord_needle, needle_local_ei, needle_edge_cap_mm
                 )
                 next_uvw_sub["u"][needle_idx_local] = u_needle
+
+            if tissue_consensus_attenuation > 0.0:
+                u_tissue = next_uvw_sub["u"][tissue_idx_local]
+                u_tissue = _consensus_filter(
+                    u_tissue, tissue_local_ei, tissue_consensus_attenuation
+                )
+                next_uvw_sub["u"][tissue_idx_local] = u_tissue
 
             # --- Integrate increments — only for nodes inside the crop ---
             for _key in target_keys:

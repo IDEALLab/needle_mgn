@@ -125,6 +125,8 @@ def run_experiment(
     project_dir: Path,
     vtu_limit: int,
     force: bool,
+    polyfit_alpha: float,
+    polyfit_degree: int,
 ) -> bool:
     """Run inference + eval for one experiment.  Returns True on success."""
     name = exp_dir.name
@@ -171,7 +173,15 @@ def run_experiment(
         f"stats_dir={exp_dir / 'stats'}",
     ]
     rollout_overrides = [f"n_rollout={n_rollout}"]
-    extra = " ".join(cfg_overrides + path_overrides + rollout_overrides)
+    # Needle-displacement post-processing: low-pass via axial polynomial fit.
+    # Preserves smooth bending modes along the needle axis, suppresses per-node
+    # high-frequency noise that drives rollout drift.  Listed last so the CLI
+    # values override anything stale in the checkpoint config.
+    postproc_overrides = [
+        f"axial_polyfit_alpha={polyfit_alpha}",
+        f"axial_polyfit_degree={polyfit_degree}",
+    ]
+    extra = " ".join(cfg_overrides + path_overrides + rollout_overrides + postproc_overrides)
 
     infer_out.mkdir(parents=True, exist_ok=True)
     eval_out.mkdir(parents=True, exist_ok=True)
@@ -245,6 +255,19 @@ def main():
         "--force", action="store_true",
         help="Re-run eval even if eval/summary.csv already exists",
     )
+    parser.add_argument(
+        "--polyfit_alpha", type=float, default=0.6,
+        help="axial_polyfit_alpha forwarded to infer.py.  Blends the predicted "
+             "needle displacement toward its polynomial fit along the needle "
+             "axis (preserves bending, suppresses per-node noise).  "
+             "0.0 disables.  Default: 0.6.",
+    )
+    parser.add_argument(
+        "--polyfit_degree", type=int, default=3,
+        help="axial_polyfit_degree forwarded to infer.py.  Polynomial degree "
+             "for the axial fit.  3 captures clamped-cantilever bending; "
+             "1 ≈ Procrustes (rigid-only).  Default: 3.",
+    )
     args = parser.parse_args()
 
     data_dir = os.path.realpath(args.data_dir)
@@ -279,6 +302,7 @@ def main():
     print(f"Data dir:     {data_dir}")
     print(f"Experiments:  {experiments_dir}")
     print(f"VTU limit:    {args.vtu_limit} (n_rollout = vtu_limit / timestep_stride)")
+    print(f"Polyfit:      alpha={args.polyfit_alpha}, degree={args.polyfit_degree}")
     print(f"Found {len(exp_dirs)} experiment(s) to process\n")
 
     failed = []
@@ -289,6 +313,8 @@ def main():
             project_dir=project_dir,
             vtu_limit=args.vtu_limit,
             force=args.force,
+            polyfit_alpha=args.polyfit_alpha,
+            polyfit_degree=args.polyfit_degree,
         )
         if not ok:
             failed.append(exp_dir.name)
