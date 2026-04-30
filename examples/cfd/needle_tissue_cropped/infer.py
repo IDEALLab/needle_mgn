@@ -650,6 +650,14 @@ def main(cfg: DictConfig) -> None:
         target_keys = [k for k in _ALL_TARGET_KEYS if k != "cpress"]
         target_dims = [d for k, d in zip(_ALL_TARGET_KEYS, _ALL_TARGET_DIMS) if k != "cpress"]
 
+    # Drop kinematic targets the model wasn't trained to predict.
+    drop_targets = list(OmegaConf.select(cfg, "drop_targets", default=[]) or [])
+    if drop_targets:
+        keep = [(k, d) for k, d in zip(target_keys, target_dims) if k not in drop_targets]
+        target_keys = [k for k, _ in keep]
+        target_dims = [d for _, d in keep]
+        print(f"  drop_targets: {drop_targets} → predicting {target_keys}")
+
     input_dim_nodes = sum(input_dims) + sum(_STATIC_PROP_DIMS)
     output_dim      = sum(target_dims)
 
@@ -730,6 +738,26 @@ def main(cfg: DictConfig) -> None:
     # Per-region normalization: detected automatically from the stats file.
     # When enabled, needle and tissue nodes use separate mean/std for each feature.
     per_region_norm = f"u_needle_mean" in node_stats
+
+    # Per-rollout-step physical dt — used to integrate Δv → Δu when "u" is
+    # dropped from training targets.  Saved to target_stats.json by dataset.py
+    # during training; falls back to a manual override or to NaN otherwise.
+    rollout_dt: float
+    _dt_cfg = OmegaConf.select(cfg, "rollout_dt", default=None)
+    if _dt_cfg is not None:
+        rollout_dt = float(_dt_cfg)
+        print(f"  rollout_dt = {rollout_dt:.6g} s (from cfg override)")
+    elif "rollout_dt" in target_stats:
+        _dt_t = target_stats["rollout_dt"]
+        rollout_dt = float(_dt_t.item() if hasattr(_dt_t, "item") else _dt_t[0] if hasattr(_dt_t, "__getitem__") else _dt_t)
+        print(f"  rollout_dt = {rollout_dt:.6g} s (estimated from training data)")
+    else:
+        rollout_dt = float("nan")
+        if "u" in drop_targets:
+            print(
+                "  WARNING: 'u' dropped but rollout_dt not in target_stats and not "
+                "supplied via cfg.rollout_dt — Δu integration will produce NaN."
+            )
 
     raw_cache_path = os.path.join(data_dir, cache_filename)
     _need_rebuild = not os.path.exists(raw_cache_path)
@@ -978,6 +1006,22 @@ def main(cfg: DictConfig) -> None:
                 pred_sub, target_stats, target_keys, target_dims, needle_mask, tissue_mask
             )
 
+            # --- Derive Δu from Δv when the model wasn't trained to predict u.
+            # Trapezoidal rule: Δu = v_t · dt + 0.5 · Δv_pred · dt
+            #   = 0.5 · (v_t + v_{t+1}) · dt   (semi-implicit, energy-preserving)
+            # This produces a "u" entry in next_uvw_sub that the standard
+            # post-processing and state-update paths below can consume
+            # unchanged.
+            if "u" in drop_targets:
+                if "v" not in next_uvw_sub:
+                    raise RuntimeError(
+                        "drop_targets includes 'u' but the model didn't predict 'v' — "
+                        "cannot integrate to recover Δu."
+                    )
+                v_t_sub = state["v"][part_nodes]
+                delta_v_pred = next_uvw_sub["v"]
+                next_uvw_sub["u"] = (v_t_sub + 0.5 * delta_v_pred) * rollout_dt
+
             # --- Post-processing on predicted displacement --------------------
             # All filters operate in part-local index space (0..n_part-1).
             # Since part_nodes is the full mesh, indexing next_uvw_sub["u"]
@@ -1018,8 +1062,12 @@ def main(cfg: DictConfig) -> None:
                 next_uvw_sub["u"][tissue_idx_local] = u_tissue
 
             # --- Integrate increments — only for nodes inside the crop ---
-            for _key in target_keys:
-                state[_key][part_nodes] = state[_key][part_nodes] + next_uvw_sub[_key]
+            # Apply every Δ in next_uvw_sub, including any keys derived from
+            # other predictions (e.g. Δu from Δv).  Dropped-but-not-derived
+            # keys (e.g. 'a' in u-only experiments) stay at their previous
+            # value, which is the intended ablation semantics.
+            for _key, _delta in next_uvw_sub.items():
+                state[_key][part_nodes] = state[_key][part_nodes] + _delta
 
             # Advance Lagrangian (needle) node positions for cropped needle nodes
             needle_in_crop = part_nodes[

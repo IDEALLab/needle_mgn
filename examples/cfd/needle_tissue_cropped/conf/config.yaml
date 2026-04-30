@@ -80,6 +80,37 @@ use_cpress: true
 # alongside the global stats, so infer.py detects this automatically.
 per_region_norm: false
 
+# Isotropic vector normalisation for u, v, a, mat_fiber: stats are stored as
+# (mean=0, std=[s,s,s]) where s is a single scalar across xyz.  Required for
+# SE(3)-equivariant models (fiber, fiber_kan, tfn) — per-component (mean, std)
+# breaks the 1o-vector property of the normalised target.  Mutually exclusive
+# with per_region_norm.
+vector_iso_norm: false
+
+# Override mat_fiber on needle nodes with the unit principal SVD axis of the
+# frame-0 needle geometry, so fiber_dir is non-zero on the needle and the
+# {V, d, V×d} decoder basis includes a transverse direction.  Without this,
+# the fiber decoder for needle nodes collapses to α·V (which lies along the
+# needle axis by symmetry) and cannot express transverse deflection.
+needle_fiber_axis: false
+
+# Drop one or more kinematic vector targets (subset of u/v/a) from the
+# model's outputs.  The remaining outputs train as usual; each dropped key
+# is handled at inference time as follows:
+#   - "u" dropped → Δu derived from predicted Δv via trapezoidal integration
+#                   (Δu = (v_t + 0.5 · Δv_pred) · rollout_dt).  Tests the
+#                   "predict acceleration/velocity, integrate position"
+#                   approach used by Pfaff et al. (MGN, 2020) and Sanchez-
+#                   Gonzalez et al. (GNS, 2020).
+#   - "v" dropped → v stays stale across rollout; not integrated.  Cannot
+#                   coexist with "u" dropped (no predicted v to integrate).
+#   - "a" dropped → a stays stale across rollout.
+# Hydra list syntax (single-quoted to survive the shell): 'drop_targets=[v,a]'.
+# rollout_dt is auto-estimated during training and saved to target_stats.json;
+# override here only if the data implies a different timestep.
+drop_targets: []
+rollout_dt: null
+
 # -------------------------
 # Model architecture
 # -------------------------

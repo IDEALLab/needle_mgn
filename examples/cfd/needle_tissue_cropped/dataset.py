@@ -774,6 +774,7 @@ class NeedleTissueDataset(Dataset):
         num_bsms_levels: int = 2,
         vector_iso_norm: bool = False,
         needle_fiber_axis: bool = False,
+        drop_targets: Optional[List[str]] = None,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -784,6 +785,21 @@ class NeedleTissueDataset(Dataset):
                 "(per-region stats reintroduce anisotropic per-component scaling)."
             )
 
+        # Validate drop_targets: only the kinematic vector targets can be dropped.
+        # Scalar targets (evf, s, cpress) are always predicted.
+        self.drop_targets: List[str] = list(drop_targets) if drop_targets else []
+        _droppable = {"u", "v", "a"}
+        _bad = set(self.drop_targets) - _droppable
+        if _bad:
+            raise ValueError(
+                f"drop_targets must be a subset of {sorted(_droppable)}; got extras: {sorted(_bad)}"
+            )
+        if "u" in self.drop_targets and "v" in self.drop_targets:
+            raise ValueError(
+                "Cannot drop both 'u' and 'v': u must be either predicted directly "
+                "or derived from a predicted v via trapezoidal integration."
+            )
+
         self.use_cpress = use_cpress
         self.per_region_norm = per_region_norm
         self.vector_iso_norm = vector_iso_norm
@@ -791,13 +807,17 @@ class NeedleTissueDataset(Dataset):
         if use_cpress:
             self.INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s", "cpress"]
             self.INPUT_DIMS = [3, 3, 3, 3, 1, 6, 1]
-            self.TARGET_KEYS = ["u", "v", "a", "evf", "s", "cpress"]
-            self.TARGET_DIMS = [3, 3, 3, 1, 6, 1]
+            base_targets = ["u", "v", "a", "evf", "s", "cpress"]
+            base_target_dims = [3, 3, 3, 1, 6, 1]
         else:
             self.INPUT_KEYS = ["coord", "u", "v", "a", "evf", "s"]
             self.INPUT_DIMS = [3, 3, 3, 3, 1, 6]
-            self.TARGET_KEYS = ["u", "v", "a", "evf", "s"]
-            self.TARGET_DIMS = [3, 3, 3, 1, 6]
+            base_targets = ["u", "v", "a", "evf", "s"]
+            base_target_dims = [3, 3, 3, 1, 6]
+        self.TARGET_KEYS = [k for k in base_targets if k not in self.drop_targets]
+        self.TARGET_DIMS = [
+            d for k, d in zip(base_targets, base_target_dims) if k not in self.drop_targets
+        ]
 
         self.split = split
         self.stats_path = stats_path
@@ -1413,6 +1433,29 @@ class NeedleTissueDataset(Dataset):
                 flat_t = all_data[:, self._tissue_idx_t, :].reshape(-1, dim)
                 target_stats[f"{key}_tissue_mean"] = flat_t.mean(0)
                 target_stats[f"{key}_tissue_std"] = flat_t.std(0).clamp(min=1e-8)
+
+        # Estimate the per-rollout-step physical dt from training data:
+        #   Δu(t) = v(t) · dt + O(dt²)   →   dt ≈ <Δu, v> / <v, v>
+        # Saved into target_stats so infer.py can integrate Δv → Δu when the
+        # 'u' target is dropped.  Computed from raw frame_tensors so the
+        # estimate is independent of which targets the model is trained on.
+        du_chunks, v_chunks = [], []
+        for r_idx, run in enumerate(self._run_data):
+            ft = run["frame_tensors"]
+            pair_locals = [t for r, t in self._samples if r == r_idx]
+            t1_locals = [t + 1 for t in pair_locals]
+            du_chunks.append(ft["u"][t1_locals] - ft["u"][pair_locals])
+            v_chunks.append(ft["v"][pair_locals])
+        all_du = torch.cat(du_chunks, dim=0).float().reshape(-1, 3)
+        all_v = torch.cat(v_chunks, dim=0).float().reshape(-1, 3)
+        v_norm = all_v.norm(dim=-1)
+        mask = v_norm > v_norm.max() * 1e-3
+        if mask.any():
+            num = (all_du[mask] * all_v[mask]).sum()
+            den = all_v[mask].pow(2).sum().clamp(min=1e-12)
+            target_stats["rollout_dt"] = torch.tensor([float(num / den)])
+        else:
+            target_stats["rollout_dt"] = torch.tensor([0.0])
 
         return node_stats, target_stats
 
