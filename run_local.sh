@@ -109,6 +109,31 @@ if [ -z "$UV_BIN" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# uv extras selection.  On Windows the project's CUDA wheels are exposed
+# under the `cu12` extra group; on Linux the default lock resolves correctly
+# without one.  Override (any platform) by setting `UV_EXTRAS` to a
+# space-separated list, e.g.  UV_EXTRAS="cu12 dev".  Set UV_EXTRAS="" to
+# explicitly select no extras.
+# ---------------------------------------------------------------------------
+UV_EXTRAS_ARGS=()
+_uname=$(uname -s 2>/dev/null || echo unknown)
+if [ -z "${UV_EXTRAS+x}" ]; then
+    case "$_uname" in
+        MINGW*|MSYS*|CYGWIN*|Windows*)
+            UV_EXTRAS_ARGS=(--extra cu12)
+            ;;
+    esac
+else
+    # User-provided UV_EXTRAS — empty string means "no extras", non-empty is
+    # split on whitespace into individual --extra args.
+    for _extra in $UV_EXTRAS; do
+        UV_EXTRAS_ARGS+=(--extra "$_extra")
+    done
+    unset _extra
+fi
+unset _uname
+
+# ---------------------------------------------------------------------------
 # Parse slurm file: extract train.py invocation + Hydra overrides.
 # Returns: SCRIPT_REL on stdout line 1, then one Hydra token per subsequent
 # line (with shell quotes already stripped).
@@ -164,7 +189,9 @@ trap 'rm -f "$PARSE_STDERR"' EXIT
 
 set +e
 mapfile -t PARSED < <(
-    cd "$PROJECT" && "$UV_BIN" run --project "$PROJECT" python -c "$PARSE_PY" "$SLURM_FILE" \
+    cd "$PROJECT" && "$UV_BIN" run --project "$PROJECT" \
+        ${UV_EXTRAS_ARGS[@]+"${UV_EXTRAS_ARGS[@]}"} \
+        python -c "$PARSE_PY" "$SLURM_FILE" \
         2> "$PARSE_STDERR"
 )
 PARSE_RC=$?
@@ -274,7 +301,13 @@ echo "  Data         : ${DATA_DIR}"
 echo "  Results      : ${EXP_DIR}"
 echo "  bash         : ${BASH_VERSION}"
 echo "  uv           : ${UV_BIN} ($("$UV_BIN" --version 2>&1))"
-echo "  uv python    : $("$UV_BIN" run --project "$PROJECT" python --version 2>&1)"
+echo "  uv python    : $("$UV_BIN" run --project "$PROJECT" \
+    ${UV_EXTRAS_ARGS[@]+"${UV_EXTRAS_ARGS[@]}"} python --version 2>&1)"
+if [ "${#UV_EXTRAS_ARGS[@]}" -gt 0 ]; then
+    echo "  uv extras    : ${UV_EXTRAS_ARGS[*]}"
+else
+    echo "  uv extras    : (none — Linux default lock)"
+fi
 echo "  Overrides    : ${#SLURM_OVERRIDES[@]} from slurm file + ${#COMMON[@]} local"
 echo "----------------------------------------------------------------------"
 printf '  %s\n' "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
@@ -288,11 +321,13 @@ fi
 
 cd "$(dirname "$SCRIPT")"
 echo "[run_local.sh] cd $(pwd)"
-echo "[run_local.sh] launching: uv run python $(basename "$SCRIPT") <overrides>"
+echo "[run_local.sh] launching: uv run ${UV_EXTRAS_ARGS[*]:-} python $(basename "$SCRIPT") <overrides>"
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
     echo "[run_local.sh] DRY_RUN=1 — not executing.  Full command:"
-    printf '%q ' "$UV_BIN" run python "$(basename "$SCRIPT")" "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
+    printf '%q ' "$UV_BIN" run \
+        ${UV_EXTRAS_ARGS[@]+"${UV_EXTRAS_ARGS[@]}"} \
+        python "$(basename "$SCRIPT")" "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
     echo
     exit 0
 fi
@@ -300,7 +335,9 @@ fi
 # Disable -e here so we can capture the rc and print a clear final status —
 # otherwise a non-zero exit from uv/python is reported only as a generic ERR.
 set +e
-"$UV_BIN" run python "$(basename "$SCRIPT")" "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
+"$UV_BIN" run \
+    ${UV_EXTRAS_ARGS[@]+"${UV_EXTRAS_ARGS[@]}"} \
+    python "$(basename "$SCRIPT")" "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
 RC=$?
 set -e
 
