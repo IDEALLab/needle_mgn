@@ -116,7 +116,18 @@ fi
 PARSE_PY=$(cat <<'EOF'
 import os, re, shlex, sys
 
-text = open(sys.argv[1]).read()
+# On Windows, Python's stdout/stderr are in text mode and translate every
+# '\n' to '\r\n'.  bash's `mapfile -t` strips trailing '\n' but not '\r',
+# so without forcing LF here every parsed array element ends up with a
+# stray CR that breaks file-existence checks.  reconfigure() is Python
+# 3.7+; uv ships a recent interpreter so this is always available.
+sys.stdout.reconfigure(newline="\n")
+sys.stderr.reconfigure(newline="\n")
+
+text = open(sys.argv[1], encoding="utf-8").read()
+# Normalise CRLF and lone CR to LF in case the slurm file was authored on
+# Windows; otherwise the line-continuation regex below would not match.
+text = text.replace("\r\n", "\n").replace("\r", "\n")
 # Join shell line continuations so the train.py invocation is on one line.
 joined = re.sub(r"\\\n", " ", text)
 
@@ -159,12 +170,29 @@ mapfile -t PARSED < <(
 PARSE_RC=$?
 set -e
 
-# Strip carriage returns from every parsed token.  On Windows, Python's
-# stdout is in text mode by default, which converts each '\n' to '\r\n'.
-# `mapfile -t` strips the trailing '\n' but not the '\r', so without this
-# fix every array element ends with a stray '\r' that breaks file-existence
-# checks and prints as a cursor-rewind in error messages.
-PARSED=("${PARSED[@]//$'\r'/}")
+# Strip carriage returns from every parsed token.  Belt-and-suspenders with
+# the `sys.stdout.reconfigure(newline="\n")` call inside PARSE_PY: even if a
+# CR somehow survives (shells/locales differ on how `${arr[@]//$'\r'/}` is
+# parsed under MSYS / Git Bash), an explicit per-element strip catches it.
+_CR=$'\r'
+for _i in "${!PARSED[@]}"; do
+    # Remove every CR, anywhere in the element.
+    PARSED[_i]="${PARSED[_i]//${_CR}/}"
+done
+unset _i _CR
+
+# Sanity check: if any token still contains CR, surface that loudly rather
+# than letting a downstream `[ -f path<CR> ]` test silently fail.
+for _tok in "${PARSED[@]}"; do
+    case "$_tok" in
+        *$'\r'*)
+            echo "ERROR: parsed token still contains CR after strip: $(printf %q "$_tok")" >&2
+            echo "  bash version: $BASH_VERSION" >&2
+            exit 1
+            ;;
+    esac
+done
+unset _tok
 
 if [ "$PARSE_RC" -ne 0 ] || [ "${#PARSED[@]}" -lt 1 ]; then
     echo "ERROR: failed to parse $SLURM_FILE (python rc=$PARSE_RC, tokens=${#PARSED[@]})" >&2
