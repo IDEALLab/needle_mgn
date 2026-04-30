@@ -95,16 +95,14 @@ mkdir -p "${EXP_DIR}/checkpoints" "${EXP_DIR}/stats" "${EXP_DIR}/outputs"
 # ---------------------------------------------------------------------------
 # Pre-flight: required tools.  Fail loudly if missing instead of silently
 # letting later steps print no output.
+#
+# Only `uv` is required on PATH — the slurm-file parser and the training
+# script both run via `uv run python`, which uses uv's managed Python and
+# doesn't depend on a system Python install (important on Windows).
 # ---------------------------------------------------------------------------
-PYTHON3_BIN=$(command -v python3 || true)
 UV_BIN=$(command -v uv || true)
-if [ -z "$PYTHON3_BIN" ]; then
-    echo "ERROR: python3 not found on PATH (needed to parse the slurm file)." >&2
-    echo "  PATH=$PATH" >&2
-    exit 127
-fi
 if [ -z "$UV_BIN" ]; then
-    echo "ERROR: uv not found on PATH (needed to launch the training script)." >&2
+    echo "ERROR: uv not found on PATH (needed for both parsing and training)." >&2
     echo "  PATH=$PATH" >&2
     echo "  Install: https://docs.astral.sh/uv/getting-started/installation/" >&2
     exit 127
@@ -154,7 +152,10 @@ PARSE_STDERR=$(mktemp)
 trap 'rm -f "$PARSE_STDERR"' EXIT
 
 set +e
-mapfile -t PARSED < <("$PYTHON3_BIN" -c "$PARSE_PY" "$SLURM_FILE" 2> "$PARSE_STDERR")
+mapfile -t PARSED < <(
+    cd "$PROJECT" && "$UV_BIN" run --project "$PROJECT" python -c "$PARSE_PY" "$SLURM_FILE" \
+        2> "$PARSE_STDERR"
+)
 PARSE_RC=$?
 set -e
 
@@ -235,8 +236,8 @@ echo "  Project      : ${PROJECT}"
 echo "  Data         : ${DATA_DIR}"
 echo "  Results      : ${EXP_DIR}"
 echo "  bash         : ${BASH_VERSION}"
-echo "  python3      : ${PYTHON3_BIN} ($("$PYTHON3_BIN" --version 2>&1))"
 echo "  uv           : ${UV_BIN} ($("$UV_BIN" --version 2>&1))"
+echo "  uv python    : $("$UV_BIN" run --project "$PROJECT" python --version 2>&1)"
 echo "  Overrides    : ${#SLURM_OVERRIDES[@]} from slurm file + ${#COMMON[@]} local"
 echo "----------------------------------------------------------------------"
 printf '  %s\n' "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
