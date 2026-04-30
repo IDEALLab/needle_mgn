@@ -159,11 +159,20 @@ mapfile -t PARSED < <(
 PARSE_RC=$?
 set -e
 
+# Strip carriage returns from every parsed token.  On Windows, Python's
+# stdout is in text mode by default, which converts each '\n' to '\r\n'.
+# `mapfile -t` strips the trailing '\n' but not the '\r', so without this
+# fix every array element ends with a stray '\r' that breaks file-existence
+# checks and prints as a cursor-rewind in error messages.
+PARSED=("${PARSED[@]//$'\r'/}")
+
 if [ "$PARSE_RC" -ne 0 ] || [ "${#PARSED[@]}" -lt 1 ]; then
     echo "ERROR: failed to parse $SLURM_FILE (python rc=$PARSE_RC, tokens=${#PARSED[@]})" >&2
     if [ -s "$PARSE_STDERR" ]; then
         echo "  parser stderr:" >&2
-        sed 's/^/    /' "$PARSE_STDERR" >&2
+        # Strip trailing CR from every line — Python on Windows writes CRLF
+        # to stderr by default, which would otherwise mangle the indentation.
+        sed -e 's/\r$//' -e 's/^/    /' "$PARSE_STDERR" >&2
     else
         echo "  (parser produced no stderr — check the train.py line in $SLURM_FILE)" >&2
     fi
