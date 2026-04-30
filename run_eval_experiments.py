@@ -256,7 +256,7 @@ def main():
         help="Re-run eval even if eval/summary.csv already exists",
     )
     parser.add_argument(
-        "--polyfit_alpha", type=float, default=0.6,
+        "--polyfit_alpha", type=float, default=1,
         help="axial_polyfit_alpha forwarded to infer.py.  Blends the predicted "
              "needle displacement toward its polynomial fit along the needle "
              "axis (preserves bending, suppresses per-node noise).  "

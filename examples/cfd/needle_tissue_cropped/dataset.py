@@ -847,6 +847,7 @@ class NeedleTissueDataset(Dataset):
             # ---- Multi-run mode: split by run, subsample timesteps ----------
             run_files = _group_vtu_by_run(data_dir, timestep_stride)
             run_ids = list(run_files.keys())
+            random.Random(42).shuffle(run_ids)
             n_runs = len(run_ids)
 
             n_train_runs = max(1, int(n_runs * train_fraction))
