@@ -96,6 +96,9 @@ input_dim_edges: 7
 #             (cos θ, cos φ) and equivariant vector message passing.  Set
 #             n_vec_outputs to match the number of 3-D vector output fields
 #             (default 3 for u, v, a).
+#   "tfn"   — Tensor Field Network: fully equivariant spherical-harmonic-based
+#             architecture.  More expensive but encodes strong inductive biases.
+
 model_type: "mgn"
 num_harmonics: 5
 # Number of 3-D vector outputs decoded equivariantly (fiber/tfn model only).
