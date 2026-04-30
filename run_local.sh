@@ -8,6 +8,10 @@
 #   experiment_name  Name matching slurm/<name>.sh (e.g. cropped_base)
 #   data_dir         Path to the RUN-2 directory (default: ./RUN-2)
 #
+# Environment knobs:
+#   DEBUG=1          Verbose tracing (set -x) plus extra environment dumps
+#   DRY_RUN=1        Print the final uv run command but don't execute it
+#
 # Hydra overrides are extracted from slurm/<experiment_name>.sh — the slurm
 # file is the single source of truth for each experiment's configuration.
 # This script substitutes local paths (data_dir, ckpt_path, stats_dir,
@@ -18,9 +22,41 @@
 # Examples:
 #   bash run_local.sh cropped_base
 #   bash run_local.sh cropped_fiber_iso /data/RUN-2
+#   DEBUG=1 bash run_local.sh cropped_tfn_iso
+#   DRY_RUN=1 bash run_local.sh cropped_tfn_iso
 
-set -euo pipefail
+set -Eeuo pipefail
 
+# ---------------------------------------------------------------------------
+# Diagnostics: surface failures that would otherwise be silent.
+# ---------------------------------------------------------------------------
+on_err() {
+    local exit_code=$?
+    local line_no=${1:-?}
+    echo "" >&2
+    echo "[run_local.sh] FAILED at line ${line_no} (exit ${exit_code})" >&2
+    echo "[run_local.sh] last command attempted: ${BASH_COMMAND}" >&2
+    if [ "${DEBUG:-0}" != "1" ]; then
+        echo "[run_local.sh] re-run with DEBUG=1 for full trace" >&2
+    fi
+    exit "$exit_code"
+}
+trap 'on_err $LINENO' ERR
+
+if [ "${DEBUG:-0}" = "1" ]; then
+    set -x
+fi
+
+# Bash 4+ required for `mapfile`.  macOS ships bash 3.2 by default.
+if (( BASH_VERSINFO[0] < 4 )); then
+    echo "ERROR: this script requires bash >= 4 (found ${BASH_VERSION})." >&2
+    echo "  On macOS, install via: brew install bash, then run with: $(brew --prefix)/bin/bash $0 ..." >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Argument handling
+# ---------------------------------------------------------------------------
 PROJECT=$(realpath "$(dirname "$0")")
 SLURM_DIR="${PROJECT}/slurm"
 
@@ -41,19 +77,38 @@ fi
 
 SLURM_FILE="${SLURM_DIR}/${EXP_NAME}.sh"
 if [ ! -f "$SLURM_FILE" ]; then
-    echo "ERROR: slurm file not found: $SLURM_FILE"
-    echo "Run '$0' with no arguments to see available experiments."
+    echo "ERROR: slurm file not found: $SLURM_FILE" >&2
+    echo "Run '$0' with no arguments to see available experiments." >&2
     exit 1
 fi
 
-DATA_DIR=$(realpath "$DATA_DIR")
 if [ ! -d "$DATA_DIR" ]; then
-    echo "ERROR: data_dir not found: $DATA_DIR"
+    echo "ERROR: data_dir not found: $DATA_DIR" >&2
+    echo "  (resolved from arg 2 or default '${PROJECT}/RUN-2')" >&2
     exit 1
 fi
+DATA_DIR=$(realpath "$DATA_DIR")
 
 EXP_DIR="${PROJECT}/experiments/${EXP_NAME}"
 mkdir -p "${EXP_DIR}/checkpoints" "${EXP_DIR}/stats" "${EXP_DIR}/outputs"
+
+# ---------------------------------------------------------------------------
+# Pre-flight: required tools.  Fail loudly if missing instead of silently
+# letting later steps print no output.
+# ---------------------------------------------------------------------------
+PYTHON3_BIN=$(command -v python3 || true)
+UV_BIN=$(command -v uv || true)
+if [ -z "$PYTHON3_BIN" ]; then
+    echo "ERROR: python3 not found on PATH (needed to parse the slurm file)." >&2
+    echo "  PATH=$PATH" >&2
+    exit 127
+fi
+if [ -z "$UV_BIN" ]; then
+    echo "ERROR: uv not found on PATH (needed to launch the training script)." >&2
+    echo "  PATH=$PATH" >&2
+    echo "  Install: https://docs.astral.sh/uv/getting-started/installation/" >&2
+    exit 127
+fi
 
 # ---------------------------------------------------------------------------
 # Parse slurm file: extract train.py invocation + Hydra overrides.
@@ -92,16 +147,33 @@ sys.exit(1)
 EOF
 )
 
-mapfile -t PARSED < <(python3 -c "$PARSE_PY" "$SLURM_FILE")
-if [ ${#PARSED[@]} -lt 1 ]; then
-    echo "ERROR: failed to parse $SLURM_FILE"
+# Capture stderr separately so a parser failure surfaces — the previous
+# version routed parser stderr to the terminal but never confirmed parser
+# success, so an empty parse looked the same as a successful parse.
+PARSE_STDERR=$(mktemp)
+trap 'rm -f "$PARSE_STDERR"' EXIT
+
+set +e
+mapfile -t PARSED < <("$PYTHON3_BIN" -c "$PARSE_PY" "$SLURM_FILE" 2> "$PARSE_STDERR")
+PARSE_RC=$?
+set -e
+
+if [ "$PARSE_RC" -ne 0 ] || [ "${#PARSED[@]}" -lt 1 ]; then
+    echo "ERROR: failed to parse $SLURM_FILE (python rc=$PARSE_RC, tokens=${#PARSED[@]})" >&2
+    if [ -s "$PARSE_STDERR" ]; then
+        echo "  parser stderr:" >&2
+        sed 's/^/    /' "$PARSE_STDERR" >&2
+    else
+        echo "  (parser produced no stderr — check the train.py line in $SLURM_FILE)" >&2
+    fi
     exit 1
 fi
 
 SCRIPT_REL="${PARSED[0]}"
 SCRIPT="${PROJECT}/${SCRIPT_REL}"
 if [ ! -f "$SCRIPT" ]; then
-    echo "ERROR: training script not found: $SCRIPT"
+    echo "ERROR: training script not found: $SCRIPT" >&2
+    echo "  (parsed from slurm file: ${SCRIPT_REL})" >&2
     exit 1
 fi
 
@@ -114,6 +186,13 @@ for tok in "${PARSED[@]:1}"; do
         *) SLURM_OVERRIDES+=("$tok") ;;
     esac
 done
+
+if [ "${#SLURM_OVERRIDES[@]}" -eq 0 ]; then
+    echo "ERROR: parsed slurm file but found 0 Hydra overrides — likely a parser issue." >&2
+    echo "  raw parsed tokens (${#PARSED[@]}):" >&2
+    printf '    %s\n' "${PARSED[@]}" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Local environment + path overrides
@@ -143,3 +222,56 @@ COMMON=(
     "hydra.run.dir=${EXP_DIR}/outputs"
     cuda_devices=null
 )
+
+# ---------------------------------------------------------------------------
+# Diagnostic banner — visible on every run so failures inside uv/python don't
+# look like silent exits.
+# ---------------------------------------------------------------------------
+echo "======================================================================"
+echo "  Experiment   : ${EXP_NAME}"
+echo "  Slurm file   : ${SLURM_FILE}"
+echo "  Script       : ${SCRIPT}"
+echo "  Project      : ${PROJECT}"
+echo "  Data         : ${DATA_DIR}"
+echo "  Results      : ${EXP_DIR}"
+echo "  bash         : ${BASH_VERSION}"
+echo "  python3      : ${PYTHON3_BIN} ($("$PYTHON3_BIN" --version 2>&1))"
+echo "  uv           : ${UV_BIN} ($("$UV_BIN" --version 2>&1))"
+echo "  Overrides    : ${#SLURM_OVERRIDES[@]} from slurm file + ${#COMMON[@]} local"
+echo "----------------------------------------------------------------------"
+printf '  %s\n' "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
+echo "======================================================================"
+
+if [ "${DEBUG:-0}" = "1" ]; then
+    echo "[debug] env (filtered):"
+    env | grep -E '^(CUDA|RANK|LOCAL_RANK|WORLD_SIZE|MASTER|UV_|WARP_|WANDB_|MKL)' | sed 's/^/  /'
+    echo "[debug] cwd: $(pwd)"
+fi
+
+cd "$(dirname "$SCRIPT")"
+echo "[run_local.sh] cd $(pwd)"
+echo "[run_local.sh] launching: uv run python $(basename "$SCRIPT") <overrides>"
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[run_local.sh] DRY_RUN=1 — not executing.  Full command:"
+    printf '%q ' "$UV_BIN" run python "$(basename "$SCRIPT")" "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
+    echo
+    exit 0
+fi
+
+# Disable -e here so we can capture the rc and print a clear final status —
+# otherwise a non-zero exit from uv/python is reported only as a generic ERR.
+set +e
+"$UV_BIN" run python "$(basename "$SCRIPT")" "${SLURM_OVERRIDES[@]}" "${COMMON[@]}"
+RC=$?
+set -e
+
+echo "======================================================================"
+if [ "$RC" -eq 0 ]; then
+    echo "[run_local.sh] training exited cleanly (rc=0)"
+else
+    echo "[run_local.sh] training FAILED (rc=$RC)" >&2
+fi
+echo "  Results in: ${EXP_DIR}"
+echo "======================================================================"
+exit "$RC"
