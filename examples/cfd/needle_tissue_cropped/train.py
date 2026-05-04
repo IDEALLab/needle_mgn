@@ -121,6 +121,11 @@ class MGNTrainer:
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         val_dataset = NeedleTissueDataset(split="validation", **_shared_dataset_kwargs)
+        # Stash so validation() can label its rel-err output by the actual
+        # TARGET_KEYS (which depend on use_cpress and drop_targets) rather
+        # than the previously-hardcoded ["u","v","a"].
+        self._target_keys = train_dataset.TARGET_KEYS
+        self._target_dims = train_dataset.TARGET_DIMS
 
         train_sampler = DistributedSampler(
             train_dataset,
@@ -310,8 +315,13 @@ class MGNTrainer:
 
     @torch.no_grad()
     def validation(self):
-        keys = ["u", "v", "a"]
-        dims = [3, 3, 3]
+        # Use the dataset's actual TARGET_KEYS so the labels track
+        # use_cpress and drop_targets — otherwise (e.g. with
+        # drop_targets=[u,a,evf] the output is [v(3), s(6)] but the
+        # logged "val_u_rel_err" was secretly the v error and "val_v_rel_err"
+        # / "val_a_rel_err" were halves of the stress error.
+        keys = self._target_keys
+        dims = self._target_dims
         errors = {k: 0.0 for k in keys}
 
         for batch in self.val_dataloader:
