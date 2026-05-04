@@ -448,13 +448,16 @@ def _apply_needle_edge_cap(
 
 
 def _split_tfn_features(
-    x: torch.Tensor, use_cpress: bool
+    x: torch.Tensor, use_cpress: bool, mgn_paper_features: bool = False
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Split flat node features into (x_scalar, x_vec) for TFNMeshGraphNet.
 
     Mirrors ``NeedleTissueDataset._split_tfn_features``.  Coordinates are
-    excluded for translational equivariance.
+    excluded for translational equivariance.  In MGN-paper mode, ``x`` is
+    already a (N, 2) node-type one-hot — all scalar, no vector components.
     """
+    if mgn_paper_features:
+        return x, x.new_zeros(x.shape[0], 0)
     if use_cpress:
         x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
         x_scalar = torch.cat([x[:, 12:23], x[:, 26:30]], dim=-1)
@@ -479,6 +482,9 @@ def _build_step_graph(
     tissue_idx_t: Optional[torch.Tensor] = None,
     fiber_dir_full: Optional[torch.Tensor] = None,
     use_cpress: bool = True,
+    mgn_paper_features: bool = False,
+    mgn_node_features: Optional[torch.Tensor] = None,
+    mgn_ref_pos: Optional[torch.Tensor] = None,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -499,14 +505,33 @@ def _build_step_graph(
             all_et = torch.cat([sub_et_hex, world_et[keep]], dim=0)
 
     coord_sub = state["coord"][part_nodes]
-    x_sub = _normalize(
-        state, node_props, node_stats, input_keys, needle_idx_t, tissue_idx_t
-    )[part_nodes]
+
+    if mgn_paper_features:
+        # MGN paper input scheme: 2-dim node-type one-hot, edge_attr augmented
+        # with mesh-space rel_pos (and its norm).  Layout matches dataset.py.
+        if mgn_node_features is None or mgn_ref_pos is None:
+            raise RuntimeError(
+                "mgn_paper_features=True requires mgn_node_features and "
+                "mgn_ref_pos to be supplied."
+            )
+        x_sub = mgn_node_features[part_nodes]
+        ref_pos_sub = mgn_ref_pos[part_nodes]
+    else:
+        x_sub = _normalize(
+            state, node_props, node_stats, input_keys, needle_idx_t, tissue_idx_t
+        )[part_nodes]
 
     src, dst = all_ei
     rel_pos = coord_sub[src] - coord_sub[dst]
     edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
-    edge_attr = torch.cat([rel_pos, edge_len, all_et], dim=-1)
+    if mgn_paper_features:
+        mesh_rel = ref_pos_sub[src] - ref_pos_sub[dst]
+        mesh_d = torch.linalg.norm(mesh_rel, dim=-1, keepdim=True)
+        edge_attr = torch.cat(
+            [rel_pos, edge_len, mesh_rel, mesh_d, all_et], dim=-1
+        )
+    else:
+        edge_attr = torch.cat([rel_pos, edge_len, all_et], dim=-1)
 
     # Unit fiber direction per node (passed through to FiberEquivariantMGN).
     fiber_dir_sub = None
@@ -514,7 +539,9 @@ def _build_step_graph(
         fiber_dir_sub = fiber_dir_full[part_nodes]
 
     # Split into scalar/vector parts for TFNMeshGraphNet.
-    x_scalar_sub, x_vec_sub = _split_tfn_features(x_sub, use_cpress)
+    x_scalar_sub, x_vec_sub = _split_tfn_features(
+        x_sub, use_cpress, mgn_paper_features=mgn_paper_features
+    )
 
     return Data(
         x=x_sub,
@@ -658,8 +685,16 @@ def main(cfg: DictConfig) -> None:
         target_dims = [d for _, d in keep]
         print(f"  drop_targets: {drop_targets} → predicting {target_keys}")
 
-    input_dim_nodes = sum(input_dims) + sum(_STATIC_PROP_DIMS)
-    output_dim      = sum(target_dims)
+    # MGN-paper feature scheme: node-type one-hot + edge_attr augmented with
+    # mesh-space rel_pos.  Must match the dataset construction at training
+    # time.  When enabled, input_dim_nodes is 2 regardless of use_cpress.
+    mgn_paper_features = bool(OmegaConf.select(cfg, "mgn_paper_features", default=False))
+    if mgn_paper_features:
+        input_dim_nodes = 2
+        print("  mgn_paper_features=true: 2-dim node-type one-hot input")
+    else:
+        input_dim_nodes = sum(input_dims) + sum(_STATIC_PROP_DIMS)
+    output_dim = sum(target_dims)
 
     print(
         f"Rollout: start_frame={infer_start}, n_rollout={n_rollout}, "
@@ -707,15 +742,20 @@ def main(cfg: DictConfig) -> None:
             num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
         )
     elif model_type == "tfn":
-        n_tfn_scalar = 15 if use_cpress else 14
+        if mgn_paper_features:
+            n_tfn_scalar, n_tfn_vec = 2, 0
+        else:
+            n_tfn_scalar = 15 if use_cpress else 14
+            n_tfn_vec = 4
         model = TFNMeshGraphNet(
             n_node_scalar=n_tfn_scalar,
-            n_node_vec=4,
+            n_node_vec=n_tfn_vec,
             output_dim=output_dim,
             irreps_hidden=str(OmegaConf.select(cfg, "irreps_hidden", default="16x0e + 8x1o + 4x2e")),
             l_max=int(OmegaConf.select(cfg, "l_max", default=2)),
             n_radial_basis=int(OmegaConf.select(cfg, "n_radial_basis", default=8)),
             r_max=float(OmegaConf.select(cfg, "r_max", default=60.0)),
+            n_edge_extra_scalar=int(cfg.input_dim_edges) - 3,
             processor_size=cfg.processor_size,
             n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
             checkpoint_layers=False,  # not needed at inference; model.eval() disables it anyway
@@ -850,6 +890,26 @@ def main(cfg: DictConfig) -> None:
         fiber_dir_full = _fiber_raw / _fiber_norm       # (N, 3) unit vectors
     else:
         fiber_dir_full = None
+
+    # MGN-paper feature precomputation — match dataset.py: 2-dim node-type
+    # one-hot per node, and per-run reference positions (frame-0 coord minus
+    # frame-0 displacement) for mesh-space rel_pos in the edge encoder.
+    if mgn_paper_features:
+        mgn_node_features = torch.zeros(n_nodes, 2, dtype=torch.float32)
+        mgn_node_features[needle_node_indices, 0] = 1.0
+        mgn_node_features[tissue_node_indices, 1] = 1.0
+        mgn_ref_pos = (
+            frame_tensors["coord"][0] - frame_tensors["u"][0]
+        ).float()
+        print(
+            f"  mgn_paper_features: edge_attr expanded to "
+            f"{cfg.input_dim_edges}-dim "
+            f"[world_rel(3), world_d(1), mesh_rel(3), mesh_d(1), edge_type(3)]"
+        )
+    else:
+        mgn_node_features = None
+        mgn_ref_pos = None
+
     print(
         f"Node sets: {len(needle_node_indices)} needle, "
         f"{len(tissue_node_indices)} tissue (total {n_nodes})"
@@ -988,6 +1048,9 @@ def main(cfg: DictConfig) -> None:
                 tissue_idx_t=tissue_idx_t,
                 fiber_dir_full=fiber_dir_full,
                 use_cpress=use_cpress,
+                mgn_paper_features=mgn_paper_features,
+                mgn_node_features=mgn_node_features,
+                mgn_ref_pos=mgn_ref_pos,
             )
             graph = graph.to(dist.device)
             if model_type == "bistride":

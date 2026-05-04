@@ -776,6 +776,7 @@ class NeedleTissueDataset(Dataset):
         vector_iso_norm: bool = False,
         needle_fiber_axis: bool = False,
         drop_targets: Optional[List[str]] = None,
+        mgn_paper_features: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -786,10 +787,11 @@ class NeedleTissueDataset(Dataset):
                 "(per-region stats reintroduce anisotropic per-component scaling)."
             )
 
-        # Validate drop_targets: only the kinematic vector targets can be dropped.
-        # Scalar targets (evf, s, cpress) are always predicted.
+        # Validate drop_targets: kinematic vector targets (u/v/a) and the
+        # scalar evf can be dropped.  Stress (s) and contact pressure (cpress)
+        # are always predicted unless cpress is disabled via use_cpress.
         self.drop_targets: List[str] = list(drop_targets) if drop_targets else []
-        _droppable = {"u", "v", "a"}
+        _droppable = {"u", "v", "a", "evf"}
         _bad = set(self.drop_targets) - _droppable
         if _bad:
             raise ValueError(
@@ -800,6 +802,7 @@ class NeedleTissueDataset(Dataset):
                 "Cannot drop both 'u' and 'v': u must be either predicted directly "
                 "or derived from a predicted v via trapezoidal integration."
             )
+        self.mgn_paper_features = mgn_paper_features
 
         self.use_cpress = use_cpress
         self.per_region_norm = per_region_norm
@@ -1069,6 +1072,30 @@ class NeedleTissueDataset(Dataset):
             f"| crops: {', '.join(active)}"
         )
 
+        # ---- MGN paper features precomputation -------------------------------
+        # Pfaff et al. (MGN, 2020) Section "Hyperelastic plate" use a minimal
+        # input scheme: node-type one-hot per node, and per-edge [world_rel(3),
+        # world_dist(1), mesh_rel(3), mesh_dist(1), edge_type_onehot(3)].  All
+        # state-derived inputs (u, v, a, evf, s, cpress) and material props
+        # are dropped from x.  The mesh-space rel_pos is the rest-state edge
+        # vector — constant across time — which encodes the undeformed
+        # geometry; the world-space rel_pos encodes the current deformation.
+        if self.mgn_paper_features:
+            nt = torch.zeros(self.n_nodes, 2, dtype=torch.float32)
+            nt[self._needle_idx_t, 0] = 1.0
+            nt[self._tissue_idx_t, 1] = 1.0
+            self._mgn_node_features = nt
+            # Reference positions per run: frame-0 coord minus frame-0
+            # displacement.  This is the rest configuration — fixed in time.
+            self._mgn_ref_pos_per_run: List[torch.Tensor] = []
+            for run in self._run_data:
+                ft = run["frame_tensors"]
+                ref_pos = (ft["coord"][0] - ft["u"][0]).float()
+                self._mgn_ref_pos_per_run.append(ref_pos)
+        else:
+            self._mgn_node_features = None
+            self._mgn_ref_pos_per_run = None
+
         # ---- Needle-tangent override of mat_fiber ---------------------------
         # mat_fiber as exported by odb_to_mgn_input.py is zero on needle nodes
         # (only tissue gets the orientation axis1).  When needle_fiber_axis=true
@@ -1102,7 +1129,14 @@ class NeedleTissueDataset(Dataset):
 
     @property
     def input_dim_nodes(self) -> int:
-        """Total node feature dimension: dynamic inputs + static material props."""
+        """Total node feature dimension: dynamic inputs + static material props.
+
+        With ``mgn_paper_features=True`` the model sees only a 2-dim node-type
+        one-hot and all dynamic / static state goes into the edge features,
+        matching Pfaff et al. (2020).
+        """
+        if self.mgn_paper_features:
+            return 2
         return sum(self.INPUT_DIMS) + sum(self.STATIC_PROP_DIMS)
 
     @property
@@ -1113,11 +1147,15 @@ class NeedleTissueDataset(Dataset):
     @property
     def n_tfn_scalar(self) -> int:
         """Number of scalar node features for TFNMeshGraphNet (excludes coord and vectors)."""
+        if self.mgn_paper_features:
+            return 2
         return 15 if self.use_cpress else 14
 
     @property
     def n_tfn_vec(self) -> int:
         """Number of 3-D vector node features for TFNMeshGraphNet (u, v, a, mat_fiber)."""
+        if self.mgn_paper_features:
+            return 0
         return 4
 
     def _split_tfn_features(
@@ -1147,6 +1185,9 @@ class NeedleTissueDataset(Dataset):
         x_vec : torch.Tensor
             Shape ``(N, n_tfn_vec * 3)`` — consecutive xyz per vector.
         """
+        if self.mgn_paper_features:
+            # x is already a (N, 2) one-hot — all scalar, no vectors.
+            return x, x.new_zeros(x.shape[0], 0)
         if self.use_cpress:
             # x_vec: u[3:6], v[6:9], a[9:12], mat_fiber[23:26]
             x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
@@ -1343,6 +1384,21 @@ class NeedleTissueDataset(Dataset):
         rel_pos = coord_sub[src] - coord_sub[dst]
         edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
         edge_attr = torch.cat([rel_pos, edge_len, all_et], dim=-1)
+
+        # MGN-paper feature override: replace x with node-type one-hot and
+        # augment edge_attr with mesh-space rel-pos and its norm.  Layout
+        # chosen so the first 4 columns of edge_attr are still
+        # [world_rel(3), world_dist(1)] — matching what MeshGraphNet,
+        # FiberEquivariantMGN and TFNMeshGraphNet read for the unit-edge
+        # vector — and the rest is "extra scalar" content.
+        if self.mgn_paper_features:
+            x_sub = self._mgn_node_features[part_nodes]
+            ref_pos_sub = self._mgn_ref_pos_per_run[r_idx][part_nodes]
+            mesh_rel = ref_pos_sub[src] - ref_pos_sub[dst]
+            mesh_d = torch.linalg.norm(mesh_rel, dim=-1, keepdim=True)
+            edge_attr = torch.cat(
+                [rel_pos, edge_len, mesh_rel, mesh_d, all_et], dim=-1
+            )
 
         # Unit fiber direction per node (for FiberEquivariantMGN).
         # mat_fiber is a 3-D material axis stored in node_props; normalise to unit length.

@@ -111,6 +111,16 @@ needle_fiber_axis: false
 drop_targets: []
 rollout_dt: null
 
+# Pfaff et al. (MGN, 2020) input scheme.  When true:
+#   - Node features are reduced to a 2-dim node-type one-hot
+#     [needle, tissue]; all dynamic/static state inputs are dropped.
+#   - Edge features are augmented from 7-dim to 11-dim:
+#     [world_rel(3), world_dist(1), mesh_rel(3), mesh_dist(1), edge_type(3)].
+#   - Set input_dim_edges=11 in the slurm script to match.
+# Pair with drop_targets=[u,a,evf] + use_cpress=false to predict only the
+# MGN-paper outputs (Lagrangian velocity v + von Mises / Voigt stress s).
+mgn_paper_features: false
+
 # -------------------------
 # Model architecture
 # -------------------------

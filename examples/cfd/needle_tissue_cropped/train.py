@@ -117,6 +117,7 @@ class MGNTrainer:
             vector_iso_norm=bool(cfg.get("vector_iso_norm", False)),
             needle_fiber_axis=bool(cfg.get("needle_fiber_axis", False)),
             drop_targets=list(cfg.get("drop_targets", []) or []),
+            mgn_paper_features=bool(cfg.get("mgn_paper_features", False)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         val_dataset = NeedleTissueDataset(split="validation", **_shared_dataset_kwargs)
@@ -186,6 +187,9 @@ class MGNTrainer:
             )
         elif model_type == "tfn":
             n_tfn_scalar = train_dataset.n_tfn_scalar
+            # n_edge_extra_scalar = (everything in edge_attr after the first 3
+            # columns of physical rel_pos).  Standard layout: 7 - 3 = 4.
+            # MGN-paper layout: 11 - 3 = 8.
             self.model = TFNMeshGraphNet(
                 n_node_scalar=n_tfn_scalar,
                 n_node_vec=train_dataset.n_tfn_vec,
@@ -194,6 +198,7 @@ class MGNTrainer:
                 l_max=int(cfg.get("l_max", 2)),
                 n_radial_basis=int(cfg.get("n_radial_basis", 8)),
                 r_max=float(cfg.get("r_max", 60.0)),
+                n_edge_extra_scalar=int(cfg.input_dim_edges) - 3,
                 processor_size=cfg.processor_size,
                 n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
                 checkpoint_layers=bool(cfg.get("tfn_checkpoint_layers", True)),
