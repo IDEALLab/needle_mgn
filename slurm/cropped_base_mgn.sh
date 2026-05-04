@@ -11,21 +11,27 @@
 #SBATCH --error=/home/nhoffma1/scratch.fuge-prj/needle_mgn/experiments/cropped_base_mgn/slurm-%j.err
 
 # Experiment: cropped_base trained with the MGN-paper feature scheme
-# (Pfaff et al. 2020, "Hyperelastic plate" example).
+# (Pfaff et al. 2020, "Hyperelastic plate" example) + mat_fiber as a node
+# input.
 #
 # Inputs:
-#   - Per node: 2-dim node-type one-hot [needle, tissue]
+#   - Per node: [node_type one-hot(2), unit fiber direction(3)]   = 5 dims
 #   - Per edge: [world_rel(3), world_d(1), mesh_rel(3), mesh_d(1),
 #                edge_type_onehot(3)]   = 11 dims
+#     World/contact edges have the mesh_rel/mesh_d block zeroed
+#     (those nodes were disjoint in the rest mesh).
 # Outputs:
 #   - Lagrangian (world-space) velocity v (3 dims)
 #   - Cauchy stress voigt s (6 dims)
 #   - Total output_dim = 9
 #
-# All state inputs (u, v, a, evf, s, cpress) and material props are dropped
-# from x; the model has to infer everything from the per-edge mesh+world
-# geometry and the node type.  Drop u, a, evf via drop_targets and disable
-# cpress via use_cpress=false to leave only [v, s] as predicted targets.
+# All state inputs (u, v, a, evf, s, cpress) and other material props are
+# dropped from x; the model gets node_type, the rest-state fiber direction,
+# and the mesh+world edge geometry — closer to the MGN-paper input scheme
+# than the full feature setup but with the per-node anisotropy that the
+# tissue's transverse-isotropic constitutive model encodes.  needle_fiber_axis
+# is on so needle nodes get the principal-axis vector instead of a zero
+# fiber input.
 
 module load apptainer
 
@@ -71,6 +77,8 @@ apptainer exec --nv \
         hidden_dim_processor=256 \
         processor_size=15 \
         ++mgn_paper_features=true \
+        ++mgn_include_mat_fiber=true \
+        ++needle_fiber_axis=true \
         input_dim_edges=11 \
         'drop_targets=[u,a,evf]' \
         save_every=10 \

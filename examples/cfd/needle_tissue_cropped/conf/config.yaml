@@ -121,6 +121,15 @@ rollout_dt: null
 # MGN-paper outputs (Lagrangian velocity v + von Mises / Voigt stress s).
 mgn_paper_features: false
 
+# Append unit fiber direction (3-dim 1o vector) to the MGN-paper input.
+# Only meaningful when mgn_paper_features=true.  For TFN this becomes the
+# only ``x_vec`` channel (n_node_vec=1); for base/fiber it concatenates onto
+# x as 3 extra scalar dims (input_dim_nodes 2 → 5).  When pairing with this
+# flag, also enable needle_fiber_axis=true so needle nodes get a non-zero
+# fiber direction (otherwise mat_fiber is [0,0,0] for every needle node by
+# default and the appended channel is uninformative there).
+mgn_include_mat_fiber: false
+
 # -------------------------
 # Model architecture
 # -------------------------

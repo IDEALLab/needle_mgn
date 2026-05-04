@@ -777,6 +777,7 @@ class NeedleTissueDataset(Dataset):
         needle_fiber_axis: bool = False,
         drop_targets: Optional[List[str]] = None,
         mgn_paper_features: bool = False,
+        mgn_include_mat_fiber: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -803,6 +804,12 @@ class NeedleTissueDataset(Dataset):
                 "or derived from a predicted v via trapezoidal integration."
             )
         self.mgn_paper_features = mgn_paper_features
+        self.mgn_include_mat_fiber = mgn_include_mat_fiber
+        if mgn_include_mat_fiber and not mgn_paper_features:
+            raise ValueError(
+                "mgn_include_mat_fiber only applies when mgn_paper_features=True; "
+                "in the standard input scheme mat_fiber is already a static prop."
+            )
 
         self.use_cpress = use_cpress
         self.per_region_norm = per_region_norm
@@ -1133,10 +1140,11 @@ class NeedleTissueDataset(Dataset):
 
         With ``mgn_paper_features=True`` the model sees only a 2-dim node-type
         one-hot and all dynamic / static state goes into the edge features,
-        matching Pfaff et al. (2020).
+        matching Pfaff et al. (2020).  With ``mgn_include_mat_fiber=True``
+        the unit fiber direction is appended (3 extra dims).
         """
         if self.mgn_paper_features:
-            return 2
+            return 2 + (3 if self.mgn_include_mat_fiber else 0)
         return sum(self.INPUT_DIMS) + sum(self.STATIC_PROP_DIMS)
 
     @property
@@ -1148,6 +1156,8 @@ class NeedleTissueDataset(Dataset):
     def n_tfn_scalar(self) -> int:
         """Number of scalar node features for TFNMeshGraphNet (excludes coord and vectors)."""
         if self.mgn_paper_features:
+            # node_type one-hot is the only scalar input; mat_fiber, when
+            # included, is a 1o vector and goes to x_vec.
             return 2
         return 15 if self.use_cpress else 14
 
@@ -1155,7 +1165,7 @@ class NeedleTissueDataset(Dataset):
     def n_tfn_vec(self) -> int:
         """Number of 3-D vector node features for TFNMeshGraphNet (u, v, a, mat_fiber)."""
         if self.mgn_paper_features:
-            return 0
+            return 1 if self.mgn_include_mat_fiber else 0
         return 4
 
     def _split_tfn_features(
@@ -1186,7 +1196,10 @@ class NeedleTissueDataset(Dataset):
             Shape ``(N, n_tfn_vec * 3)`` — consecutive xyz per vector.
         """
         if self.mgn_paper_features:
-            # x is already a (N, 2) one-hot — all scalar, no vectors.
+            if self.mgn_include_mat_fiber:
+                # x layout: [node_type(2), mat_fiber(3)].  Split into the
+                # 2 scalars and the 1 trailing 3-D vector.
+                return x[:, :2], x[:, 2:5]
             return x, x.new_zeros(x.shape[0], 0)
         if self.use_cpress:
             # x_vec: u[3:6], v[6:9], a[9:12], mat_fiber[23:26]
@@ -1385,26 +1398,41 @@ class NeedleTissueDataset(Dataset):
         edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
         edge_attr = torch.cat([rel_pos, edge_len, all_et], dim=-1)
 
+        # Unit fiber direction per node (for FiberEquivariantMGN, and as an
+        # optional input under mgn_include_mat_fiber).  mat_fiber is a 3-D
+        # material axis stored in node_props; normalise to unit length.
+        fiber_raw = node_props["mat_fiber"]  # (n_nodes, 3) float32
+        fiber_norm = torch.linalg.norm(fiber_raw, dim=-1, keepdim=True).clamp(min=1e-8)
+        fiber_dir = (fiber_raw / fiber_norm)[part_nodes]  # (n_sub, 3)
+
         # MGN-paper feature override: replace x with node-type one-hot and
         # augment edge_attr with mesh-space rel-pos and its norm.  Layout
         # chosen so the first 4 columns of edge_attr are still
         # [world_rel(3), world_dist(1)] — matching what MeshGraphNet,
         # FiberEquivariantMGN and TFNMeshGraphNet read for the unit-edge
         # vector — and the rest is "extra scalar" content.
+        #
+        # Per Pfaff et al. (2020) Table 1, the *world* (contact) edges only
+        # receive world-space rel-pos and its norm; the mesh-space block is
+        # zeroed because contact edges connect nodes that were disjoint in
+        # the rest-state mesh and so have no meaningful mesh-space vector.
+        # Mesh edges (hex needle/tissue connectivity) get both blocks.
         if self.mgn_paper_features:
             x_sub = self._mgn_node_features[part_nodes]
+            if self.mgn_include_mat_fiber:
+                # Append unit fiber direction.  For TFN, _split_tfn_features
+                # peels this off into x_vec as a 1o feature.
+                x_sub = torch.cat([x_sub, fiber_dir], dim=-1)
             ref_pos_sub = self._mgn_ref_pos_per_run[r_idx][part_nodes]
             mesh_rel = ref_pos_sub[src] - ref_pos_sub[dst]
             mesh_d = torch.linalg.norm(mesh_rel, dim=-1, keepdim=True)
+            is_world = all_et[:, 2] > 0.5
+            if is_world.any():
+                mesh_rel[is_world] = 0.0
+                mesh_d[is_world] = 0.0
             edge_attr = torch.cat(
                 [rel_pos, edge_len, mesh_rel, mesh_d, all_et], dim=-1
             )
-
-        # Unit fiber direction per node (for FiberEquivariantMGN).
-        # mat_fiber is a 3-D material axis stored in node_props; normalise to unit length.
-        fiber_raw = node_props["mat_fiber"]  # (n_nodes, 3) float32
-        fiber_norm = torch.linalg.norm(fiber_raw, dim=-1, keepdim=True).clamp(min=1e-8)
-        fiber_dir = (fiber_raw / fiber_norm)[part_nodes]  # (n_sub, 3)
 
         # Split x into scalar and vector parts for TFNMeshGraphNet.
         x_scalar_sub, x_vec_sub = self._split_tfn_features(x_sub)

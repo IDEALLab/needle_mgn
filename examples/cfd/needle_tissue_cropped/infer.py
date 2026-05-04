@@ -448,15 +448,21 @@ def _apply_needle_edge_cap(
 
 
 def _split_tfn_features(
-    x: torch.Tensor, use_cpress: bool, mgn_paper_features: bool = False
+    x: torch.Tensor,
+    use_cpress: bool,
+    mgn_paper_features: bool = False,
+    mgn_include_mat_fiber: bool = False,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Split flat node features into (x_scalar, x_vec) for TFNMeshGraphNet.
 
     Mirrors ``NeedleTissueDataset._split_tfn_features``.  Coordinates are
     excluded for translational equivariance.  In MGN-paper mode, ``x`` is
-    already a (N, 2) node-type one-hot — all scalar, no vector components.
+    a (N, 2) node-type one-hot, optionally followed by a (N, 3) mat_fiber
+    1o vector when ``mgn_include_mat_fiber`` is set.
     """
     if mgn_paper_features:
+        if mgn_include_mat_fiber:
+            return x[:, :2], x[:, 2:5]
         return x, x.new_zeros(x.shape[0], 0)
     if use_cpress:
         x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
@@ -485,6 +491,7 @@ def _build_step_graph(
     mgn_paper_features: bool = False,
     mgn_node_features: Optional[torch.Tensor] = None,
     mgn_ref_pos: Optional[torch.Tensor] = None,
+    mgn_include_mat_fiber: bool = False,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -515,6 +522,13 @@ def _build_step_graph(
                 "mgn_ref_pos to be supplied."
             )
         x_sub = mgn_node_features[part_nodes]
+        if mgn_include_mat_fiber:
+            if fiber_dir_full is None:
+                raise RuntimeError(
+                    "mgn_include_mat_fiber=True but fiber_dir_full is None — "
+                    "node_props must contain mat_fiber."
+                )
+            x_sub = torch.cat([x_sub, fiber_dir_full[part_nodes]], dim=-1)
         ref_pos_sub = mgn_ref_pos[part_nodes]
     else:
         x_sub = _normalize(
@@ -525,8 +539,15 @@ def _build_step_graph(
     rel_pos = coord_sub[src] - coord_sub[dst]
     edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
     if mgn_paper_features:
+        # Per Pfaff et al. (2020): only mesh edges carry mesh-space rel-pos.
+        # World/contact edges get zeros there since the connected nodes were
+        # disjoint in the rest-state mesh.  Must match dataset.py exactly.
         mesh_rel = ref_pos_sub[src] - ref_pos_sub[dst]
         mesh_d = torch.linalg.norm(mesh_rel, dim=-1, keepdim=True)
+        is_world = all_et[:, 2] > 0.5
+        if is_world.any():
+            mesh_rel[is_world] = 0.0
+            mesh_d[is_world] = 0.0
         edge_attr = torch.cat(
             [rel_pos, edge_len, mesh_rel, mesh_d, all_et], dim=-1
         )
@@ -540,7 +561,10 @@ def _build_step_graph(
 
     # Split into scalar/vector parts for TFNMeshGraphNet.
     x_scalar_sub, x_vec_sub = _split_tfn_features(
-        x_sub, use_cpress, mgn_paper_features=mgn_paper_features
+        x_sub,
+        use_cpress,
+        mgn_paper_features=mgn_paper_features,
+        mgn_include_mat_fiber=mgn_include_mat_fiber,
     )
 
     return Data(
@@ -687,11 +711,16 @@ def main(cfg: DictConfig) -> None:
 
     # MGN-paper feature scheme: node-type one-hot + edge_attr augmented with
     # mesh-space rel_pos.  Must match the dataset construction at training
-    # time.  When enabled, input_dim_nodes is 2 regardless of use_cpress.
+    # time.  When enabled, input_dim_nodes is 2 regardless of use_cpress
+    # (or 5 if mgn_include_mat_fiber adds the unit fiber direction).
     mgn_paper_features = bool(OmegaConf.select(cfg, "mgn_paper_features", default=False))
+    mgn_include_mat_fiber = bool(OmegaConf.select(cfg, "mgn_include_mat_fiber", default=False))
     if mgn_paper_features:
-        input_dim_nodes = 2
-        print("  mgn_paper_features=true: 2-dim node-type one-hot input")
+        input_dim_nodes = 2 + (3 if mgn_include_mat_fiber else 0)
+        print(
+            f"  mgn_paper_features=true: input_dim_nodes={input_dim_nodes} "
+            f"({'node_type(2) + mat_fiber(3)' if mgn_include_mat_fiber else 'node_type(2)'})"
+        )
     else:
         input_dim_nodes = sum(input_dims) + sum(_STATIC_PROP_DIMS)
     output_dim = sum(target_dims)
@@ -743,7 +772,8 @@ def main(cfg: DictConfig) -> None:
         )
     elif model_type == "tfn":
         if mgn_paper_features:
-            n_tfn_scalar, n_tfn_vec = 2, 0
+            n_tfn_scalar = 2
+            n_tfn_vec = 1 if mgn_include_mat_fiber else 0
         else:
             n_tfn_scalar = 15 if use_cpress else 14
             n_tfn_vec = 4
@@ -1051,6 +1081,7 @@ def main(cfg: DictConfig) -> None:
                 mgn_paper_features=mgn_paper_features,
                 mgn_node_features=mgn_node_features,
                 mgn_ref_pos=mgn_ref_pos,
+                mgn_include_mat_fiber=mgn_include_mat_fiber,
             )
             graph = graph.to(dist.device)
             if model_type == "bistride":
