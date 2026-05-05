@@ -74,7 +74,9 @@ apptainer exec --nv \
         ++needle_fiber_axis=true \
         ++mgn_paper_features=true \
         ++mgn_include_prev_v=true \
+        ++mgn_include_evf=true \
+        ++mgn_kinematic_needle_only=true \
         input_dim_edges=11 \
-        'drop_targets=[u,a,evf]' \
+        'drop_targets=[u,a]' \
         save_every=10 \
         cuda_devices=null

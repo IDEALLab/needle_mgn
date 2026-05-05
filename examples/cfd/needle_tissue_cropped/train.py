@@ -120,6 +120,8 @@ class MGNTrainer:
             mgn_paper_features=bool(cfg.get("mgn_paper_features", False)),
             mgn_include_mat_fiber=bool(cfg.get("mgn_include_mat_fiber", False)),
             mgn_include_prev_v=bool(cfg.get("mgn_include_prev_v", False)),
+            mgn_include_evf=bool(cfg.get("mgn_include_evf", False)),
+            mgn_kinematic_needle_only=bool(cfg.get("mgn_kinematic_needle_only", False)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         val_dataset = NeedleTissueDataset(split="validation", **_shared_dataset_kwargs)
@@ -296,6 +298,13 @@ class MGNTrainer:
                 pred = self.model(x, graph.edge_attr, graph, ms_edges, ms_ids)
             else:
                 pred = self.model(x, graph.edge_attr, graph)
+            mask = getattr(graph, "loss_mask", None)
+            if mask is not None:
+                # Masked MSE: ignore zeroed-out (tissue, kinematic-target)
+                # entries instead of letting them dominate the gradient with
+                # essentially-noise targets.
+                diff_sq = (pred - y) ** 2
+                return (diff_sq * mask).sum() / mask.sum().clamp(min=1.0)
             return self.criterion(pred, y)
 
     def backward(self, loss):
@@ -332,10 +341,23 @@ class MGNTrainer:
                 pred = self.model(graph.x, graph.edge_attr, graph, ms_edges, ms_ids)
             else:
                 pred = self.model(graph.x, graph.edge_attr, graph)
+            mask = getattr(graph, "loss_mask", None)
             offset = 0
             for key, d in zip(keys, dims):
                 p = pred[:, offset : offset + d]
                 t = graph.y[:, offset : offset + d]
+                if mask is not None:
+                    # Per-key membership in the loss mask is uniform across
+                    # the d columns — column 0 captures it.  Skip nodes
+                    # zeroed out for this key (e.g. tissue nodes for u/v/a
+                    # under mgn_kinematic_needle_only).
+                    keep = mask[:, offset] > 0.5
+                    if keep.any():
+                        p = p[keep]
+                        t = t[keep]
+                    else:
+                        offset += d
+                        continue
                 errors[key] += (
                     torch.linalg.norm(p - t) / torch.linalg.norm(t).clamp(min=1e-8)
                 ).item()

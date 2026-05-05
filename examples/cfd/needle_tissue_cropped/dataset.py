@@ -779,6 +779,8 @@ class NeedleTissueDataset(Dataset):
         mgn_paper_features: bool = False,
         mgn_include_mat_fiber: bool = False,
         mgn_include_prev_v: bool = False,
+        mgn_include_evf: bool = False,
+        mgn_kinematic_needle_only: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -807,6 +809,8 @@ class NeedleTissueDataset(Dataset):
         self.mgn_paper_features = mgn_paper_features
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
         self.mgn_include_prev_v = mgn_include_prev_v
+        self.mgn_include_evf = mgn_include_evf
+        self.mgn_kinematic_needle_only = mgn_kinematic_needle_only
         if mgn_include_mat_fiber and not mgn_paper_features:
             raise ValueError(
                 "mgn_include_mat_fiber only applies when mgn_paper_features=True; "
@@ -816,6 +820,11 @@ class NeedleTissueDataset(Dataset):
             raise ValueError(
                 "mgn_include_prev_v only applies when mgn_paper_features=True; "
                 "in the standard input scheme v is already a dynamic input."
+            )
+        if mgn_include_evf and not mgn_paper_features:
+            raise ValueError(
+                "mgn_include_evf only applies when mgn_paper_features=True; "
+                "in the standard input scheme evf is already a dynamic input."
             )
 
         self.use_cpress = use_cpress
@@ -1147,13 +1156,15 @@ class NeedleTissueDataset(Dataset):
 
         With ``mgn_paper_features=True`` the model sees only a 2-dim node-type
         one-hot.  Optional appended channels:
+          - ``mgn_include_evf``: + 1 scalar dim (current EVF).
           - ``mgn_include_mat_fiber``: + 3 dims (unit fiber direction).
           - ``mgn_include_prev_v``: + 3 dims (normalised current velocity).
-            Pfaff et al. (2020) include this for DeformingPlate; without it
-            the inputs are time-invariant and the model can't learn dynamics.
+        Layout: scalars first, vectors last (so the TFN split is positional).
         """
         if self.mgn_paper_features:
             d = 2
+            if self.mgn_include_evf:
+                d += 1
             if self.mgn_include_mat_fiber:
                 d += 3
             if self.mgn_include_prev_v:
@@ -1170,9 +1181,9 @@ class NeedleTissueDataset(Dataset):
     def n_tfn_scalar(self) -> int:
         """Number of scalar node features for TFNMeshGraphNet (excludes coord and vectors)."""
         if self.mgn_paper_features:
-            # node_type one-hot is the only scalar input; mat_fiber, when
-            # included, is a 1o vector and goes to x_vec.
-            return 2
+            # node_type one-hot (2) plus optional evf (1).  mat_fiber and
+            # prev_v are 1o vectors and go to x_vec.
+            return 2 + (1 if self.mgn_include_evf else 0)
         return 15 if self.use_cpress else 14
 
     @property
@@ -1215,10 +1226,11 @@ class NeedleTissueDataset(Dataset):
             Shape ``(N, n_tfn_vec * 3)`` — consecutive xyz per vector.
         """
         if self.mgn_paper_features:
-            # x layout: [node_type(2), mat_fiber(3)?, prev_v(3)?] — every
-            # appended block is a 3-D 1o vector, so the scalar/vector split
-            # is purely positional.
-            return x[:, :2], x[:, 2:]
+            # x layout: [node_type(2), evf(1)?, mat_fiber(3)?, prev_v(3)?].
+            # All scalars are at the front, all 1o vectors at the back, so
+            # the split is purely positional.
+            n_scalar = self.n_tfn_scalar
+            return x[:, :n_scalar], x[:, n_scalar:]
         if self.use_cpress:
             # x_vec: u[3:6], v[6:9], a[9:12], mat_fiber[23:26]
             x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
@@ -1437,6 +1449,15 @@ class NeedleTissueDataset(Dataset):
         # Mesh edges (hex needle/tissue connectivity) get both blocks.
         if self.mgn_paper_features:
             x_sub = self._mgn_node_features[part_nodes]
+            # Scalars first (evf), then 1o vectors (mat_fiber, prev_v).  The
+            # ordering matters for _split_tfn_features which assumes all
+            # scalars precede all vectors.
+            if self.mgn_include_evf:
+                evf_t = ft["evf"][t_local]
+                evf_norm = (
+                    evf_t - self._node_stats["evf_mean"]
+                ) / self._node_stats["evf_std"]
+                x_sub = torch.cat([x_sub, evf_norm[part_nodes]], dim=-1)
             if self.mgn_include_mat_fiber:
                 # Append unit fiber direction.  For TFN, _split_tfn_features
                 # peels this off into x_vec as a 1o feature.
@@ -1465,7 +1486,24 @@ class NeedleTissueDataset(Dataset):
         # Split x into scalar and vector parts for TFNMeshGraphNet.
         x_scalar_sub, x_vec_sub = self._split_tfn_features(x_sub)
 
-        return Data(
+        # Per-element loss mask.  When mgn_kinematic_needle_only=True, zero
+        # out the kinematic-target columns (u/v/a) on tissue nodes so the
+        # model isn't penalised for getting tissue-side noise wrong.
+        # Shape: (n_sub, sum(TARGET_DIMS)) — all-ones unless the flag is set.
+        if self.mgn_kinematic_needle_only:
+            n_sub = part_nodes.shape[0]
+            loss_mask = torch.ones(n_sub, sum(self.TARGET_DIMS), dtype=torch.float32)
+            is_needle_in_part = torch.isin(part_nodes, self._needle_idx_t)
+            is_tissue_in_part = ~is_needle_in_part
+            col = 0
+            for key, dim in zip(self.TARGET_KEYS, self.TARGET_DIMS):
+                if key in {"u", "v", "a"} and is_tissue_in_part.any():
+                    loss_mask[is_tissue_in_part, col : col + dim] = 0.0
+                col += dim
+        else:
+            loss_mask = None
+
+        data_kwargs = dict(
             x=x_sub,
             y=y_sub,
             edge_index=all_ei,
@@ -1475,6 +1513,9 @@ class NeedleTissueDataset(Dataset):
             x_scalar=x_scalar_sub,
             x_vec=x_vec_sub,
         )
+        if loss_mask is not None:
+            data_kwargs["loss_mask"] = loss_mask
+        return Data(**data_kwargs)
 
     # ------------------------------------------------------------------
     # Normalisation

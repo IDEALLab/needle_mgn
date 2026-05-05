@@ -139,6 +139,20 @@ mgn_include_mat_fiber: false
 # epochs.  Strongly recommended whenever mgn_paper_features=true.
 mgn_include_prev_v: false
 
+# Append normalised current EVF (1 scalar) to the MGN-paper input.  Useful
+# for tissue nodes where contact is happening — EVF tells the model where
+# material is present without it having to reconstruct that from edge
+# geometry.  Goes to x_scalar for TFN.
+mgn_include_evf: false
+
+# Mask the per-node loss for kinematic targets (u/v/a) on tissue nodes —
+# in our setup tissue u is ~3000× smaller than needle u (the Eulerian mesh
+# nodes don't move; u-on-tissue stores the tiny material flow plus
+# numerical-noise floor), so penalising the model for getting it wrong
+# rewards fitting noise.  Validation rel-errs are computed only over needle
+# nodes for the affected keys when this is on.
+mgn_kinematic_needle_only: false
+
 # -------------------------
 # Model architecture
 # -------------------------

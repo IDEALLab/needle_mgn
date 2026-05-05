@@ -453,15 +453,17 @@ def _split_tfn_features(
     mgn_paper_features: bool = False,
     mgn_include_mat_fiber: bool = False,
     mgn_include_prev_v: bool = False,
+    mgn_include_evf: bool = False,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Split flat node features into (x_scalar, x_vec) for TFNMeshGraphNet.
 
     Mirrors ``NeedleTissueDataset._split_tfn_features``.  In MGN-paper mode
-    the layout is [node_type(2), mat_fiber(3)?, prev_v(3)?] — split
-    positionally into the 2 scalars and the trailing 3-D 1o blocks.
+    the layout is [node_type(2), evf(1)?, mat_fiber(3)?, prev_v(3)?] — all
+    scalars first, all 1o vectors after, so the split is positional.
     """
     if mgn_paper_features:
-        return x[:, :2], x[:, 2:]
+        n_scalar = 2 + (1 if mgn_include_evf else 0)
+        return x[:, :n_scalar], x[:, n_scalar:]
     if use_cpress:
         x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
         x_scalar = torch.cat([x[:, 12:23], x[:, 26:30]], dim=-1)
@@ -491,6 +493,7 @@ def _build_step_graph(
     mgn_ref_pos: Optional[torch.Tensor] = None,
     mgn_include_mat_fiber: bool = False,
     mgn_include_prev_v: bool = False,
+    mgn_include_evf: bool = False,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -521,6 +524,12 @@ def _build_step_graph(
                 "mgn_ref_pos to be supplied."
             )
         x_sub = mgn_node_features[part_nodes]
+        # Scalars first (evf), then 1o vectors (mat_fiber, prev_v) — match
+        # dataset.py ordering so x_scalar/x_vec splits stay aligned.
+        if mgn_include_evf:
+            evf_t = state["evf"]
+            evf_norm = (evf_t - node_stats["evf_mean"]) / node_stats["evf_std"]
+            x_sub = torch.cat([x_sub, evf_norm[part_nodes]], dim=-1)
         if mgn_include_mat_fiber:
             if fiber_dir_full is None:
                 raise RuntimeError(
@@ -571,6 +580,7 @@ def _build_step_graph(
         mgn_paper_features=mgn_paper_features,
         mgn_include_mat_fiber=mgn_include_mat_fiber,
         mgn_include_prev_v=mgn_include_prev_v,
+        mgn_include_evf=mgn_include_evf,
     )
 
     return Data(
@@ -722,9 +732,13 @@ def main(cfg: DictConfig) -> None:
     mgn_paper_features = bool(OmegaConf.select(cfg, "mgn_paper_features", default=False))
     mgn_include_mat_fiber = bool(OmegaConf.select(cfg, "mgn_include_mat_fiber", default=False))
     mgn_include_prev_v = bool(OmegaConf.select(cfg, "mgn_include_prev_v", default=False))
+    mgn_include_evf = bool(OmegaConf.select(cfg, "mgn_include_evf", default=False))
     if mgn_paper_features:
         extra = ""
         input_dim_nodes = 2
+        if mgn_include_evf:
+            input_dim_nodes += 1
+            extra += " + evf(1)"
         if mgn_include_mat_fiber:
             input_dim_nodes += 3
             extra += " + mat_fiber(3)"
@@ -786,7 +800,7 @@ def main(cfg: DictConfig) -> None:
         )
     elif model_type == "tfn":
         if mgn_paper_features:
-            n_tfn_scalar = 2
+            n_tfn_scalar = 2 + int(mgn_include_evf)
             n_tfn_vec = int(mgn_include_mat_fiber) + int(mgn_include_prev_v)
         else:
             n_tfn_scalar = 15 if use_cpress else 14
@@ -1097,6 +1111,7 @@ def main(cfg: DictConfig) -> None:
                 mgn_ref_pos=mgn_ref_pos,
                 mgn_include_mat_fiber=mgn_include_mat_fiber,
                 mgn_include_prev_v=mgn_include_prev_v,
+                mgn_include_evf=mgn_include_evf,
             )
             graph = graph.to(dist.device)
             if model_type == "bistride":
