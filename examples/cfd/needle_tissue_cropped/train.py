@@ -119,6 +119,7 @@ class MGNTrainer:
             drop_targets=list(cfg.get("drop_targets", []) or []),
             mgn_paper_features=bool(cfg.get("mgn_paper_features", False)),
             mgn_include_mat_fiber=bool(cfg.get("mgn_include_mat_fiber", False)),
+            mgn_include_prev_v=bool(cfg.get("mgn_include_prev_v", False)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         val_dataset = NeedleTissueDataset(split="validation", **_shared_dataset_kwargs)

@@ -778,6 +778,7 @@ class NeedleTissueDataset(Dataset):
         drop_targets: Optional[List[str]] = None,
         mgn_paper_features: bool = False,
         mgn_include_mat_fiber: bool = False,
+        mgn_include_prev_v: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -805,10 +806,16 @@ class NeedleTissueDataset(Dataset):
             )
         self.mgn_paper_features = mgn_paper_features
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
+        self.mgn_include_prev_v = mgn_include_prev_v
         if mgn_include_mat_fiber and not mgn_paper_features:
             raise ValueError(
                 "mgn_include_mat_fiber only applies when mgn_paper_features=True; "
                 "in the standard input scheme mat_fiber is already a static prop."
+            )
+        if mgn_include_prev_v and not mgn_paper_features:
+            raise ValueError(
+                "mgn_include_prev_v only applies when mgn_paper_features=True; "
+                "in the standard input scheme v is already a dynamic input."
             )
 
         self.use_cpress = use_cpress
@@ -1139,12 +1146,19 @@ class NeedleTissueDataset(Dataset):
         """Total node feature dimension: dynamic inputs + static material props.
 
         With ``mgn_paper_features=True`` the model sees only a 2-dim node-type
-        one-hot and all dynamic / static state goes into the edge features,
-        matching Pfaff et al. (2020).  With ``mgn_include_mat_fiber=True``
-        the unit fiber direction is appended (3 extra dims).
+        one-hot.  Optional appended channels:
+          - ``mgn_include_mat_fiber``: + 3 dims (unit fiber direction).
+          - ``mgn_include_prev_v``: + 3 dims (normalised current velocity).
+            Pfaff et al. (2020) include this for DeformingPlate; without it
+            the inputs are time-invariant and the model can't learn dynamics.
         """
         if self.mgn_paper_features:
-            return 2 + (3 if self.mgn_include_mat_fiber else 0)
+            d = 2
+            if self.mgn_include_mat_fiber:
+                d += 3
+            if self.mgn_include_prev_v:
+                d += 3
+            return d
         return sum(self.INPUT_DIMS) + sum(self.STATIC_PROP_DIMS)
 
     @property
@@ -1165,7 +1179,12 @@ class NeedleTissueDataset(Dataset):
     def n_tfn_vec(self) -> int:
         """Number of 3-D vector node features for TFNMeshGraphNet (u, v, a, mat_fiber)."""
         if self.mgn_paper_features:
-            return 1 if self.mgn_include_mat_fiber else 0
+            n = 0
+            if self.mgn_include_mat_fiber:
+                n += 1
+            if self.mgn_include_prev_v:
+                n += 1
+            return n
         return 4
 
     def _split_tfn_features(
@@ -1196,11 +1215,10 @@ class NeedleTissueDataset(Dataset):
             Shape ``(N, n_tfn_vec * 3)`` — consecutive xyz per vector.
         """
         if self.mgn_paper_features:
-            if self.mgn_include_mat_fiber:
-                # x layout: [node_type(2), mat_fiber(3)].  Split into the
-                # 2 scalars and the 1 trailing 3-D vector.
-                return x[:, :2], x[:, 2:5]
-            return x, x.new_zeros(x.shape[0], 0)
+            # x layout: [node_type(2), mat_fiber(3)?, prev_v(3)?] — every
+            # appended block is a 3-D 1o vector, so the scalar/vector split
+            # is purely positional.
+            return x[:, :2], x[:, 2:]
         if self.use_cpress:
             # x_vec: u[3:6], v[6:9], a[9:12], mat_fiber[23:26]
             x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
@@ -1423,6 +1441,16 @@ class NeedleTissueDataset(Dataset):
                 # Append unit fiber direction.  For TFN, _split_tfn_features
                 # peels this off into x_vec as a 1o feature.
                 x_sub = torch.cat([x_sub, fiber_dir], dim=-1)
+            if self.mgn_include_prev_v:
+                # Normalised current velocity — the missing time-varying
+                # node input from the MGN paper.  Pulls v_t from the cache
+                # and uses the global v_mean/v_std stats (also valid under
+                # vector_iso_norm where v_std is a scalar broadcast to xyz).
+                v_t = ft["v"][t_local]
+                v_norm = (
+                    v_t - self._node_stats["v_mean"]
+                ) / self._node_stats["v_std"]
+                x_sub = torch.cat([x_sub, v_norm[part_nodes]], dim=-1)
             ref_pos_sub = self._mgn_ref_pos_per_run[r_idx][part_nodes]
             mesh_rel = ref_pos_sub[src] - ref_pos_sub[dst]
             mesh_d = torch.linalg.norm(mesh_rel, dim=-1, keepdim=True)

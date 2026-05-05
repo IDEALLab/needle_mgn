@@ -130,6 +130,15 @@ mgn_paper_features: false
 # default and the appended channel is uninformative there).
 mgn_include_mat_fiber: false
 
+# Append normalised current velocity (3-dim 1o vector) to the MGN-paper
+# input.  Only meaningful when mgn_paper_features=true.  This restores the
+# time-varying node input used in Pfaff et al. (2020) (their DeformingPlate
+# node features are [node_type, prev_velocity]).  Without it, every node
+# input is time-invariant and the model converges to predicting zero —
+# val_v_rel_err and val_s_rel_err both stay around 1.0 even after 100
+# epochs.  Strongly recommended whenever mgn_paper_features=true.
+mgn_include_prev_v: false
+
 # -------------------------
 # Model architecture
 # -------------------------

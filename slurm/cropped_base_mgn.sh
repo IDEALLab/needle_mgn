@@ -78,6 +78,7 @@ apptainer exec --nv \
         processor_size=15 \
         ++mgn_paper_features=true \
         ++mgn_include_mat_fiber=true \
+        ++mgn_include_prev_v=true \
         ++needle_fiber_axis=true \
         input_dim_edges=11 \
         'drop_targets=[u,a,evf]' \

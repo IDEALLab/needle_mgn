@@ -74,6 +74,7 @@ apptainer exec --nv \
         ++vector_iso_norm=true \
         ++needle_fiber_axis=true \
         ++mgn_paper_features=true \
+        ++mgn_include_prev_v=true \
         input_dim_edges=11 \
         'drop_targets=[u,a,evf]' \
         save_every=10 \
