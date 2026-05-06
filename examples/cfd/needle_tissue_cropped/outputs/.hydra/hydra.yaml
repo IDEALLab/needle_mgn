@@ -111,11 +111,72 @@ hydra:
   overrides:
     hydra:
     - hydra.mode=RUN
-    task: []
+    task:
+    - infer_run_id=199
+    - infer_output_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/cropped_tfn_iso_mgn/inference_output/RUN-199
+    - train_fraction=0.8
+    - val_fraction=0.1
+    - timestep_stride=10
+    - max_frames_per_run=null
+    - needle_crop_mm=10.0
+    - tissue_crop_mm=25.0
+    - slice_half_thickness_mm=15.0
+    - full_needle_tissue_mm=7.0
+    - crop_strategy_weights=[0.7,0.15,0.15]
+    - use_cpress=false
+    - per_region_norm=false
+    - vector_iso_norm=true
+    - needle_fiber_axis=true
+    - drop_targets=[u,a]
+    - rollout_dt=null
+    - mgn_paper_features=true
+    - mgn_include_mat_fiber=false
+    - mgn_include_prev_v=true
+    - mgn_include_evf=true
+    - mgn_kinematic_needle_only=true
+    - input_dim_edges=11
+    - model_type=tfn
+    - num_harmonics=5
+    - n_vec_outputs=1
+    - irreps_hidden=8x0e + 4x1o + 2x2e
+    - l_max=1
+    - n_radial_basis=8
+    - r_max=60.0
+    - tfn_checkpoint_layers=false
+    - use_bsms=false
+    - num_bsms_levels=2
+    - num_layers_bistride=2
+    - bistride_unet_levels=1
+    - num_processor_checkpoint_segments=0
+    - beam_spacing_mm=0.0
+    - tissue_downsample_mm=0.0
+    - use_fourier_features=false
+    - n_fourier_features=64
+    - fourier_scale=0.36
+    - hidden_dim_node_encoder=256
+    - hidden_dim_edge_encoder=256
+    - hidden_dim_node_decoder=256
+    - hidden_dim_processor=256
+    - processor_size=15
+    - aggregation=sum
+    - world_edge_radius=1.2
+    - consensus_attenuation=0.0
+    - tissue_consensus_attenuation=0.0
+    - procrustes_alpha=0.0
+    - axial_polyfit_alpha=0.0
+    - axial_polyfit_degree=3
+    - needle_edge_cap=false
+    - data_dir=/home/nathanielhoffman/Desktop/needle_mgn/RUN-2
+    - ckpt_path=/home/nathanielhoffman/Desktop/needle_mgn/experiments/cropped_tfn_iso_mgn/checkpoints
+    - stats_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/cropped_tfn_iso_mgn/stats
+    - n_rollout=16
+    - axial_polyfit_alpha=1
+    - axial_polyfit_degree=3
   job:
-    name: train
+    name: infer
     chdir: true
-    override_dirname: ''
+    override_dirname: aggregation=sum,axial_polyfit_alpha=0.0,axial_polyfit_alpha=1,axial_polyfit_degree=3,axial_polyfit_degree=3,beam_spacing_mm=0.0,bistride_unet_levels=1,ckpt_path=/home/nathanielhoffman/Desktop/needle_mgn/experiments/cropped_tfn_iso_mgn/checkpoints,consensus_attenuation=0.0,crop_strategy_weights=[0.7,0.15,0.15],data_dir=/home/nathanielhoffman/Desktop/needle_mgn/RUN-2,drop_targets=[u,a],fourier_scale=0.36,full_needle_tissue_mm=7.0,hidden_dim_edge_encoder=256,hidden_dim_node_decoder=256,hidden_dim_node_encoder=256,hidden_dim_processor=256,infer_output_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/cropped_tfn_iso_mgn/inference_output/RUN-199,infer_run_id=199,input_dim_edges=11,irreps_hidden=8x0e
+      + 4x1o + 2x2e,l_max=1,max_frames_per_run=null,mgn_include_evf=true,mgn_include_mat_fiber=false,mgn_include_prev_v=true,mgn_kinematic_needle_only=true,mgn_paper_features=true,model_type=tfn,n_fourier_features=64,n_radial_basis=8,n_rollout=16,n_vec_outputs=1,needle_crop_mm=10.0,needle_edge_cap=false,needle_fiber_axis=true,num_bsms_levels=2,num_harmonics=5,num_layers_bistride=2,num_processor_checkpoint_segments=0,per_region_norm=false,processor_size=15,procrustes_alpha=0.0,r_max=60.0,rollout_dt=null,slice_half_thickness_mm=15.0,stats_dir=/home/nathanielhoffman/Desktop/needle_mgn/experiments/cropped_tfn_iso_mgn/stats,tfn_checkpoint_layers=false,timestep_stride=10,tissue_consensus_attenuation=0.0,tissue_crop_mm=25.0,tissue_downsample_mm=0.0,train_fraction=0.8,use_bsms=false,use_cpress=false,use_fourier_features=false,val_fraction=0.1,vector_iso_norm=true,world_edge_radius=1.2
     id: ???
     num: ???
     config_name: config

@@ -123,7 +123,7 @@ pylibraft-cu13 = { index = "nvidia" }
 pylibraft-cu12 = { index = "nvidia" }
 nvidia-dali-cuda130 = { index = "nvidia" }
 nvidia-dali-cuda120 = { index = "nvidia" }
-torch-scatter = { path = "C:/Users/nhoffma1/Downloads/torch_scatter-2.1.2+pt210cu128-cp313-cp313-win_amd64.whl" }
+torch-scatter = { path = "/home/nathanielhoffman/Downloads/torch_scatter-2.1.2+pt210cu128-cp313-cp313-linux_x86_64.whl" }
 
 #####################################################################
 # Flags Controlling the local build of physicsnemo
