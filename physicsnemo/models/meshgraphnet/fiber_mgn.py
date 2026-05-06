@@ -104,12 +104,15 @@ class _FiberEquivNodeBlock(nn.Module):
         num_layers: int = 2,
         activation_fn: nn.Module = nn.ReLU(),
         norm_type: str = "LayerNorm",
+        extra_invariants_in: int = 0,
     ):
         super().__init__()
         self.aggregation = aggregation
         # Input: agg_efeat (hidden) + h_i (hidden) + ||V|| (1) + V·d (1)
+        # Plus optional extra rotation-invariant scalars (e.g. ||W|| and W·d
+        # when a second equivariant aggregate W is being tracked).
         self.node_mlp = MeshGraphMLP(
-            input_dim=hidden_dim * 2 + 2,
+            input_dim=hidden_dim * 2 + 2 + extra_invariants_in,
             output_dim=hidden_dim,
             hidden_dim=hidden_dim,
             hidden_layers=num_layers,
@@ -124,6 +127,7 @@ class _FiberEquivNodeBlock(nn.Module):
         V: torch.Tensor,
         fiber_dir: torch.Tensor,
         graph: GraphType,
+        W: "torch.Tensor | None" = None,
     ) -> torch.Tensor:
         # Aggregate scalar edge features and concat with node features → (N, 2*hidden)
         cat_feat = aggregate_and_concat(efeat, nfeat, graph, self.aggregation)
@@ -131,6 +135,10 @@ class _FiberEquivNodeBlock(nn.Module):
         V_norm = torch.linalg.norm(V, dim=-1, keepdim=True)   # (N, 1)
         V_dot_d = (V * fiber_dir).sum(-1, keepdim=True)        # (N, 1)
         full_in = torch.cat([cat_feat, V_norm, V_dot_d], dim=-1)  # (N, 2*h+2)
+        if W is not None:
+            W_norm = torch.linalg.norm(W, dim=-1, keepdim=True)
+            W_dot_d = (W * fiber_dir).sum(-1, keepdim=True)
+            full_in = torch.cat([full_in, W_norm, W_dot_d], dim=-1)
         return self.node_mlp(full_in) + nfeat
 
 
@@ -173,9 +181,11 @@ class _FiberEquivProcessor(nn.Module):
         aggregation: str = "sum",
         activation_fn: nn.Module = nn.ReLU(),
         norm_type: str = "LayerNorm",
+        extra_decoder_basis: bool = False,
     ):
         super().__init__()
         self.processor_size = processor_size
+        self.extra_decoder_basis = extra_decoder_basis
 
         self.edge_blocks = nn.ModuleList(
             [
@@ -194,6 +204,15 @@ class _FiberEquivProcessor(nn.Module):
         self.alpha_heads = nn.ModuleList(
             [nn.Linear(hidden_dim, 1) for _ in range(processor_size)]
         )
+        # Second equivariant message head producing W = Σⱼ βᵢⱼ · (d_i × ê_ij).
+        # Aggregating d_i × ê_ij guarantees W ⊥ d_i, so the decoder basis
+        # {V, d, V×d, W, W×d} is reliably 3-D even when V ∥ d (the bottleneck
+        # diagnosed for needle nodes whose neighbours are mostly axial).
+        if extra_decoder_basis:
+            self.beta_heads = nn.ModuleList(
+                [nn.Linear(hidden_dim, 1) for _ in range(processor_size)]
+            )
+        node_block_extra = 2 if extra_decoder_basis else 0
         self.node_blocks = nn.ModuleList(
             [
                 _FiberEquivNodeBlock(
@@ -202,6 +221,7 @@ class _FiberEquivProcessor(nn.Module):
                     num_layers=num_layers_node,
                     activation_fn=activation_fn,
                     norm_type=norm_type,
+                    extra_invariants_in=node_block_extra,
                 )
                 for _ in range(processor_size)
             ]
@@ -236,14 +256,27 @@ class _FiberEquivProcessor(nn.Module):
             Updated node features, ``(N, hidden_dim)``.
         V : torch.Tensor
             Final-step vector aggregate, ``(N, 3)``.
+        W : torch.Tensor or None
+            Final-step ``(d × ê)`` aggregate, ``(N, 3)``.  Only returned
+            when ``extra_decoder_basis=True`` was passed at construction.
         """
         n_nodes = nfeat.shape[0]
+        src = graph.edge_index[0]
         dst = graph.edge_index[1]  # (E,) destination node indices
 
         V = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=nfeat.dtype)
+        W = None
+        d_cross_e = None
+        if self.extra_decoder_basis:
+            # d_i × ê_ij is the per-edge equivariant vector that's by
+            # construction perpendicular to d_i.  Computed once outside
+            # the loop because both factors are fixed across layers.
+            d_src = fiber_dir[src]
+            d_cross_e = torch.linalg.cross(d_src, e_hat, dim=-1)   # (E, 3)
+            W = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=nfeat.dtype)
 
-        for edge_block, alpha_head, node_block in zip(
-            self.edge_blocks, self.alpha_heads, self.node_blocks
+        for layer_idx, (edge_block, alpha_head, node_block) in enumerate(
+            zip(self.edge_blocks, self.alpha_heads, self.node_blocks)
         ):
             # 1. Scalar edge update (residual inside MeshEdgeBlock)
             efeat, _ = edge_block(efeat, nfeat, graph)
@@ -257,10 +290,18 @@ class _FiberEquivProcessor(nn.Module):
             dst_exp = dst.unsqueeze(-1).expand_as(vec_msg)   # (E, 3)
             V.scatter_add_(0, dst_exp, vec_msg)
 
-            # 4. Node update using scalar aggregate + V summaries
-            nfeat = node_block(efeat, nfeat, V, fiber_dir, graph)
+            if self.extra_decoder_basis:
+                beta = self.beta_heads[layer_idx](efeat)       # (E, 1)
+                vec_msg_w = beta * d_cross_e                   # (E, 3)
+                W = torch.zeros(
+                    n_nodes, 3, device=efeat.device, dtype=efeat.dtype
+                )
+                W.scatter_add_(0, dst_exp, vec_msg_w)
 
-        return nfeat, V
+            # 4. Node update using scalar aggregate + V (and optionally W)
+            nfeat = node_block(efeat, nfeat, V, fiber_dir, graph, W=W)
+
+        return nfeat, V, W
 
 
 class FiberEquivariantMGN(Module):
@@ -368,6 +409,8 @@ class FiberEquivariantMGN(Module):
         num_layers_node_decoder: int = 2,
         aggregation: Literal["sum", "mean"] = "sum",
         norm_type: Literal["LayerNorm", "TELayerNorm"] = "LayerNorm",
+        extra_edge_invariants: bool = False,
+        extra_decoder_basis: bool = False,
     ):
         super().__init__(meta=MetaData())
 
@@ -375,6 +418,8 @@ class FiberEquivariantMGN(Module):
         self.input_dim_edges = input_dim_edges
         self.output_dim = output_dim
         self.n_vec_outputs = n_vec_outputs
+        self.extra_edge_invariants = extra_edge_invariants
+        self.extra_decoder_basis = extra_decoder_basis
 
         scalar_dim = output_dim - n_vec_outputs * 3
         if scalar_dim < 0:
@@ -385,9 +430,16 @@ class FiberEquivariantMGN(Module):
 
         activation_fn = get_activation(mlp_activation_fn)
 
-        # Edge encoder: base edge features + 2 fiber invariants (cos_theta, cos_phi)
+        # Edge encoder: base edge features + 2 fiber invariants (cos_theta, cos_phi).
+        # When extra_edge_invariants=True we additionally append:
+        #   cos_theta_dst = d_j · ê_ij        (destination-side fiber alignment)
+        #   bond_corr     = cos_theta · cos_theta_dst   (l=2-flavour correlator)
+        #   dv_along_edge = (v_j - v_i) · ê_ij           (compression rate along edge)
+        #   dv_norm       = ||v_j - v_i||                (relative speed)
+        # so velocity-driven asymmetries can modulate the per-edge α weights.
+        edge_extra = 6 if extra_edge_invariants else 2
         self.edge_encoder = MeshGraphMLP(
-            input_dim=input_dim_edges + 2,
+            input_dim=input_dim_edges + edge_extra,
             output_dim=hidden_dim_processor,
             hidden_dim=hidden_dim_edge_encoder,
             hidden_layers=num_layers_edge_encoder,
@@ -414,16 +466,28 @@ class FiberEquivariantMGN(Module):
             aggregation=aggregation,
             activation_fn=activation_fn,
             norm_type=norm_type,
+            extra_decoder_basis=extra_decoder_basis,
         )
 
         # Decoder inputs: [h_i (hidden), ||V|| (1), V·d (1)]
+        # plus optional [||W|| (1), W·d (1)] when the W aggregate is tracked.
         decoder_in_dim = hidden_dim_processor + 2
+        if extra_decoder_basis:
+            decoder_in_dim += 2
 
-        # Equivariant vector decoder: outputs n_vec_outputs * 3 scalar coefficients
-        # for the local basis {V, d, V×d}
+        # Number of basis vectors used to express each equivariant output:
+        #   3 = {V, d, V × d}                                 (default)
+        #   5 = {V, d, V × d, W, W × d}                       (extra_decoder_basis)
+        # The W basis vectors are guaranteed perpendicular to d, so the basis
+        # spans 3-D even when V ∥ d (which happens for needle nodes whose
+        # neighbours are mostly axial — the bottleneck causing x-z flattening).
+        self.n_basis = 5 if extra_decoder_basis else 3
+
+        # Equivariant vector decoder: outputs n_vec_outputs * n_basis scalar
+        # coefficients for the local equivariant basis.
         self.vec_coef_head = MeshGraphMLP(
             input_dim=decoder_in_dim,
-            output_dim=n_vec_outputs * 3,
+            output_dim=n_vec_outputs * self.n_basis,
             hidden_dim=hidden_dim_node_decoder,
             hidden_layers=num_layers_node_decoder,
             activation_fn=activation_fn,
@@ -448,12 +512,12 @@ class FiberEquivariantMGN(Module):
         node_features: torch.Tensor,
         edge_features: torch.Tensor,
         graph: GraphType,
-        **kwargs,
+        **kwargs,  # noqa: ARG002 — kept for API compatibility with sibling models
     ) -> torch.Tensor:
         fiber_dir = graph.fiber_dir  # (N, 3) unit fiber directions
 
         ei = graph.edge_index
-        src, dst = ei[0], ei[1]  # noqa: F841
+        src, dst = ei[0], ei[1]
 
         # Unit edge vectors from the first 4 columns of edge_features
         rel_pos = edge_features[:, :3]                                 # (E, 3)
@@ -466,31 +530,70 @@ class FiberEquivariantMGN(Module):
         cos_theta = (d_src * e_hat).sum(-1, keepdim=True)             # (E, 1)
         cos_phi = (d_src * d_dst).sum(-1, keepdim=True)               # (E, 1)
 
-        edge_features_aug = torch.cat(
-            [edge_features, cos_theta, cos_phi], dim=-1
-        )  # (E, input_dim_edges + 2)
+        if self.extra_edge_invariants:
+            # Symmetric counterpart of cos_theta plus an l=2-flavour
+            # alignment correlator.
+            cos_theta_dst = (d_dst * e_hat).sum(-1, keepdim=True)
+            bond_corr = cos_theta * cos_theta_dst
+            # Velocity-driven invariants — break the y-symmetry that locks
+            # alpha to fiber-only signals.  Requires graph.node_velocity
+            # (already supplied by the dataset / infer pipeline).
+            v_node = graph.node_velocity                               # (N, 3)
+            v_src = v_node[src]
+            v_dst = v_node[dst]
+            dv = v_dst - v_src
+            dv_along_edge = (dv * e_hat).sum(-1, keepdim=True)
+            dv_norm = torch.linalg.norm(dv, dim=-1, keepdim=True)
+            edge_features_aug = torch.cat(
+                [
+                    edge_features,
+                    cos_theta, cos_phi,
+                    cos_theta_dst, bond_corr,
+                    dv_along_edge, dv_norm,
+                ],
+                dim=-1,
+            )  # (E, input_dim_edges + 6)
+        else:
+            edge_features_aug = torch.cat(
+                [edge_features, cos_theta, cos_phi], dim=-1
+            )  # (E, input_dim_edges + 2)
 
         efeat = self.edge_encoder(edge_features_aug)
         nfeat = self.node_encoder(node_features)
 
-        nfeat, V = self.processor(nfeat, efeat, graph, e_hat, fiber_dir)
+        nfeat, V, W = self.processor(nfeat, efeat, graph, e_hat, fiber_dir)
 
         # --- Decoder --------------------------------------------------------
         V_norm = torch.linalg.norm(V, dim=-1, keepdim=True)           # (N, 1)
         V_dot_d = (V * fiber_dir).sum(-1, keepdim=True)               # (N, 1)
         decoder_in = torch.cat([nfeat, V_norm, V_dot_d], dim=-1)      # (N, h+2)
+        if self.extra_decoder_basis:
+            W_norm = torch.linalg.norm(W, dim=-1, keepdim=True)
+            W_dot_d = (W * fiber_dir).sum(-1, keepdim=True)
+            decoder_in = torch.cat([decoder_in, W_norm, W_dot_d], dim=-1)
 
-        # Equivariant vector outputs via local basis {V, d, V×d}
-        VcrossD = torch.linalg.cross(V, fiber_dir)                    # (N, 3)
-        # basis columns: V, d, VcrossD — shape (N, 3, 3)
-        basis = torch.stack([V, fiber_dir, VcrossD], dim=-1)
+        # Equivariant vector outputs via local basis {V, d, V×d} or
+        # {V, d, V×d, W, W×d} when extra_decoder_basis is set.
+        VcrossD = torch.linalg.cross(V, fiber_dir, dim=-1)            # (N, 3)
+        basis_vecs = [V, fiber_dir, VcrossD]
+        if self.extra_decoder_basis:
+            WcrossD = torch.linalg.cross(W, fiber_dir, dim=-1)
+            basis_vecs.extend([W, WcrossD])
+        basis = torch.stack(basis_vecs, dim=-1)                       # (N, 3, n_basis)
 
-        # Scalar coefficients: (N, n_vec_outputs * 3) → (N, n_vec_out, 3)
+        # Scalar coefficients: (N, n_vec_outputs * n_basis) → (N, n_vec_out, n_basis)
         vec_coefs = self.vec_coef_head(decoder_in)
-        vec_coefs = vec_coefs.view(-1, self.n_vec_outputs, 3)
+        vec_coefs = vec_coefs.view(-1, self.n_vec_outputs, self.n_basis)
 
-        # vec_out[n, k, :] = Σ_b coefs[n, k, b] * basis[n, :, b]
-        vec_out = torch.einsum("nkb,nbd->nkd", vec_coefs, basis)      # (N, n_vec_out, 3)
+        # vec_out[n, k, x] = Σ_b coefs[n, k, b] * basis[n, x, b]
+        # i.e. each output is a learned linear combination of the basis
+        # vectors {V, d, V×d} (and {W, W×d} when extra_decoder_basis is set).
+        # The contraction is over basis_idx (length n_basis) — NOT xyz —
+        # so the output transforms as a proper 1o vector under rotation
+        # of the basis vectors.  The previous "nkb,nbd->nkd" form happened
+        # to typecheck only because n_basis=3=xyz and was equivalent to a
+        # different (rotation-non-equivariant) computation.
+        vec_out = torch.einsum("nkb,nxb->nkx", vec_coefs, basis)      # (N, n_vec_out, 3)
         vec_out = vec_out.reshape(-1, self.n_vec_outputs * 3)          # (N, n_vec_out*3)
 
         if self.scalar_decoder is not None:
@@ -551,6 +654,8 @@ class FiberEquivariantKAN(FiberEquivariantMGN):
         num_layers_node_decoder: int = 2,
         aggregation: Literal["sum", "mean"] = "sum",
         norm_type: Literal["LayerNorm", "TELayerNorm"] = "LayerNorm",
+        extra_edge_invariants: bool = False,
+        extra_decoder_basis: bool = False,
     ):
         super().__init__(
             input_dim_nodes=input_dim_nodes,
@@ -570,6 +675,8 @@ class FiberEquivariantKAN(FiberEquivariantMGN):
             num_layers_node_decoder=num_layers_node_decoder,
             aggregation=aggregation,
             norm_type=norm_type,
+            extra_edge_invariants=extra_edge_invariants,
+            extra_decoder_basis=extra_decoder_basis,
         )
 
         # Replace the MLP node encoder with a KAN.

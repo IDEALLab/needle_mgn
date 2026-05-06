@@ -1486,6 +1486,16 @@ class NeedleTissueDataset(Dataset):
         # Split x into scalar and vector parts for TFNMeshGraphNet.
         x_scalar_sub, x_vec_sub = self._split_tfn_features(x_sub)
 
+        # Always pass normalised current velocity as a separate attribute.
+        # Used by FiberEquivariantMGN(extra_edge_invariants=True) to compute
+        # velocity-driven edge invariants without depending on the layout
+        # of x.  Cheap (3 floats per node) so unconditional.
+        v_t = ft["v"][t_local]
+        v_norm = (
+            v_t - self._node_stats["v_mean"]
+        ) / self._node_stats["v_std"]
+        node_velocity_sub = v_norm[part_nodes]
+
         # Per-element loss mask.  When mgn_kinematic_needle_only=True, zero
         # out the kinematic-target columns (u/v/a) on tissue nodes so the
         # model isn't penalised for getting tissue-side noise wrong.
@@ -1512,6 +1522,7 @@ class NeedleTissueDataset(Dataset):
             fiber_dir=fiber_dir,
             x_scalar=x_scalar_sub,
             x_vec=x_vec_sub,
+            node_velocity=node_velocity_sub,
         )
         if loss_mask is not None:
             data_kwargs["loss_mask"] = loss_mask

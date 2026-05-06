@@ -200,6 +200,7 @@ def _axial_polyfit_blend(
     axial_coords: torch.Tensor,
     degree: int,
     alpha: float,
+    step: int = -1,
 ) -> torch.Tensor:
     """Project per-node displacement onto a polynomial-of-axial-coordinate subspace.
 
@@ -234,6 +235,21 @@ def _axial_polyfit_blend(
     """
     if alpha <= 0.0 or disp.shape[0] < degree + 1 or degree < 0:
         return disp
+
+    if not torch.isfinite(disp).all():
+        # disp has NaN/inf — torch.linalg.lstsq's MKL backend reports this
+        # as the cryptic "SGELSY parameter 6" error.  Surface it clearly
+        # instead.  The usual cause is the trained model producing
+        # numerically unstable predictions that compound over the rollout
+        # (especially with TFN at l_max=1 + small irreps).
+        n_nan = int((~torch.isfinite(disp)).any(dim=-1).sum().item())
+        raise RuntimeError(
+            f"_axial_polyfit_blend: disp has NaN/inf on {n_nan} of "
+            f"{disp.shape[0]} nodes (step={step}).  This usually means "
+            f"the model's rollout state has diverged.  Rerun with "
+            f"axial_polyfit_alpha=0 to see where the divergence starts, "
+            f"and check pred_sub / state['v'] each step."
+        )
 
     s_c = axial_coords - axial_coords.mean()
     s_max = s_c.abs().max()
@@ -583,6 +599,12 @@ def _build_step_graph(
         mgn_include_evf=mgn_include_evf,
     )
 
+    # Always attach normalised current velocity for the fiber-extra edge
+    # invariants (also harmless when those flags are off).
+    v_node_full = state["v"]
+    v_norm_full = (v_node_full - node_stats["v_mean"]) / node_stats["v_std"]
+    node_velocity_sub = v_norm_full[part_nodes]
+
     return Data(
         x=x_sub,
         edge_attr=edge_attr,
@@ -592,6 +614,7 @@ def _build_step_graph(
         fiber_dir=fiber_dir_sub,
         x_scalar=x_scalar_sub,
         x_vec=x_vec_sub,
+        node_velocity=node_velocity_sub,
     )
 
 
@@ -791,12 +814,16 @@ def main(cfg: DictConfig) -> None:
         model = FiberEquivariantMGN(
             **_shared_kwargs,
             n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
+            extra_edge_invariants=bool(OmegaConf.select(cfg, "fiber_extra_invariants", default=False)),
+            extra_decoder_basis=bool(OmegaConf.select(cfg, "fiber_extra_decoder_basis", default=False)),
         )
     elif model_type == "fiber_kan":
         model = FiberEquivariantKAN(
             **_shared_kwargs,
             n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
             num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
+            extra_edge_invariants=bool(OmegaConf.select(cfg, "fiber_extra_invariants", default=False)),
+            extra_decoder_basis=bool(OmegaConf.select(cfg, "fiber_extra_decoder_basis", default=False)),
         )
     elif model_type == "tfn":
         if mgn_paper_features:
@@ -1119,6 +1146,33 @@ def main(cfg: DictConfig) -> None:
             else:
                 pred_sub = model(graph.x, graph.edge_attr, graph).cpu()
 
+            # Diverged-rollout guard: surface the bad step early instead of
+            # letting NaN propagate into post-processing where it appears as
+            # cryptic MKL/lstsq errors.  Reports per-target counts so it's
+            # obvious whether v, s, evf, ... are the source.
+            if not torch.isfinite(pred_sub).all():
+                offset = 0
+                breakdown = []
+                for key, dim in zip(target_keys, target_dims):
+                    chunk = pred_sub[:, offset : offset + dim]
+                    n_bad = int((~torch.isfinite(chunk)).any(dim=-1).sum().item())
+                    breakdown.append(f"{key}: {n_bad}/{chunk.shape[0]} nodes")
+                    offset += dim
+                # Also surface the largest finite |Δ| before the divergence
+                # so it's clear whether the model was already pushing scale.
+                fin = pred_sub[torch.isfinite(pred_sub)]
+                max_abs = float(fin.abs().max().item()) if fin.numel() > 0 else float("nan")
+                raise RuntimeError(
+                    f"Model produced NaN/inf at rollout step {step} (run "
+                    f"{infer_run_id}).  Per-target NaN counts: "
+                    f"{', '.join(breakdown)}.  Max |finite|={max_abs:.3g}.  "
+                    f"This usually indicates rollout drift compounding into "
+                    f"numerical overflow — common with TFN at small irreps "
+                    f"and noise_std=0.  Try: (1) shorter n_rollout to confirm "
+                    f"the model is fine for early steps, (2) retrain with "
+                    f"noise_std=3e-3, (3) inspect state['v'] norms each step."
+                )
+
             # Per-region denorm: compute needle/tissue masks in crop-local index space
             if per_region_norm:
                 part_nodes_np = part_nodes.numpy()
@@ -1161,6 +1215,7 @@ def main(cfg: DictConfig) -> None:
                     u_needle, needle_axial_coords,
                     degree=axial_polyfit_degree,
                     alpha=axial_polyfit_alpha,
+                    step=step,
                 )
                 next_uvw_sub["u"][needle_idx_local] = u_needle
 

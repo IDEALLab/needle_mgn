@@ -187,12 +187,16 @@ class MGNTrainer:
             self.model = FiberEquivariantMGN(
                 **_shared_kwargs,
                 n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
+                extra_edge_invariants=bool(cfg.get("fiber_extra_invariants", False)),
+                extra_decoder_basis=bool(cfg.get("fiber_extra_decoder_basis", False)),
             )
         elif model_type == "fiber_kan":
             self.model = FiberEquivariantKAN(
                 **_shared_kwargs,
                 n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
                 num_harmonics=int(cfg.get("num_harmonics", 5)),
+                extra_edge_invariants=bool(cfg.get("fiber_extra_invariants", False)),
+                extra_decoder_basis=bool(cfg.get("fiber_extra_decoder_basis", False)),
             )
         elif model_type == "tfn":
             n_tfn_scalar = train_dataset.n_tfn_scalar
