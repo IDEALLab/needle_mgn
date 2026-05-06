@@ -59,8 +59,12 @@ def _get_test_run_ids(
     timestep_stride: int,
 ) -> list:
     """Return test run IDs using the same split logic as dataset.py / train.py."""
+    import random as _random
     run_files = _group_vtu_by_run(data_dir, timestep_stride)
     run_ids = list(run_files.keys())
+    # Must mirror dataset.py's deterministic shuffle (seed 42) so the test
+    # set lines up with what the model never saw at training time.
+    _random.Random(42).shuffle(run_ids)
     n_runs = len(run_ids)
     n_train = max(1, int(n_runs * train_fraction))
     n_val   = max(1, int(n_runs * val_fraction))

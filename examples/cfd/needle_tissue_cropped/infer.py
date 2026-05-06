@@ -684,6 +684,11 @@ def main(cfg: DictConfig) -> None:
     if _is_multi_run(data_dir):
         run_files = _group_vtu_by_run(data_dir, timestep_stride)
         run_ids = list(run_files.keys())
+        # Must mirror dataset.py's deterministic shuffle so the test set
+        # held out at inference matches the runs the model never saw
+        # during training.  Seed 42 is hard-coded in dataset.py.
+        import random as _random
+        _random.Random(42).shuffle(run_ids)
         n_runs = len(run_ids)
         n_train_runs = max(1, int(n_runs * cfg.train_fraction))
         n_val_runs = max(1, int(n_runs * cfg.val_fraction))
