@@ -47,6 +47,37 @@ equivariantly decoded vector fields; the remaining columns are scalar
 outputs from the standard MLP decoder.  This layout matches the TARGET_KEYS
 ordering ``[u (3), v (3), a (3), evf (1), s (6), cpress (1)]`` when
 ``n_vec_outputs=3``.
+
+Optional architectural extensions
+---------------------------------
+Two boolean flags on :class:`FiberEquivariantMGN` (and
+:class:`FiberEquivariantKAN`) toggle additional invariants / equivariant
+basis vectors.  In the ``needle_tissue_cropped`` example they are exposed
+as the Hydra config keys ``fiber_extra_invariants`` and
+``fiber_extra_decoder_basis``.
+
+* ``extra_edge_invariants`` (config: ``fiber_extra_invariants``) — augment
+  the edge encoder with 4 additional rotation-invariant scalars on top of
+  the existing ``(cos θ, cos φ)``:
+
+    - ``cos θ_dst = d_j · ê_ij``        (symmetric counterpart of cos θ)
+    - ``bond_corr = cos θ · cos θ_dst``  (l=2-flavour alignment correlator)
+    - ``dv_along_edge = (v_j - v_i) · ê_ij``  (compression rate along edge)
+    - ``dv_norm = ||v_j - v_i||``        (relative speed)
+
+  Brings velocity into the per-edge ``α`` weights so ``V`` is no longer
+  purely fiber-modulated; gives the model a way to break the y-axis
+  symmetry that otherwise locks needle deflection into the x-z plane.
+  Requires ``graph.node_velocity`` (always supplied by the dataset).
+
+* ``extra_decoder_basis`` (config: ``fiber_extra_decoder_basis``) — enrich
+  the decoder's local basis from ``{V, d, V × d}`` (3 vectors, can be 1-D
+  when ``V ∥ d``) to ``{V, d, V × d, W, W × d}`` (5 vectors, reliably 3-D).
+  The new aggregate ``W = Σⱼ βⱼ · (d_i × ê_ij)`` is by construction
+  perpendicular to ``d``, so the transverse-to-fiber direction is always
+  represented even when ``V``'s direction is dominated by axial neighbours.
+  Adds one ``beta_head`` per processor layer plus 2 invariants in
+  ``_FiberEquivNodeBlock`` and the decoder.
 """
 
 from dataclasses import dataclass
