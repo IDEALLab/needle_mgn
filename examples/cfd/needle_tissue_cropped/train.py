@@ -21,10 +21,12 @@ import re
 import time
 
 import hydra
+import numpy as np
 import torch
 import wandb
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
+from scipy.spatial import cKDTree
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 
@@ -122,9 +124,14 @@ class MGNTrainer:
             mgn_include_prev_v=bool(cfg.get("mgn_include_prev_v", False)),
             mgn_include_evf=bool(cfg.get("mgn_include_evf", False)),
             mgn_kinematic_needle_only=bool(cfg.get("mgn_kinematic_needle_only", False)),
+            multistep_K=int(cfg.get("multistep_K", 1)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
-        val_dataset = NeedleTissueDataset(split="validation", **_shared_dataset_kwargs)
+        # Val keeps K=1 so the metric is the standard 1-step rel-err and
+        # short val runs aren't pruned for lack of K future frames.
+        _val_kwargs = dict(_shared_dataset_kwargs)
+        _val_kwargs["multistep_K"] = 1
+        val_dataset = NeedleTissueDataset(split="validation", **_val_kwargs)
         # Stash so validation() can label its rel-err output by the actual
         # TARGET_KEYS (which depend on use_cpress and drop_targets) rather
         # than the previously-hardcoded ["u","v","a"].
@@ -256,6 +263,23 @@ class MGNTrainer:
         )
         self.scaler = GradScaler()
 
+        # ---- Multi-step rollout curriculum --------------------------------
+        self.multistep_K = int(cfg.get("multistep_K", 1))
+        self.multistep_w_max = float(cfg.get("multistep_w_max", 0.7))
+        self.multistep_warmup_epochs = int(cfg.get("multistep_warmup_epochs", 5))
+        self.world_edge_radius = float(cfg.get("world_edge_radius", 1.2))
+        self._multistep_total_epochs = int(cfg.epochs)
+        self._current_w = 0.0
+        if self.multistep_K > 1:
+            if bool(cfg.get("per_region_norm", False)) or bool(cfg.get("mgn_paper_features", False)):
+                raise ValueError(
+                    "multistep_K>1 currently requires per_region_norm=false and "
+                    "mgn_paper_features=false (rollout state-update path)."
+                )
+            if int(cfg.batch_size) != 1:
+                raise ValueError("multistep_K>1 requires batch_size=1.")
+            self._build_rollout_stats(train_dataset)
+
         if dist.world_size > 1:
             torch.distributed.barrier()
         self.epoch_init = load_checkpoint(
@@ -266,6 +290,203 @@ class MGNTrainer:
             scaler=self.scaler,
             device=dist.device,
         )
+
+    def _build_rollout_stats(self, dataset):
+        """Cache the (target_std/input_std) ratios needed to update the
+        normalised x in-place after each rollout step.
+
+        For each TARGET_KEY k that maps to an INPUT_KEY (u, v, a, evf, s,
+        cpress), compute the slice of x that holds that input feature, the
+        slice of pred that holds the corresponding output, and the per-channel
+        scaling tensors used by the update rule
+
+            Δx_norm = Δf_raw / input_std,    Δf_raw = pred_norm * tgt_std + tgt_mean.
+        """
+        device = self.dist.device
+        node_stats = dataset._node_stats
+        target_stats = dataset._target_stats
+
+        # Column offsets in pred (concat of TARGET_KEYS).
+        tgt_offsets = {}
+        off = 0
+        for k, d in zip(dataset.TARGET_KEYS, dataset.TARGET_DIMS):
+            tgt_offsets[k] = (off, off + d)
+            off += d
+
+        # Column offsets in x (concat of INPUT_KEYS, then STATIC_PROP_KEYS).
+        in_offsets = {}
+        off = 0
+        for k, d in zip(dataset.INPUT_KEYS, dataset.INPUT_DIMS):
+            in_offsets[k] = (off, off + d)
+            off += d
+
+        # u-target updates BOTH u-input and coord-input; record both.
+        self._rollout_updates = []  # list of (tgt_slice, input_slice_or_None, ratio, bias)
+        for tkey in dataset.TARGET_KEYS:
+            if tkey not in in_offsets:
+                # Target without a matching input feature (shouldn't happen
+                # in current setup, but skip just in case).
+                continue
+            t_lo, t_hi = tgt_offsets[tkey]
+            i_lo, i_hi = in_offsets[tkey]
+            t_mean = target_stats[f"{tkey}_mean"].to(device).float()
+            t_std = target_stats[f"{tkey}_std"].to(device).float()
+            i_std = node_stats[f"{tkey}_std"].to(device).float()
+            ratio = (t_std / i_std).view(1, -1)
+            bias = (t_mean / i_std).view(1, -1)
+            self._rollout_updates.append(("input", tkey, (t_lo, t_hi), (i_lo, i_hi), ratio, bias))
+
+        # u-target also updates coord-input (raw): coord_norm += Δu_raw / coord_std.
+        if "u" in tgt_offsets and "coord" in in_offsets:
+            t_lo, t_hi = tgt_offsets["u"]
+            c_lo, c_hi = in_offsets["coord"]
+            t_mean = target_stats["u_mean"].to(device).float()
+            t_std = target_stats["u_std"].to(device).float()
+            c_std = node_stats["coord_std"].to(device).float()
+            ratio = (t_std / c_std).view(1, -1)
+            bias = (t_mean / c_std).view(1, -1)
+            self._rollout_updates.append(("coord", "u", (t_lo, t_hi), (c_lo, c_hi), ratio, bias))
+
+        # u-target also updates pos (raw mm).  Δpos_raw = pred_norm * t_std + t_mean.
+        self._u_tgt_slice = tgt_offsets.get("u")
+        self._u_t_mean = target_stats["u_mean"].to(device).float().view(1, -1)
+        self._u_t_std = target_stats["u_std"].to(device).float().view(1, -1)
+
+        # v-target updates node_velocity: v_norm += Δv_raw / v_input_std.
+        if "v" in tgt_offsets:
+            t_lo, t_hi = tgt_offsets["v"]
+            t_mean = target_stats["v_mean"].to(device).float().view(1, -1)
+            t_std = target_stats["v_std"].to(device).float().view(1, -1)
+            v_std = node_stats["v_std"].to(device).float().view(1, -1)
+            self._v_update = ((t_lo, t_hi), t_std / v_std, t_mean / v_std)
+        else:
+            self._v_update = None
+
+        # Hex edge type one-hots (col 2 = world).  Cached for rebuilding.
+        self._world_edge_radius = self.world_edge_radius
+
+    def _rebuild_edges(self, pos, edge_index, edge_attr, is_needle):
+        """Rebuild contact (world) edges from current pos; keep hex edges fixed.
+
+        Returns (new_edge_index, new_edge_attr) where edge_attr's first 4
+        columns (rel_pos, edge_len) are computed against the live pos tensor
+        so gradients flow through the geometry.  Edge connectivity itself is
+        a discrete np.int64 tensor and carries no gradient — that's fine.
+        """
+        # Identify hex (mesh) vs world edges by the one-hot in the trailing
+        # 3 columns of edge_attr.
+        type_oh = edge_attr[:, -3:]
+        is_world_edge = type_oh[:, 2] > 0.5
+        hex_mask = ~is_world_edge
+
+        hex_ei = edge_index[:, hex_mask]
+        hex_oh = type_oh[hex_mask]
+
+        # Rebuild world edges from current needle / tissue positions.
+        pos_np = pos.detach().cpu().numpy()
+        needle_local = torch.nonzero(is_needle, as_tuple=False).squeeze(-1)
+        tissue_local = torch.nonzero(~is_needle, as_tuple=False).squeeze(-1)
+        if needle_local.numel() == 0 or tissue_local.numel() == 0:
+            new_ei = hex_ei
+            new_oh = hex_oh
+        else:
+            tissue_pts = pos_np[tissue_local.cpu().numpy()]
+            needle_pts = pos_np[needle_local.cpu().numpy()]
+            tree = cKDTree(tissue_pts)
+            neigh = tree.query_ball_point(needle_pts, r=self._world_edge_radius)
+            src_l, dst_l = [], []
+            n_loc_np = needle_local.cpu().numpy()
+            t_loc_np = tissue_local.cpu().numpy()
+            for i, nbrs in enumerate(neigh):
+                if not nbrs:
+                    continue
+                ng = int(n_loc_np[i])
+                for j in nbrs:
+                    src_l.append(ng)
+                    dst_l.append(int(t_loc_np[j]))
+            if not src_l:
+                new_ei = hex_ei
+                new_oh = hex_oh
+            else:
+                src_t = torch.tensor(src_l, dtype=torch.long, device=pos.device)
+                dst_t = torch.tensor(dst_l, dtype=torch.long, device=pos.device)
+                world_ei = torch.stack(
+                    [torch.cat([src_t, dst_t]), torch.cat([dst_t, src_t])], dim=0
+                )
+                world_oh = torch.zeros(world_ei.shape[1], 3, dtype=hex_oh.dtype, device=pos.device)
+                world_oh[:, 2] = 1.0
+                new_ei = torch.cat([hex_ei, world_ei], dim=1)
+                new_oh = torch.cat([hex_oh, world_oh], dim=0)
+
+        src, dst = new_ei
+        rel_pos = pos[src] - pos[dst]
+        edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
+        new_attr = torch.cat([rel_pos, edge_len, new_oh], dim=-1)
+        # If edge_attr had extra columns (mgn_paper_features), they would sit
+        # between edge_len and the type one-hot.  Multistep is gated to
+        # mgn_paper_features=false so the standard 7-col layout always holds.
+        return new_ei, new_attr
+
+    def _apply_rollout_step(self, graph, pred):
+        """Update graph state in place using the model's prediction.
+
+        Updates: graph.x (input feature normalised state), graph.pos (raw),
+        graph.node_velocity (normalised v), graph.edge_index, graph.edge_attr.
+        Also recomputes graph.x_scalar / graph.x_vec splits to mirror the
+        dataset (TFN path); for non-TFN models these aren't read but we keep
+        them consistent.
+        """
+        # Run state update in float32 to avoid autocast-induced precision
+        # drift across many rollout steps.
+        pred = pred.float()
+        x = graph.x.float()
+        new_x = x.clone()
+
+        # Per-target updates to x.
+        for _kind, _key, t_slice, i_slice, ratio, bias in self._rollout_updates:
+            t_lo, t_hi = t_slice
+            i_lo, i_hi = i_slice
+            pred_slice = pred[:, t_lo:t_hi]
+            new_x[:, i_lo:i_hi] = new_x[:, i_lo:i_hi] + ratio * pred_slice + bias
+
+        # Raw Δu for pos update and node_velocity (computed separately below).
+        u_lo, u_hi = self._u_tgt_slice
+        u_pred_norm = pred[:, u_lo:u_hi]
+        u_raw = u_pred_norm * self._u_t_std + self._u_t_mean
+        new_pos = graph.pos + u_raw
+
+        # node_velocity update via v target.
+        new_nv = graph.node_velocity
+        if self._v_update is not None:
+            (v_lo, v_hi), v_ratio, v_bias = self._v_update
+            v_pred = pred[:, v_lo:v_hi]
+            new_nv = graph.node_velocity + v_ratio * v_pred + v_bias
+
+        # Rebuild edges (hex fixed, world recomputed from new_pos).
+        new_ei, new_attr = self._rebuild_edges(
+            new_pos, graph.edge_index, graph.edge_attr, graph.is_needle
+        )
+        graph.x = new_x
+        graph.pos = new_pos
+        graph.edge_index = new_ei
+        graph.edge_attr = new_attr
+        graph.node_velocity = new_nv
+        return graph
+
+    def _masked_mse(self, pred, y, mask):
+        if mask is not None:
+            diff_sq = (pred - y) ** 2
+            return (diff_sq * mask).sum() / mask.sum().clamp(min=1.0)
+        return self.criterion(pred, y)
+
+    def _curriculum_w(self, epoch):
+        if self.multistep_K <= 1:
+            return 0.0
+        if epoch < self.multistep_warmup_epochs:
+            return 0.0
+        denom = max(1, self._multistep_total_epochs - self.multistep_warmup_epochs)
+        frac = (epoch - self.multistep_warmup_epochs) / denom
+        return min(1.0, frac) * self.multistep_w_max
 
     def _unpack_batch(self, batch):
         """Return (graph, ms_edges, ms_ids) regardless of BSMS mode."""
@@ -303,13 +524,34 @@ class MGNTrainer:
             else:
                 pred = self.model(x, graph.edge_attr, graph)
             mask = getattr(graph, "loss_mask", None)
-            if mask is not None:
-                # Masked MSE: ignore zeroed-out (tissue, kinematic-target)
-                # entries instead of letting them dominate the gradient with
-                # essentially-noise targets.
-                diff_sq = (pred - y) ** 2
-                return (diff_sq * mask).sum() / mask.sum().clamp(min=1.0)
-            return self.criterion(pred, y)
+            l1 = self._masked_mse(pred, y, mask)
+
+            w = self._current_w
+            if self.multistep_K <= 1 or w <= 0.0:
+                return l1
+
+            # ---- K-step rollout branch ----
+            # Update graph from the just-computed pred and unroll K-1 more
+            # forward passes, comparing each to the cached future_deltas.
+            future = graph.future_deltas  # (n_sub, K, output_dim)
+            # L_K = mean MSE over all K rollout steps (k=0 is the 1-step
+            # prediction we already made; subsequent steps unroll the model
+            # autoregressively, rebuilding world edges each step).
+            step_losses = [l1]
+            self._apply_rollout_step(graph, pred)
+            for k in range(1, self.multistep_K):
+                pred_k = self.model(graph.x, graph.edge_attr, graph)
+                target_k = future[:, k, :]
+                step_losses.append(self._masked_mse(pred_k, target_k, mask))
+                if k < self.multistep_K - 1:
+                    self._apply_rollout_step(graph, pred_k)
+            l_k = torch.stack(step_losses).mean()
+            wandb.log({
+                "train_l1": l1.detach().item(),
+                "train_lk": l_k.detach().item(),
+                "rollout_w": w,
+            })
+            return (1.0 - w) * l1 + w * l_k
 
     def backward(self, loss):
         if self.amp:
@@ -398,6 +640,7 @@ def main(cfg: DictConfig) -> None:
 
     for epoch in range(trainer.epoch_init, cfg.epochs):
         trainer.dataloader.sampler.set_epoch(epoch)
+        trainer._current_w = trainer._curriculum_w(epoch)
         loss_agg = 0.0
         for batch in trainer.dataloader:
             loss = trainer.train(batch)

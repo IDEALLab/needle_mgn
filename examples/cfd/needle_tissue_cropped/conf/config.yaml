@@ -270,6 +270,26 @@ val_every: 10
 save_every: 10
 
 # -------------------------
+# Multi-step rollout training (curriculum)
+# -------------------------
+# When multistep_K > 1, training loss becomes
+#   L = (1 - w) * L_1step + w * L_Kstep
+# where L_Kstep is the mean MSE over k=1..K predicted increments unrolled
+# autoregressively from frame t (same crop, world edges rebuilt each step
+# from the predicted needle positions).
+#
+# Curriculum: w = 0 for the first multistep_warmup_epochs, then ramps
+# linearly to multistep_w_max over the remaining epochs.
+#
+# Caveats: requires per_region_norm=false and mgn_paper_features=false
+# (the rollout-state update path is only implemented for the standard
+# input scheme).  Recommend batch_size=1 (per-step world-edge rebuild
+# uses a CPU cKDTree per graph in the batch).
+multistep_K: 1
+multistep_w_max: 0.7
+multistep_warmup_epochs: 5
+
+# -------------------------
 # Inference (infer.py)
 # -------------------------
 infer_start_frame: null

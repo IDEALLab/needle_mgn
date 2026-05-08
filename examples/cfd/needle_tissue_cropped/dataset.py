@@ -781,6 +781,7 @@ class NeedleTissueDataset(Dataset):
         mgn_include_prev_v: bool = False,
         mgn_include_evf: bool = False,
         mgn_kinematic_needle_only: bool = False,
+        multistep_K: int = 1,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -806,6 +807,7 @@ class NeedleTissueDataset(Dataset):
                 "Cannot drop both 'u' and 'v': u must be either predicted directly "
                 "or derived from a predicted v via trapezoidal integration."
             )
+        self.multistep_K = max(1, int(multistep_K))
         self.mgn_paper_features = mgn_paper_features
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
         self.mgn_include_prev_v = mgn_include_prev_v
@@ -992,7 +994,7 @@ class NeedleTissueDataset(Dataset):
                         "node_props": graph_cache["node_props"],
                     }
                 )
-                for t in range(n_kept - 1):
+                for t in range(n_kept - self.multistep_K):
                     self._samples.append((r_idx, t))
 
         else:
@@ -1047,7 +1049,7 @@ class NeedleTissueDataset(Dataset):
                     "node_props": cache["node_props"],
                 }
             )
-            for t in range(n_pairs_split):
+            for t in range(n_pairs_split - (self.multistep_K - 1)):
                 self._samples.append((0, t))
 
         # ---- BSMS precomputation (bistride mode, fixed topology) ------------
@@ -1526,6 +1528,41 @@ class NeedleTissueDataset(Dataset):
         )
         if loss_mask is not None:
             data_kwargs["loss_mask"] = loss_mask
+
+        # Multi-step rollout targets: normalised increments for future steps
+        # t+k → t+k+1 for k=1..K-1.  k=0 is already in y_sub.  Cropped to
+        # part_nodes (the same node set as x_sub/y_sub) — frame-t crop is
+        # held fixed across the K rollout steps.
+        if self.multistep_K > 1:
+            future_list = [y_sub.unsqueeze(1)]  # (n_sub, 1, output_dim)
+            for k in range(1, self.multistep_K):
+                parts = []
+                for key in self.TARGET_KEYS:
+                    delta_k = ft[key][t_local + k + 1] - ft[key][t_local + k]
+                    if self.per_region_norm:
+                        dn = delta_k.clone()
+                        dn[self._needle_idx_t] = (
+                            delta_k[self._needle_idx_t] - self._target_stats[f"{key}_needle_mean"]
+                        ) / self._target_stats[f"{key}_needle_std"]
+                        dn[self._tissue_idx_t] = (
+                            delta_k[self._tissue_idx_t] - self._target_stats[f"{key}_tissue_mean"]
+                        ) / self._target_stats[f"{key}_tissue_std"]
+                        parts.append(dn)
+                    else:
+                        parts.append(
+                            (delta_k - self._target_stats[f"{key}_mean"])
+                            / self._target_stats[f"{key}_std"]
+                        )
+                future_list.append(torch.cat(parts, dim=-1)[part_nodes].unsqueeze(1))
+            data_kwargs["future_deltas"] = torch.cat(future_list, dim=1)  # (n_sub, K, output_dim)
+            # Bool mask: which local nodes are needle.  Used by the trainer to
+            # rebuild world (contact) edges each rollout step from the live
+            # predicted positions (mirrors infer.py's _build_world_edges).
+            is_needle = torch.zeros(part_nodes.shape[0], dtype=torch.bool)
+            is_needle_full = torch.zeros(self.n_nodes, dtype=torch.bool)
+            is_needle_full[self._needle_idx_t] = True
+            is_needle = is_needle_full[part_nodes]
+            data_kwargs["is_needle"] = is_needle
         return Data(**data_kwargs)
 
     # ------------------------------------------------------------------
