@@ -502,6 +502,8 @@ class MGNTrainer:
     def train(self, batch):
         self.optimizer.zero_grad()
         graph, ms_edges, ms_ids = self._unpack_batch(batch)
+        if self.multistep_K > 1 and self._current_w > 0.0:
+            return self._train_multistep(graph)
         loss = self.forward(graph, ms_edges, ms_ids)
         self.backward(loss)
         self.scheduler.step()
@@ -524,34 +526,95 @@ class MGNTrainer:
             else:
                 pred = self.model(x, graph.edge_attr, graph)
             mask = getattr(graph, "loss_mask", None)
+            return self._masked_mse(pred, y, mask)
+
+    def _train_multistep(self, graph):
+        """Pushforward-trick K-step training: each step's loss backprops
+        through *one* forward pass only.
+
+        At step boundaries, the predicted state is detached and used to seed
+        the next forward pass.  Per-step losses are scaled and backwarded
+        immediately (under AMP, via GradScaler.scale().backward()) so the
+        autograd activations for that step are released before the next
+        forward pass allocates more.
+
+        Loss combination:
+            total = (1 - w) * L_1 + w * (1/K) * Σ_{k=0..K-1} L_k
+        which expands to per-step weights
+            w_1step  = (1 - w) + w / K     (applied to the k=0 forward)
+            w_kstep  = w / K               (applied to each k=1..K-1 forward)
+        The k=0 forward is the standard 1-step prediction (with optional
+        noise injection); k=1..K-1 use the rolled, detached state.
+        """
+        K = self.multistep_K
+        w = self._current_w
+        w1 = (1.0 - w) + w / K
+        wk = w / K
+
+        mask = getattr(graph, "loss_mask", None)
+        future = graph.future_deltas  # (n_sub, K, output_dim)
+
+        # ---- Step 0: standard 1-step forward + backward. -----------------
+        with autocast(device_type=self.dist.device.type, enabled=self.amp):
+            x, y = graph.x, graph.y
+            if self.noise_std > 0.0:
+                noise = torch.randn(x.shape[0], 9, device=x.device, dtype=x.dtype) * self.noise_std
+                x = x.clone()
+                x[:, 3:12] = x[:, 3:12] + noise
+                y = y.clone()
+                y[:, :9] = y[:, :9] - noise
+            pred = self.model(x, graph.edge_attr, graph)
             l1 = self._masked_mse(pred, y, mask)
+            scaled_l1 = w1 * l1
+        if self.amp:
+            self.scaler.scale(scaled_l1).backward()
+        else:
+            scaled_l1.backward()
+        l1_val = float(l1.detach().item())
 
-            w = self._current_w
-            if self.multistep_K <= 1 or w <= 0.0:
-                return l1
+        # Detach pred and advance the graph state for the rollout chain.
+        # All subsequent forwards see detached x/pos/edge_attr/node_velocity,
+        # so each forward's autograd graph is independent and can be freed
+        # by the per-step backward.
+        self._apply_rollout_step(graph, pred.detach())
+        # Drop step-0's tensors so the autograd graph is fully released.
+        del pred, scaled_l1, l1, x, y
 
-            # ---- K-step rollout branch ----
-            # Update graph from the just-computed pred and unroll K-1 more
-            # forward passes, comparing each to the cached future_deltas.
-            future = graph.future_deltas  # (n_sub, K, output_dim)
-            # L_K = mean MSE over all K rollout steps (k=0 is the 1-step
-            # prediction we already made; subsequent steps unroll the model
-            # autoregressively, rebuilding world edges each step).
-            step_losses = [l1]
-            self._apply_rollout_step(graph, pred)
-            for k in range(1, self.multistep_K):
+        lk_vals = []
+        for k in range(1, K):
+            with autocast(device_type=self.dist.device.type, enabled=self.amp):
                 pred_k = self.model(graph.x, graph.edge_attr, graph)
                 target_k = future[:, k, :]
-                step_losses.append(self._masked_mse(pred_k, target_k, mask))
-                if k < self.multistep_K - 1:
-                    self._apply_rollout_step(graph, pred_k)
-            l_k = torch.stack(step_losses).mean()
-            wandb.log({
-                "train_l1": l1.detach().item(),
-                "train_lk": l_k.detach().item(),
-                "rollout_w": w,
-            })
-            return (1.0 - w) * l1 + w * l_k
+                l_k = self._masked_mse(pred_k, target_k, mask)
+                scaled_lk = wk * l_k
+            if self.amp:
+                self.scaler.scale(scaled_lk).backward()
+            else:
+                scaled_lk.backward()
+            lk_vals.append(float(l_k.detach().item()))
+            if k < K - 1:
+                self._apply_rollout_step(graph, pred_k.detach())
+            del pred_k, scaled_lk, l_k
+
+        # ---- Optimiser step (replaces self.backward's tail). -------------
+        if self.amp:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+        self.scheduler.step()
+        lk_mean = sum(lk_vals) / max(1, len(lk_vals))
+        wandb.log({
+            "lr": self.get_lr(),
+            "train_l1": l1_val,
+            "train_lk": lk_mean,
+            "rollout_w": w,
+        })
+        total = (1.0 - w) * l1_val + w * ((l1_val + sum(lk_vals)) / K)
+        return torch.tensor(total, device=self.dist.device)
 
     def backward(self, loss):
         if self.amp:
