@@ -1529,6 +1529,13 @@ class NeedleTissueDataset(Dataset):
         if loss_mask is not None:
             data_kwargs["loss_mask"] = loss_mask
 
+        # Boolean per-local-node mask: True for needle nodes in the crop.
+        # Cheap (~few KB) and useful for any analysis script that wants to
+        # filter by node type without recomputing.
+        is_needle_full = torch.zeros(self.n_nodes, dtype=torch.bool)
+        is_needle_full[self._needle_idx_t] = True
+        data_kwargs["is_needle"] = is_needle_full[part_nodes]
+
         # Multi-step rollout targets: normalised increments for future steps
         # t+k → t+k+1 for k=1..K-1.  k=0 is already in y_sub.  Cropped to
         # part_nodes (the same node set as x_sub/y_sub) — frame-t crop is
@@ -1555,14 +1562,6 @@ class NeedleTissueDataset(Dataset):
                         )
                 future_list.append(torch.cat(parts, dim=-1)[part_nodes].unsqueeze(1))
             data_kwargs["future_deltas"] = torch.cat(future_list, dim=1)  # (n_sub, K, output_dim)
-            # Bool mask: which local nodes are needle.  Used by the trainer to
-            # rebuild world (contact) edges each rollout step from the live
-            # predicted positions (mirrors infer.py's _build_world_edges).
-            is_needle = torch.zeros(part_nodes.shape[0], dtype=torch.bool)
-            is_needle_full = torch.zeros(self.n_nodes, dtype=torch.bool)
-            is_needle_full[self._needle_idx_t] = True
-            is_needle = is_needle_full[part_nodes]
-            data_kwargs["is_needle"] = is_needle
         return Data(**data_kwargs)
 
     # ------------------------------------------------------------------
