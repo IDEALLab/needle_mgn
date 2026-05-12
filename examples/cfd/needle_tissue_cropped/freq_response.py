@@ -608,13 +608,16 @@ def _plot(out_dir: str, csv_a: str, csv_b: str, label_a: str, label_b: str):
     for data, lab, color in [(da, label_a, "tab:blue"), (db, label_b, "tab:red")]:
         lams, l2m, l2s, ftm, fts, pkm, plo, phi = _agg(data)
         agg_cache[lab] = (lams, l2m, l2s, ftm, fts, pkm, plo, phi, color)
-        axes[0].plot(lams, l2m, "o-", label=lab, color=color)
-        axes[0].fill_between(lams, l2m - l2s, l2m + l2s, alpha=0.2, color=color)
-        axes[1].plot(lams, ftm, "o-", label=lab, color=color)
-        axes[1].fill_between(lams, np.maximum(ftm - fts, 1e-12), ftm + fts, alpha=0.2, color=color)
+        axes[0].plot(lams, l2m, "o-", label=f"{lab} (mean)", color=color)
+        axes[0].fill_between(lams, l2m - l2s, l2m + l2s, alpha=0.2, color=color,
+                             label=f"{lab} (±1 std over centres)")
+        axes[1].plot(lams, ftm, "o-", label=f"{lab} (mean)", color=color)
+        axes[1].fill_between(lams, np.maximum(ftm - fts, 1e-12), ftm + fts, alpha=0.2,
+                             color=color, label=f"{lab} (±1 std over centres)")
         # Output peak wavelength vs input wavelength (with IQR band).
-        axes[2].plot(lams, pkm, "o-", label=lab, color=color)
-        axes[2].fill_between(lams, plo, phi, alpha=0.2, color=color)
+        axes[2].plot(lams, pkm, "o-", label=f"{lab} (median)", color=color)
+        axes[2].fill_between(lams, plo, phi, alpha=0.2, color=color,
+                             label=f"{lab} (IQR over centres)")
     # y=x reference line on the peak-wavelength panel.
     lam_min = min(agg_cache[label_a][0].min(), agg_cache[label_b][0].min())
     lam_max = max(agg_cache[label_a][0].max(), agg_cache[label_b][0].max())
@@ -633,10 +636,10 @@ def _plot(out_dir: str, csv_a: str, csv_b: str, label_a: str, label_b: str):
         ax.legend()
     fig.suptitle("Frequency response — transverse Gabor wavelet on needle u")
     fig.tight_layout()
-    out_png = os.path.join(out_dir, "freq_response.png")
-    fig.savefig(out_png, dpi=140)
+    out_svg = os.path.join(out_dir, "freq_response.svg")
+    fig.savefig(out_svg)
     plt.close(fig)
-    print(f"wrote plot → {out_png}", flush=True)
+    print(f"wrote plot → {out_svg}", flush=True)
 
     # ---- Spectral-descriptor figure (centroid / bandwidth / HF energy). --
     def _agg_spec(data):
@@ -669,13 +672,17 @@ def _plot(out_dir: str, csv_a: str, csv_b: str, label_a: str, label_b: str):
     for data, lab, color in [(da, label_a, "tab:blue"), (db, label_b, "tab:red")]:
         (lams, cr, crl, crh, bw, bwl, bwh,
          hf2, hf2s, hf5, hf5s) = _agg_spec(data)
-        axes_s[0].plot(lams, cr, "o-", label=lab, color=color)
-        axes_s[0].fill_between(lams, crl, crh, alpha=0.2, color=color)
-        axes_s[1].plot(lams, bw, "o-", label=lab, color=color)
-        axes_s[1].fill_between(lams, bwl, bwh, alpha=0.2, color=color)
-        axes_s[2].plot(lams, hf2, "o-", label=f"{lab} (>2× k_in)", color=color)
-        axes_s[2].fill_between(lams, np.clip(hf2 - hf2s, 0, 1), np.clip(hf2 + hf2s, 0, 1), alpha=0.2, color=color)
-        axes_s[2].plot(lams, hf5, "s--", label=f"{lab} (>5× k_in)", color=color, alpha=0.7)
+        axes_s[0].plot(lams, cr, "o-", label=f"{lab} (median)", color=color)
+        axes_s[0].fill_between(lams, crl, crh, alpha=0.2, color=color,
+                               label=f"{lab} (IQR over centres)")
+        axes_s[1].plot(lams, bw, "o-", label=f"{lab} (median)", color=color)
+        axes_s[1].fill_between(lams, bwl, bwh, alpha=0.2, color=color,
+                               label=f"{lab} (IQR over centres)")
+        axes_s[2].plot(lams, hf2, "o-", label=f"{lab} (>2× k_in, median)", color=color)
+        axes_s[2].fill_between(lams, np.clip(hf2 - hf2s, 0, 1), np.clip(hf2 + hf2s, 0, 1),
+                               alpha=0.2, color=color,
+                               label=f"{lab} (>2× k_in, ±1 std over centres)")
+        axes_s[2].plot(lams, hf5, "s--", label=f"{lab} (>5× k_in, median)", color=color, alpha=0.7)
     # Reference: centroid_ratio = 1 means output centred at input frequency.
     axes_s[0].axhline(1.0, color="k", linestyle="--", alpha=0.5, label="centroid = k_in")
     for ax, ttl, ylab, ylog in [
@@ -693,10 +700,10 @@ def _plot(out_dir: str, csv_a: str, csv_b: str, label_a: str, label_b: str):
         ax.legend(fontsize=8)
     fig_s.suptitle("Spectral descriptors of the model's response")
     fig_s.tight_layout()
-    out_png_s = os.path.join(out_dir, "freq_response_spectral.png")
-    fig_s.savefig(out_png_s, dpi=140)
+    out_svg_s = os.path.join(out_dir, "freq_response_spectral.svg")
+    fig_s.savefig(out_svg_s)
     plt.close(fig_s)
-    print(f"wrote spectral-descriptor plot → {out_png_s}", flush=True)
+    print(f"wrote spectral-descriptor plot → {out_svg_s}", flush=True)
 
     # ---- Panel 2: output spectra at a selection of input wavelengths. ----
     npz_a = csv_a.replace(".csv", "_spectra.npz")
@@ -741,10 +748,10 @@ def _plot(out_dir: str, csv_a: str, csv_b: str, label_a: str, label_b: str):
         axes2[k // n_cols, k % n_cols].axis("off")
     fig2.suptitle("Output spectra at selected input wavelengths (mean over centres)")
     fig2.tight_layout()
-    out_png2 = os.path.join(out_dir, "freq_response_spectra.png")
-    fig2.savefig(out_png2, dpi=140)
+    out_svg2 = os.path.join(out_dir, "freq_response_spectra.svg")
+    fig2.savefig(out_svg2)
     plt.close(fig2)
-    print(f"wrote spectrum plot → {out_png2}", flush=True)
+    print(f"wrote spectrum plot → {out_svg2}", flush=True)
 
 
 def main():
