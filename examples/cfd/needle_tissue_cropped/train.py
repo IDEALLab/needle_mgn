@@ -271,13 +271,16 @@ class MGNTrainer:
         self._multistep_total_epochs = int(cfg.epochs)
         self._current_w = 0.0
         if self.multistep_K > 1:
-            if bool(cfg.get("per_region_norm", False)) or bool(cfg.get("mgn_paper_features", False)):
+            if bool(cfg.get("per_region_norm", False)):
                 raise ValueError(
-                    "multistep_K>1 currently requires per_region_norm=false and "
-                    "mgn_paper_features=false (rollout state-update path)."
+                    "multistep_K>1 currently requires per_region_norm=false."
                 )
             if int(cfg.batch_size) != 1:
                 raise ValueError("multistep_K>1 requires batch_size=1.")
+            self._mgn_paper_features = bool(cfg.get("mgn_paper_features", False))
+            self._mgn_include_evf = bool(cfg.get("mgn_include_evf", False))
+            self._mgn_include_mat_fiber = bool(cfg.get("mgn_include_mat_fiber", False))
+            self._mgn_include_prev_v = bool(cfg.get("mgn_include_prev_v", False))
             self._build_rollout_stats(train_dataset)
 
         if dist.world_size > 1:
@@ -295,16 +298,33 @@ class MGNTrainer:
         """Cache the (target_std/input_std) ratios needed to update the
         normalised x in-place after each rollout step.
 
-        For each TARGET_KEY k that maps to an INPUT_KEY (u, v, a, evf, s,
-        cpress), compute the slice of x that holds that input feature, the
-        slice of pred that holds the corresponding output, and the per-channel
-        scaling tensors used by the update rule
+        Handles two input schemes:
 
-            Δx_norm = Δf_raw / input_std,    Δf_raw = pred_norm * tgt_std + tgt_mean.
+        * Standard (mgn_paper_features=false): x is [coord, u, v, a, evf, s,
+          (cpress)] concatenated with the static material props.  Each
+          dynamic TARGET_KEY (u, v, a, evf, s, cpress) maps 1-1 to the input
+          slice of the same name; u also updates the coord slice and the
+          raw `pos`.
+
+        * MGN-paper (mgn_paper_features=true): x is [node_type(2),
+          evf(1)?, mat_fiber(3)?, prev_v(3)?] — most state features are
+          *not* in x.  We update:
+            - graph.pos via Δu_raw  (always),
+            - x[evf cols] via Δevf,        if mgn_include_evf
+            - x[prev_v cols] via Δv,       if mgn_include_prev_v
+          mat_fiber and node_type are static and never updated.
+
+        Δf_raw = pred_norm * tgt_std + tgt_mean
+        Δx_norm = Δf_raw / input_std
         """
         device = self.dist.device
         node_stats = dataset._node_stats
         target_stats = dataset._target_stats
+
+        def _to_t(stat_val) -> torch.Tensor:
+            if isinstance(stat_val, torch.Tensor):
+                return stat_val.to(device).float().view(1, -1)
+            return torch.tensor(stat_val, device=device).float().view(1, -1)
 
         # Column offsets in pred (concat of TARGET_KEYS).
         tgt_offsets = {}
@@ -313,83 +333,130 @@ class MGNTrainer:
             tgt_offsets[k] = (off, off + d)
             off += d
 
-        # Column offsets in x (concat of INPUT_KEYS, then STATIC_PROP_KEYS).
-        in_offsets = {}
-        off = 0
-        for k, d in zip(dataset.INPUT_KEYS, dataset.INPUT_DIMS):
-            in_offsets[k] = (off, off + d)
-            off += d
+        self._rollout_updates = []
+        if not self._mgn_paper_features:
+            # ---- Standard input layout -----------------------------------
+            in_offsets = {}
+            off = 0
+            for k, d in zip(dataset.INPUT_KEYS, dataset.INPUT_DIMS):
+                in_offsets[k] = (off, off + d)
+                off += d
 
-        # u-target updates BOTH u-input and coord-input; record both.
-        self._rollout_updates = []  # list of (tgt_slice, input_slice_or_None, ratio, bias)
-        for tkey in dataset.TARGET_KEYS:
-            if tkey not in in_offsets:
-                # Target without a matching input feature (shouldn't happen
-                # in current setup, but skip just in case).
-                continue
-            t_lo, t_hi = tgt_offsets[tkey]
-            i_lo, i_hi = in_offsets[tkey]
-            t_mean = target_stats[f"{tkey}_mean"].to(device).float()
-            t_std = target_stats[f"{tkey}_std"].to(device).float()
-            i_std = node_stats[f"{tkey}_std"].to(device).float()
-            ratio = (t_std / i_std).view(1, -1)
-            bias = (t_mean / i_std).view(1, -1)
-            self._rollout_updates.append(("input", tkey, (t_lo, t_hi), (i_lo, i_hi), ratio, bias))
+            for tkey in dataset.TARGET_KEYS:
+                if tkey not in in_offsets:
+                    continue
+                t_lo, t_hi = tgt_offsets[tkey]
+                i_lo, i_hi = in_offsets[tkey]
+                t_mean = _to_t(target_stats[f"{tkey}_mean"])
+                t_std = _to_t(target_stats[f"{tkey}_std"])
+                i_std = _to_t(node_stats[f"{tkey}_std"])
+                self._rollout_updates.append(
+                    ("input", tkey, (t_lo, t_hi), (i_lo, i_hi), t_std / i_std, t_mean / i_std)
+                )
 
-        # u-target also updates coord-input (raw): coord_norm += Δu_raw / coord_std.
-        if "u" in tgt_offsets and "coord" in in_offsets:
-            t_lo, t_hi = tgt_offsets["u"]
-            c_lo, c_hi = in_offsets["coord"]
-            t_mean = target_stats["u_mean"].to(device).float()
-            t_std = target_stats["u_std"].to(device).float()
-            c_std = node_stats["coord_std"].to(device).float()
-            ratio = (t_std / c_std).view(1, -1)
-            bias = (t_mean / c_std).view(1, -1)
-            self._rollout_updates.append(("coord", "u", (t_lo, t_hi), (c_lo, c_hi), ratio, bias))
+            if "u" in tgt_offsets and "coord" in in_offsets:
+                t_lo, t_hi = tgt_offsets["u"]
+                c_lo, c_hi = in_offsets["coord"]
+                t_mean = _to_t(target_stats["u_mean"])
+                t_std = _to_t(target_stats["u_std"])
+                c_std = _to_t(node_stats["coord_std"])
+                self._rollout_updates.append(
+                    ("coord", "u", (t_lo, t_hi), (c_lo, c_hi), t_std / c_std, t_mean / c_std)
+                )
+        else:
+            # ---- MGN-paper input layout ----------------------------------
+            # Match the column ordering written by dataset._build_graph
+            # under mgn_paper_features=true.
+            off_x = 2  # after node_type one-hot
+            if self._mgn_include_evf:
+                if "evf" in tgt_offsets:
+                    t_lo, t_hi = tgt_offsets["evf"]
+                    t_mean = _to_t(target_stats["evf_mean"])
+                    t_std = _to_t(target_stats["evf_std"])
+                    i_std = _to_t(node_stats["evf_std"])
+                    self._rollout_updates.append(
+                        ("input", "evf", (t_lo, t_hi), (off_x, off_x + 1),
+                         t_std / i_std, t_mean / i_std)
+                    )
+                off_x += 1
+            if self._mgn_include_mat_fiber:
+                # mat_fiber is static — no rollout update.
+                off_x += 3
+            if self._mgn_include_prev_v:
+                if "v" in tgt_offsets:
+                    t_lo, t_hi = tgt_offsets["v"]
+                    t_mean = _to_t(target_stats["v_mean"])
+                    t_std = _to_t(target_stats["v_std"])
+                    i_std = _to_t(node_stats["v_std"])
+                    self._rollout_updates.append(
+                        ("input", "prev_v", (t_lo, t_hi), (off_x, off_x + 3),
+                         t_std / i_std, t_mean / i_std)
+                    )
+                off_x += 3
 
-        # u-target also updates pos (raw mm).  Δpos_raw = pred_norm * t_std + t_mean.
+        # u-target also updates the raw `pos` (so edge_attr is recomputed
+        # from the moved geometry).  u is dropped only by the user; this is
+        # the one target that *must* be present for multi-step rollout to
+        # make sense, so warn if it's missing.
         self._u_tgt_slice = tgt_offsets.get("u")
-        self._u_t_mean = target_stats["u_mean"].to(device).float().view(1, -1)
-        self._u_t_std = target_stats["u_std"].to(device).float().view(1, -1)
+        if self._u_tgt_slice is None:
+            raise ValueError(
+                "multistep_K>1 requires 'u' in TARGET_KEYS so the rollout "
+                "can advance the geometry; current drop_targets removes 'u'."
+            )
+        self._u_t_mean = _to_t(target_stats["u_mean"])
+        self._u_t_std = _to_t(target_stats["u_std"])
 
-        # v-target updates node_velocity: v_norm += Δv_raw / v_input_std.
+        # node_velocity is attached unconditionally by the dataset (used by
+        # FiberEquivariantMGN's extra invariants; harmless otherwise).
+        # Update it from Δv whenever v is a target.
         if "v" in tgt_offsets:
             t_lo, t_hi = tgt_offsets["v"]
-            t_mean = target_stats["v_mean"].to(device).float().view(1, -1)
-            t_std = target_stats["v_std"].to(device).float().view(1, -1)
-            v_std = node_stats["v_std"].to(device).float().view(1, -1)
+            t_mean = _to_t(target_stats["v_mean"])
+            t_std = _to_t(target_stats["v_std"])
+            v_std = _to_t(node_stats["v_std"])
             self._v_update = ((t_lo, t_hi), t_std / v_std, t_mean / v_std)
         else:
             self._v_update = None
 
-        # Hex edge type one-hots (col 2 = world).  Cached for rebuilding.
         self._world_edge_radius = self.world_edge_radius
 
     def _rebuild_edges(self, pos, edge_index, edge_attr, is_needle):
         """Rebuild contact (world) edges from current pos; keep hex edges fixed.
 
-        Returns (new_edge_index, new_edge_attr) where edge_attr's first 4
-        columns (rel_pos, edge_len) are computed against the live pos tensor
-        so gradients flow through the geometry.  Edge connectivity itself is
-        a discrete np.int64 tensor and carries no gradient — that's fine.
+        Layouts supported:
+          - Standard (7 cols):   [rel_pos(3), edge_len(1), type_oh(3)]
+          - MGN-paper (11 cols): [rel_pos(3), edge_len(1), mesh_rel(3),
+                                  mesh_d(1), type_oh(3)]
+
+        `rel_pos` and `edge_len` are recomputed against the live `pos`
+        tensor so gradients flow through the geometry.  `mesh_rel`/`mesh_d`
+        are rest-state quantities — preserved on existing hex edges, set to
+        zero on newly-rebuilt world edges (matching the dataset's
+        convention for contact edges).  Edge connectivity is a discrete
+        long tensor and carries no gradient — fine.
         """
-        # Identify hex (mesh) vs world edges by the one-hot in the trailing
-        # 3 columns of edge_attr.
         type_oh = edge_attr[:, -3:]
         is_world_edge = type_oh[:, 2] > 0.5
         hex_mask = ~is_world_edge
+        extra_dim = edge_attr.shape[1] - 7  # 0 standard, 4 mgn-paper
+        if extra_dim < 0:
+            raise RuntimeError(
+                f"edge_attr has {edge_attr.shape[1]} cols; rollout supports 7 (standard) or 11 (mgn-paper)."
+            )
 
         hex_ei = edge_index[:, hex_mask]
         hex_oh = type_oh[hex_mask]
+        hex_extra = edge_attr[hex_mask, 4 : 4 + extra_dim] if extra_dim > 0 else None
 
         # Rebuild world edges from current needle / tissue positions.
         pos_np = pos.detach().cpu().numpy()
         needle_local = torch.nonzero(is_needle, as_tuple=False).squeeze(-1)
         tissue_local = torch.nonzero(~is_needle, as_tuple=False).squeeze(-1)
-        if needle_local.numel() == 0 or tissue_local.numel() == 0:
-            new_ei = hex_ei
-            new_oh = hex_oh
-        else:
+        new_ei = hex_ei
+        new_oh = hex_oh
+        new_extra = hex_extra
+        if needle_local.numel() > 0 and tissue_local.numel() > 0:
             tissue_pts = pos_np[tissue_local.cpu().numpy()]
             needle_pts = pos_np[needle_local.cpu().numpy()]
             tree = cKDTree(tissue_pts)
@@ -404,10 +471,7 @@ class MGNTrainer:
                 for j in nbrs:
                     src_l.append(ng)
                     dst_l.append(int(t_loc_np[j]))
-            if not src_l:
-                new_ei = hex_ei
-                new_oh = hex_oh
-            else:
+            if src_l:
                 src_t = torch.tensor(src_l, dtype=torch.long, device=pos.device)
                 dst_t = torch.tensor(dst_l, dtype=torch.long, device=pos.device)
                 world_ei = torch.stack(
@@ -417,14 +481,20 @@ class MGNTrainer:
                 world_oh[:, 2] = 1.0
                 new_ei = torch.cat([hex_ei, world_ei], dim=1)
                 new_oh = torch.cat([hex_oh, world_oh], dim=0)
+                if extra_dim > 0:
+                    world_extra = torch.zeros(
+                        world_ei.shape[1], extra_dim,
+                        dtype=hex_extra.dtype, device=pos.device,
+                    )
+                    new_extra = torch.cat([hex_extra, world_extra], dim=0)
 
         src, dst = new_ei
         rel_pos = pos[src] - pos[dst]
         edge_len = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
-        new_attr = torch.cat([rel_pos, edge_len, new_oh], dim=-1)
-        # If edge_attr had extra columns (mgn_paper_features), they would sit
-        # between edge_len and the type one-hot.  Multistep is gated to
-        # mgn_paper_features=false so the standard 7-col layout always holds.
+        if extra_dim > 0:
+            new_attr = torch.cat([rel_pos, edge_len, new_extra, new_oh], dim=-1)
+        else:
+            new_attr = torch.cat([rel_pos, edge_len, new_oh], dim=-1)
         return new_ei, new_attr
 
     def _apply_rollout_step(self, graph, pred):
