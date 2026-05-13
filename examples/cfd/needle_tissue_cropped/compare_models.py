@@ -1460,6 +1460,17 @@ def _plot_bias_spectrum(out_dir, csv_a, csv_b, label_a, label_b):
     db = _read(csv_b)
 
     components = ["axial", "transverse1", "transverse2", "magnitude"]
+    # Display labels: the bevel tip is parallel to world Y, so the 2nd
+    # principal axis of the needle point cloud (transverse1) consistently
+    # aligns with ±Y (sign rule anchors it to +Y).  transverse2 = axis ×
+    # transverse1, which for needle ≈ +Z gives the in-plane perpendicular,
+    # ≈ −X.  Show these physical-axis hints to the reader.
+    component_labels = {
+        "axial": "axial (along needle, ≈ Z)",
+        "transverse1": "transverse — bevel-aligned (≈ +Y)",
+        "transverse2": "transverse — perpendicular to bevel (≈ −X)",
+        "magnitude": "magnitude",
+    }
     colors = {label_a: "tab:blue", label_b: "tab:red"}
 
     # Discover the set of step indices the workers wrote.  step == -1 is
@@ -1491,8 +1502,8 @@ def _plot_bias_spectrum(out_dir, csv_a, csv_b, label_a, label_b):
             ax.set_xscale("log")
             ax.set_yscale("log")
             ax.set_xlabel("wavenumber k (cycles per needle length)")
-            ax.set_ylabel(f"|F(bias_{comp})|  (raw mm)")
-            ax.set_title(f"Bias spectrum — {comp}")
+            ax.set_ylabel("|F(bias)|  (raw mm)")
+            ax.set_title(f"Bias spectrum — {component_labels[comp]}")
             ax.grid(True, which="both", alpha=0.3)
             ax.legend(fontsize=8)
         fig.suptitle(f"Spectral content of ⟨pred_u − GT_u⟩  ({title_suffix})")
@@ -1518,8 +1529,8 @@ def _plot_bias_spectrum(out_dir, csv_a, csv_b, label_a, label_b):
                 ax.plot(x, y, "-", color=colors[lab], label=lab)
             ax.axhline(0.0, color="k", linestyle="--", alpha=0.4)
             ax.set_xlabel("normalised axial position (tip → base)")
-            ax.set_ylabel(f"⟨bias⟩  ({comp}, mm)")
-            ax.set_title(f"Spatial bias — {comp}")
+            ax.set_ylabel("⟨bias⟩  (mm)")
+            ax.set_title(f"Spatial bias — {component_labels[comp]}")
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=8)
         fig.suptitle(f"Mean needle-u error vs needle axial position  ({title_suffix})")
