@@ -1243,6 +1243,303 @@ def _plot_mat_fiber_noise(out_dir, csv_a, csv_b, label_a, label_b, amplitudes):
 
 
 # ===========================================================================
+# Experiment 5: bias spectrum.
+# ===========================================================================
+#
+# For each model we want the spatial spectrum of the *systematic* needle
+# position-error — i.e. the part of (pred_u − GT_u) that survives averaging
+# across many rollout steps and across the entire test split.  The
+# hypothesis is that an equivariance-broken model accumulates a bias that
+# varies slowly along the needle axis, which would show up as concentrated
+# spectral energy at low wavenumbers.
+#
+# Per-sample procedure (run autoregressively for n_steps):
+#   1. Compute per-needle-node 3-D error vector at each step.
+#   2. Project onto a needle-aligned basis (axial, transverse1, transverse2)
+#      with deterministic sign conventions so contributions from different
+#      samples add coherently.
+#   3. Sort by normalised axial coord ∈ [0, 1] and interpolate each of the
+#      three scalar components onto a uniform grid of size n_grid.
+#   4. Sum step-by-step into a global accumulator (n_grid bins per component);
+#      track the count.
+# After all samples:
+#   bias[c, x] = sum[c, x] / count.
+#   |F(k)|_c   = |rfft(bias[c, x])|     — the bias spectrum per component.
+
+def _stable_needle_basis(pos_needle: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (axis, transverse1, transverse2, axial_coord) with sign
+    conventions stable across samples.
+
+    Sign rule (idempotent across SVD sign flips):
+      * axis: flip so the component with the largest absolute value is positive.
+      * transverse1: flip so its largest-abs component is positive.
+      * transverse2 = axis × transverse1  (right-handed).
+    """
+    axis, transverse1, axial = _needle_axis_and_transverse(pos_needle)
+    if float(axis[int(torch.argmax(torch.abs(axis)).item())]) < 0:
+        axis = -axis
+        axial = -axial
+    if float(transverse1[int(torch.argmax(torch.abs(transverse1)).item())]) < 0:
+        transverse1 = -transverse1
+    transverse2 = torch.cross(axis, transverse1, dim=-1)
+    return axis, transverse1, transverse2, axial
+
+
+def _worker_bias_spectrum(rank: int, exp_dir: str, data_dir: str,
+                          n_steps: int, n_grid: int, n_samples_max: Optional[int],
+                          out_path: str, label: str):
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    print(f"[{label}|cuda:{rank}] loading ...", flush=True)
+    _, _, engine = load_experiment(exp_dir, data_dir, device)
+    dataset = _reload_dataset_with_K(exp_dir, data_dir, n_steps)
+    engine.dataset = dataset
+
+    n_samples = len(dataset)
+    if n_samples_max is not None:
+        n_samples = min(n_samples, int(n_samples_max))
+
+    components = ("axial", "transverse1", "transverse2", "magnitude")
+    # Per-step accumulators: shape (n_steps, n_grid) per component.
+    grid_sum = {c: np.zeros((n_steps, n_grid), dtype=np.float64) for c in components}
+    count = np.zeros(n_steps, dtype=np.int64)
+    s_uni = np.linspace(0.0, 1.0, n_grid)
+
+    for sample_idx in range(n_samples):
+        try:
+            graph = dataset[sample_idx].to(device)
+        except Exception as e:
+            print(f"[{label}|cuda:{rank}] sample {sample_idx} load failed: {e}", flush=True)
+            continue
+        future = graph.future_deltas
+
+        needle_local = torch.nonzero(graph.is_needle, as_tuple=False).squeeze(-1)
+        if needle_local.numel() < 8:
+            continue
+        axis, t1, t2, axial = _stable_needle_basis(graph.pos[needle_local])
+        s_np = axial.detach().cpu().numpy()
+        s_min, s_max = float(s_np.min()), float(s_np.max())
+        L = s_max - s_min
+        if L <= 0:
+            continue
+        s_norm = (s_np - s_min) / L
+        order = np.argsort(s_norm)
+        s_sorted = s_norm[order]
+
+        preds, _ = engine.rollout_with_states(graph, n_steps)
+        for k in range(n_steps):
+            pred_raw = _denorm_pred_u(preds[k], engine)
+            gt_raw = _denorm_per_key(future[:, k, :], engine)["u"]
+            err = (pred_raw - gt_raw)[needle_local]  # (n_needle, 3)
+
+            # Project onto needle-aligned basis.
+            e_ax = (err * axis.view(1, 3)).sum(-1).detach().cpu().numpy()
+            e_t1 = (err * t1.view(1, 3)).sum(-1).detach().cpu().numpy()
+            e_t2 = (err * t2.view(1, 3)).sum(-1).detach().cpu().numpy()
+            e_mag = torch.linalg.norm(err, dim=-1).detach().cpu().numpy()
+
+            grid_sum["axial"][k] += np.interp(s_uni, s_sorted, e_ax[order])
+            grid_sum["transverse1"][k] += np.interp(s_uni, s_sorted, e_t1[order])
+            grid_sum["transverse2"][k] += np.interp(s_uni, s_sorted, e_t2[order])
+            grid_sum["magnitude"][k] += np.interp(s_uni, s_sorted, e_mag[order])
+            count[k] += 1
+
+        del graph, preds
+        if (sample_idx + 1) % 5 == 0:
+            print(f"[{label}|cuda:{rank}] {sample_idx + 1}/{n_samples} samples done", flush=True)
+
+    total = int(count.sum())
+    if total == 0:
+        print(f"[{label}|cuda:{rank}] no samples processed — writing empty CSV", flush=True)
+        _write_csv([{"label": label, "step": -1, "component": "axial",
+                     "k_per_needle_length": 0.0, "fft_mag": 0.0,
+                     "bias_value": 0.0, "axial_norm": 0.0,
+                     "n_contributions": 0, "kind": "bias"}], out_path)
+        return
+
+    print(f"[{label}|cuda:{rank}] aggregated per-step counts: {count.tolist()} (total {total})", flush=True)
+    freqs = np.fft.rfftfreq(n_grid, d=1.0 / (n_grid - 1))  # cycles per needle length
+
+    # Helper: append bias-profile + spectrum rows for one (step_label, bias_grid).
+    def _emit_rows(step_label: int, bias_grid: np.ndarray, comp: str, n_used: int):
+        rs = []
+        spec = np.abs(np.fft.rfft(bias_grid))
+        rs.extend([
+            {
+                "label": label,
+                "step": int(step_label),
+                "kind": "bias",
+                "component": comp,
+                "axial_norm": float(s_uni[i]),
+                "bias_value": float(bias_grid[i]),
+                "k_per_needle_length": 0.0,
+                "fft_mag": 0.0,
+                "n_contributions": int(n_used),
+            }
+            for i in range(n_grid)
+        ])
+        rs.extend([
+            {
+                "label": label,
+                "step": int(step_label),
+                "kind": "spectrum",
+                "component": comp,
+                "axial_norm": 0.0,
+                "bias_value": 0.0,
+                "k_per_needle_length": float(freqs[i]),
+                "fft_mag": float(spec[i]),
+                "n_contributions": int(n_used),
+            }
+            for i in range(len(spec))
+        ])
+        return rs
+
+    rows = []
+    for comp in components:
+        # Per-step rows: average over the samples that contributed at step k.
+        for k in range(n_steps):
+            if count[k] == 0:
+                continue
+            bias_k = grid_sum[comp][k] / count[k]
+            rows.extend(_emit_rows(step_label=k, bias_grid=bias_k, comp=comp, n_used=int(count[k])))
+        # Aggregate (across steps): mean of per-step means, weighted by sample count.
+        total_count = int(count.sum())
+        if total_count > 0:
+            bias_all = grid_sum[comp].sum(axis=0) / total_count
+            rows.extend(_emit_rows(step_label=-1, bias_grid=bias_all, comp=comp, n_used=total_count))
+    _write_csv(rows, out_path)
+    print(f"[{label}|cuda:{rank}] wrote → {out_path}", flush=True)
+
+
+def exp_bias_spectrum(args, out_subdir: str):
+    out_dir = os.path.join(args.out_dir, out_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    label_a, label_b = args.label_a, args.label_b
+    csv_a = os.path.join(out_dir, f"{label_a}.csv")
+    csv_b = os.path.join(out_dir, f"{label_b}.csv")
+    n_steps = int(args.n_rollout_bias)
+    n_grid = int(args.bias_n_grid)
+    n_samples_max = None if args.n_samples_bias <= 0 else int(args.n_samples_bias)
+
+    ctx = mp.get_context("spawn")
+    procs = []
+    for rank, (exp_dir, csv_path, label) in enumerate([
+        (args.exp_a, csv_a, label_a),
+        (args.exp_b, csv_b, label_b),
+    ]):
+        p = ctx.Process(
+            target=_worker_bias_spectrum,
+            args=(rank, exp_dir, args.data_dir, n_steps, n_grid,
+                  n_samples_max, csv_path, label),
+        )
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"bias_spectrum worker exited {p.exitcode}")
+
+    _plot_bias_spectrum(out_dir, csv_a, csv_b, label_a, label_b)
+
+
+def _plot_bias_spectrum(out_dir, csv_a, csv_b, label_a, label_b):
+    plt = _matplotlib()
+
+    def _read(path):
+        with open(path) as f:
+            header = f.readline().strip().split(",")
+            data = [dict(zip(header, line.strip().split(","))) for line in f if line.strip()]
+        for d in data:
+            for k in ("axial_norm", "bias_value", "k_per_needle_length", "fft_mag"):
+                d[k] = float(d[k])
+            d["n_contributions"] = int(d["n_contributions"])
+            d["step"] = int(d["step"])
+        return data
+
+    da = _read(csv_a)
+    db = _read(csv_b)
+
+    components = ["axial", "transverse1", "transverse2", "magnitude"]
+    colors = {label_a: "tab:blue", label_b: "tab:red"}
+
+    # Discover the set of step indices the workers wrote.  step == -1 is
+    # reserved for the cross-step aggregate.
+    steps = sorted({r["step"] for r in da + db})
+    per_step = [s for s in steps if s >= 0]
+    has_aggregate = -1 in steps
+
+    def _render(step_label: int, suffix: str, title_suffix: str):
+        """One figure pair (spectrum + profile) for a given step label.
+
+        step_label = -1 → cross-step aggregate;  step_label ≥ 0 → that step.
+        """
+        # Spectrum.
+        fig, axes = plt.subplots(1, len(components), figsize=(5 * len(components), 4.5))
+        for i, comp in enumerate(components):
+            ax = axes[i]
+            for data, lab in [(da, label_a), (db, label_b)]:
+                rows = [r for r in data
+                        if r["kind"] == "spectrum" and r["component"] == comp
+                        and r["step"] == step_label]
+                rows.sort(key=lambda r: r["k_per_needle_length"])
+                if not rows:
+                    continue
+                k = np.array([r["k_per_needle_length"] for r in rows])
+                m = np.array([r["fft_mag"] for r in rows])
+                mask = k > 0
+                ax.plot(k[mask], m[mask], "-", color=colors[lab], label=lab)
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("wavenumber k (cycles per needle length)")
+            ax.set_ylabel(f"|F(bias_{comp})|  (raw mm)")
+            ax.set_title(f"Bias spectrum — {comp}")
+            ax.grid(True, which="both", alpha=0.3)
+            ax.legend(fontsize=8)
+        fig.suptitle(f"Spectral content of ⟨pred_u − GT_u⟩  ({title_suffix})")
+        fig.tight_layout()
+        out_svg = os.path.join(out_dir, f"bias_spectrum_{suffix}.svg")
+        fig.savefig(out_svg)
+        plt.close(fig)
+        print(f"wrote → {out_svg}", flush=True)
+
+        # Profile (real space).
+        fig, axes = plt.subplots(1, len(components), figsize=(5 * len(components), 4.5))
+        for i, comp in enumerate(components):
+            ax = axes[i]
+            for data, lab in [(da, label_a), (db, label_b)]:
+                rows = [r for r in data
+                        if r["kind"] == "bias" and r["component"] == comp
+                        and r["step"] == step_label]
+                rows.sort(key=lambda r: r["axial_norm"])
+                if not rows:
+                    continue
+                x = np.array([r["axial_norm"] for r in rows])
+                y = np.array([r["bias_value"] for r in rows])
+                ax.plot(x, y, "-", color=colors[lab], label=lab)
+            ax.axhline(0.0, color="k", linestyle="--", alpha=0.4)
+            ax.set_xlabel("normalised axial position (tip → base)")
+            ax.set_ylabel(f"⟨bias⟩  ({comp}, mm)")
+            ax.set_title(f"Spatial bias — {comp}")
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8)
+        fig.suptitle(f"Mean needle-u error vs needle axial position  ({title_suffix})")
+        fig.tight_layout()
+        out_svg = os.path.join(out_dir, f"bias_profile_{suffix}.svg")
+        fig.savefig(out_svg)
+        plt.close(fig)
+        print(f"wrote → {out_svg}", flush=True)
+
+    # Per-step plots: bias_{spectrum,profile}_step_00.svg, _01.svg, ...
+    for s in per_step:
+        _render(step_label=s, suffix=f"step_{s:02d}", title_suffix=f"rollout step {s}")
+
+    # Cross-step aggregate (preserved): bias_{spectrum,profile}_all.svg
+    if has_aggregate:
+        _render(step_label=-1, suffix="all",
+                title_suffix="averaged across test set × rollout steps")
+
+
+# ===========================================================================
 # Driver.
 # ===========================================================================
 
@@ -1256,7 +1553,7 @@ def main():
     parser.add_argument("--out_dir", default="./compare_models_out")
     parser.add_argument("--mode", choices=["perturb_propagation", "base_traj",
                                            "error_coherence", "mat_fiber_noise",
-                                           "all"], default="all")
+                                           "bias_spectrum", "all"], default="all")
     parser.add_argument("--sample_idx", type=int, default=0)
     # Exp 1 knobs
     parser.add_argument("--n_centres", type=int, default=5)
@@ -1285,6 +1582,13 @@ def main():
                              "0 = use all.")
     parser.add_argument("--seed", type=int, default=0,
                         help="Base RNG seed for per-step fiber-noise sampling.")
+    # Exp 5 knobs (bias spectrum)
+    parser.add_argument("--n_rollout_bias", type=int, default=16,
+                        help="Number of rollout steps for bias_spectrum.")
+    parser.add_argument("--bias_n_grid", type=int, default=512,
+                        help="Uniform axial-grid size for the bias FFT.")
+    parser.add_argument("--n_samples_bias", type=int, default=0,
+                        help="Cap on test samples for bias_spectrum.  0 = all.")
     args = parser.parse_args()
 
     args.label_a = args.label_a or os.path.basename(os.path.normpath(args.exp_a))
@@ -1293,7 +1597,7 @@ def main():
 
     n_gpus = torch.cuda.device_count()
     if n_gpus < 2 and args.mode in ("perturb_propagation", "error_coherence",
-                                     "mat_fiber_noise", "all"):
+                                     "mat_fiber_noise", "bias_spectrum", "all"):
         raise RuntimeError(
             f"Modes perturb_propagation / error_coherence / all need 2+ visible GPUs (found {n_gpus})."
         )
@@ -1317,6 +1621,8 @@ def main():
         exp_error_coherence(args, "error_coherence")
     if args.mode in ("mat_fiber_noise", "all"):
         exp_mat_fiber_noise(args, "mat_fiber_noise")
+    if args.mode in ("bias_spectrum", "all"):
+        exp_bias_spectrum(args, "bias_spectrum")
 
 
 if __name__ == "__main__":
