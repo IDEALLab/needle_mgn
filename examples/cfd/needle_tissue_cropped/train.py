@@ -125,6 +125,9 @@ class MGNTrainer:
             mgn_include_evf=bool(cfg.get("mgn_include_evf", False)),
             mgn_kinematic_needle_only=bool(cfg.get("mgn_kinematic_needle_only", False)),
             multistep_K=int(cfg.get("multistep_K", 1)),
+            bevel_normal_feature=bool(cfg.get("bevel_normal_feature", False)),
+            surface_contact_normal_feature=bool(cfg.get("surface_contact_normal_feature", False)),
+            needle_geometry_path=cfg.get("needle_geometry_path", None),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         # Val keeps K=1 so the metric is the standard 1-step rel-err and
@@ -196,6 +199,8 @@ class MGNTrainer:
                 n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
                 extra_edge_invariants=bool(cfg.get("fiber_extra_invariants", False)),
                 extra_decoder_basis=bool(cfg.get("fiber_extra_decoder_basis", False)),
+                extra_node_vec=bool(cfg.get("bevel_normal_feature", False)
+                                    or cfg.get("surface_contact_normal_feature", False)),
             )
         elif model_type == "fiber_kan":
             self.model = FiberEquivariantKAN(

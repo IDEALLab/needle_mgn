@@ -442,6 +442,7 @@ class FiberEquivariantMGN(Module):
         norm_type: Literal["LayerNorm", "TELayerNorm"] = "LayerNorm",
         extra_edge_invariants: bool = False,
         extra_decoder_basis: bool = False,
+        extra_node_vec: bool = False,
     ):
         super().__init__(meta=MetaData())
 
@@ -451,6 +452,16 @@ class FiberEquivariantMGN(Module):
         self.n_vec_outputs = n_vec_outputs
         self.extra_edge_invariants = extra_edge_invariants
         self.extra_decoder_basis = extra_decoder_basis
+        # When True, the model reads `graph.extra_node_vec` (per-node 1o
+        # vector, e.g. bevel-face or contact surface normal) and augments
+        # the edge encoder with three additional invariants:
+        #   cos_theta_g  = g[src] · ê_ij     (alignment of g_src with edge)
+        #   cos_phi_g    = g[src] · g[dst]   (alignment of g across edge)
+        #   |g_src|                          (magnitude — picks up where
+        #                                      the feature is supported)
+        # No changes to the equivariant decoder basis; the model can
+        # modulate per-edge α weights through these extra invariants.
+        self.extra_node_vec = extra_node_vec
 
         scalar_dim = output_dim - n_vec_outputs * 3
         if scalar_dim < 0:
@@ -469,6 +480,8 @@ class FiberEquivariantMGN(Module):
         #   dv_norm       = ||v_j - v_i||                (relative speed)
         # so velocity-driven asymmetries can modulate the per-edge α weights.
         edge_extra = 6 if extra_edge_invariants else 2
+        if extra_node_vec:
+            edge_extra += 3
         self.edge_encoder = MeshGraphMLP(
             input_dim=input_dim_edges + edge_extra,
             output_dim=hidden_dim_processor,
@@ -588,6 +601,19 @@ class FiberEquivariantMGN(Module):
             edge_features_aug = torch.cat(
                 [edge_features, cos_theta, cos_phi], dim=-1
             )  # (E, input_dim_edges + 2)
+
+        if self.extra_node_vec:
+            # Per-node 1o vector input (e.g. bevel-face / contact surface
+            # normal).  Zero on nodes where the feature isn't applicable.
+            g = graph.extra_node_vec  # (N, 3)
+            g_src = g[src]
+            g_dst = g[dst]
+            cos_theta_g = (g_src * e_hat).sum(-1, keepdim=True)
+            cos_phi_g = (g_src * g_dst).sum(-1, keepdim=True)
+            g_src_norm = torch.linalg.norm(g_src, dim=-1, keepdim=True)
+            edge_features_aug = torch.cat(
+                [edge_features_aug, cos_theta_g, cos_phi_g, g_src_norm], dim=-1
+            )
 
         efeat = self.edge_encoder(edge_features_aug)
         nfeat = self.node_encoder(node_features)

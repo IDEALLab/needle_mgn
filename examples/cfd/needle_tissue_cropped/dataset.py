@@ -782,6 +782,9 @@ class NeedleTissueDataset(Dataset):
         mgn_include_evf: bool = False,
         mgn_kinematic_needle_only: bool = False,
         multistep_K: int = 1,
+        bevel_normal_feature: bool = False,
+        surface_contact_normal_feature: bool = False,
+        needle_geometry_path: Optional[str] = None,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -808,6 +811,15 @@ class NeedleTissueDataset(Dataset):
                 "or derived from a predicted v via trapezoidal integration."
             )
         self.multistep_K = max(1, int(multistep_K))
+        if bevel_normal_feature and surface_contact_normal_feature:
+            raise ValueError(
+                "bevel_normal_feature and surface_contact_normal_feature are "
+                "mutually exclusive (both populate the same `extra_node_vec` "
+                "channel)."
+            )
+        self.bevel_normal_feature = bool(bevel_normal_feature)
+        self.surface_contact_normal_feature = bool(surface_contact_normal_feature)
+        self.needle_geometry_path = needle_geometry_path
         self.mgn_paper_features = mgn_paper_features
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
         self.mgn_include_prev_v = mgn_include_prev_v
@@ -1138,6 +1150,28 @@ class NeedleTissueDataset(Dataset):
                 new_mf = run["node_props"]["mat_fiber"].clone().float()
                 new_mf[self._needle_idx_t] = axis.expand(self._needle_idx_t.numel(), 3)
                 run["node_props"]["mat_fiber"] = new_mf
+
+        # ---- Geometry feature load (bevel / surface contact normals) -------
+        # These come from compute_needle_geometry.py and are mesh-fixed.
+        self._geom_bevel_normal: Optional[torch.Tensor] = None
+        self._geom_surface_normal: Optional[torch.Tensor] = None
+        if self.bevel_normal_feature or self.surface_contact_normal_feature:
+            geom_path = self.needle_geometry_path or os.path.join(
+                cache_dir or data_dir, "needle_geometry_features.pt"
+            )
+            if not os.path.exists(geom_path):
+                raise FileNotFoundError(
+                    f"needle geometry features not found at {geom_path}. "
+                    f"Run examples/cfd/needle_tissue_cropped/compute_needle_geometry.py "
+                    f"to generate it."
+                )
+            geom = torch.load(geom_path, weights_only=False)
+            self._geom_bevel_normal = geom["bevel_node_normal"].float()
+            self._geom_surface_normal = geom["surface_node_normal"].float()
+            assert self._geom_bevel_normal.shape[0] == self.n_nodes, (
+                f"needle_geometry_features expects {self._geom_bevel_normal.shape[0]} "
+                f"nodes but dataset has {self.n_nodes}."
+            )
 
         # ---- Normalisation statistics ---------------------------------------
         if split == "train":
@@ -1528,6 +1562,28 @@ class NeedleTissueDataset(Dataset):
         )
         if loss_mask is not None:
             data_kwargs["loss_mask"] = loss_mask
+
+        # Extra 1o vector feature (bevel-face normal OR surface-contact
+        # normal), zero on non-applicable nodes.  Plugs into
+        # FiberEquivariantMGN(extra_node_vec=True).
+        if self.bevel_normal_feature and self._geom_bevel_normal is not None:
+            extra_node_vec = self._geom_bevel_normal[part_nodes]
+            data_kwargs["extra_node_vec"] = extra_node_vec
+        elif self.surface_contact_normal_feature and self._geom_surface_normal is not None:
+            sn = self._geom_surface_normal[part_nodes].clone()
+            # Mask to nodes that participate in any world (contact) edge in
+            # this frame.  all_et[:, 2] > 0.5 marks the world edges among
+            # the assembled edge_index/edge_attr above.
+            has_contact = torch.zeros(part_nodes.shape[0], dtype=torch.bool)
+            world_edge_mask = all_et[:, 2] > 0.5
+            if world_edge_mask.any():
+                wei = all_ei[:, world_edge_mask]
+                has_contact[wei[0]] = True
+                has_contact[wei[1]] = True
+            sn[~has_contact] = 0.0
+            data_kwargs["extra_node_vec"] = sn
+        else:
+            data_kwargs["extra_node_vec"] = None  # let PyG drop it gracefully
 
         # Boolean per-local-node mask: True for needle nodes in the crop.
         # Cheap (~few KB) and useful for any analysis script that wants to

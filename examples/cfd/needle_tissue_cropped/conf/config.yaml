@@ -176,6 +176,23 @@ mgn_kinematic_needle_only: false
 fiber_extra_invariants: false
 fiber_extra_decoder_basis: false
 
+# Optional per-node 1o vector input fed to FiberEquivariantMGN via
+# graph.extra_node_vec (precomputed once by compute_needle_geometry.py and
+# saved to <data_dir>/needle_geometry_features.pt).  Mutually exclusive.
+#
+# bevel_normal_feature:           outward unit normal of the bevel face, on
+#                                 needle nodes touching a bevel-classified
+#                                 surface face; zero elsewhere.
+# surface_contact_normal_feature: outward unit surface normal on needle
+#                                 surface nodes, masked per-frame to nodes
+#                                 that have at least one world (contact)
+#                                 edge.  Zero on non-surface or non-contact
+#                                 nodes.
+# needle_geometry_path:           override the default path to the .pt file.
+bevel_normal_feature: false
+surface_contact_normal_feature: false
+needle_geometry_path: null
+
 # -------------------------
 # Model architecture
 # -------------------------
