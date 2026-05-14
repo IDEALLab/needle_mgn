@@ -89,6 +89,8 @@ def _build_model(cfg, dataset, device):
         hidden_dim_processor=int(cfg.hidden_dim_processor),
         aggregation=str(cfg.aggregation),
     )
+    extra_node_vec_flag = bool(cfg.get("bevel_normal_feature", False)
+                                or cfg.get("surface_contact_normal_feature", False))
     if model_type == "kan":
         model = MeshGraphKAN(**shared, num_harmonics=int(cfg.get("num_harmonics", 5)))
     elif model_type == "fiber":
@@ -97,6 +99,7 @@ def _build_model(cfg, dataset, device):
             n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
             extra_edge_invariants=bool(cfg.get("fiber_extra_invariants", False)),
             extra_decoder_basis=bool(cfg.get("fiber_extra_decoder_basis", False)),
+            extra_node_vec=extra_node_vec_flag,
         )
     elif model_type == "fiber_kan":
         model = FiberEquivariantKAN(
@@ -160,6 +163,9 @@ def _dataset_kwargs_from_cfg(cfg, data_dir, stats_dir):
         mgn_include_evf=bool(cfg.get("mgn_include_evf", False)),
         mgn_kinematic_needle_only=bool(cfg.get("mgn_kinematic_needle_only", False)),
         multistep_K=1,
+        bevel_normal_feature=bool(cfg.get("bevel_normal_feature", False)),
+        surface_contact_normal_feature=bool(cfg.get("surface_contact_normal_feature", False)),
+        needle_geometry_path=cfg.get("needle_geometry_path", None),
     )
 
 
