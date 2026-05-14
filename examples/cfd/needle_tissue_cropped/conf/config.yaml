@@ -193,6 +193,15 @@ bevel_normal_feature: false
 surface_contact_normal_feature: false
 needle_geometry_path: null
 
+# Global per-frame needle features broadcast to every needle node (zero on
+# tissue): centroid offset to each node, principal axis direction, centroid
+# velocity, principal-axis angular velocity.  Computed from the *full*
+# needle pre-crop so the model gets accurate whole-needle context even when
+# the subgraph excludes part of the needle.  Exposed to
+# FiberEquivariantMGN(n_global_needle_vecs=4) as 4 × 1o vector channels;
+# adds 3*4 = 12 extra edge invariants (cos_theta, cos_phi, |g|).
+global_needle_vecs: false
+
 # -------------------------
 # Model architecture
 # -------------------------
@@ -346,6 +355,14 @@ procrustes_alpha: 0.0
 # bending; degree=5 admits S-curves.
 axial_polyfit_alpha: 0.0
 axial_polyfit_degree: 3
+# Base-clamp inference scheme: at every rollout step, override the state on
+# needle nodes within `base_clamp_mm` of the base end (min axial coord; the
+# tip is at max axial) with their ground-truth values at that time step.
+# Models predict the rest of the needle and the tissue as usual.  0 disables.
+# Useful when the base is tracked / controlled in deployment (e.g. robotic
+# insertion fixture) so the model only has to predict downstream motion.
+base_clamp_mm: 0.0
+
 # Needle edge length cap: if true, scale needle displacements each rollout step
 # so that no needle-to-needle edge changes length by more than the maximum
 # observed during training.  Requires needle_edge_stats.json in stats_dir

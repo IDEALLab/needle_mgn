@@ -97,7 +97,13 @@ class RolloutEngine:
         self.mgn_include_evf = bool(cfg.get("mgn_include_evf", False))
         self.mgn_include_mat_fiber = bool(cfg.get("mgn_include_mat_fiber", False))
         self.mgn_include_prev_v = bool(cfg.get("mgn_include_prev_v", False))
+        # Base-clamp inference scheme: at every rollout step, override the
+        # state on needle nodes within base_clamp_mm of the base end with
+        # the dataset's ground-truth values at that time step.  0 disables.
+        self.base_clamp_mm = float(cfg.get("base_clamp_mm", 0.0))
         self._build_stats()
+        self._build_input_offsets()
+        self._build_base_indices()
 
     # ---- Stats / column mappings ------------------------------------------
 
@@ -172,6 +178,148 @@ class RolloutEngine:
             self._v_update = ((t_lo, t_hi), ratio, bias)
         else:
             self._v_update = None
+
+    # ---- Input-column offsets (used by base-clamp override) ---------------
+
+    def _build_input_offsets(self):
+        ds = self.dataset
+        self._in_offsets: Dict[str, Tuple[int, int]] = {}
+        if not self.mgn_paper:
+            off = 0
+            for k, d in zip(ds.INPUT_KEYS, ds.INPUT_DIMS):
+                self._in_offsets[k] = (off, off + d)
+                off += d
+        else:
+            off = 2  # after node_type one-hot
+            if self.mgn_include_evf:
+                self._in_offsets["evf"] = (off, off + 1)
+                off += 1
+            if self.mgn_include_mat_fiber:
+                self._in_offsets["mat_fiber"] = (off, off + 3)
+                off += 3
+            if self.mgn_include_prev_v:
+                self._in_offsets["v_prev"] = (off, off + 3)
+                off += 3
+
+    # ---- Base-clamp index set computed once from frame-0 needle geometry --
+
+    def _build_base_indices(self):
+        self.base_global_idx: Optional[np.ndarray] = None
+        if self.base_clamp_mm <= 0.0:
+            return
+        ds = self.dataset
+        if not ds._run_data:
+            return
+        run0 = ds._run_data[0]
+        coord0 = run0["frame_tensors"]["coord"][0].numpy()
+        needle_idx = ds._needle_idx_t.numpy()
+        pts = coord0[needle_idx]
+        centred = pts - pts.mean(axis=0, keepdims=True)
+        _, _, vt = np.linalg.svd(centred, full_matrices=False)
+        axis = vt[0]
+        if axis[int(np.argmax(np.abs(axis)))] < 0:
+            axis = -axis
+        axial = centred @ axis
+        keep = axial <= axial.min() + self.base_clamp_mm
+        self.base_global_idx = needle_idx[keep]
+        print(
+            f"[RolloutEngine] base_clamp_mm={self.base_clamp_mm}: "
+            f"{len(self.base_global_idx)} needle nodes will be overridden each step",
+            flush=True,
+        )
+
+    # ---- Local mask of base nodes (used by analyses) ---------------------
+
+    def base_local_mask(self, graph: Data) -> Optional[torch.Tensor]:
+        """Bool mask over local nodes marking which fall inside the base-clamp
+        set.  Returns None when the clamp is disabled or the graph lacks
+        `part_nodes`.  Used by bias/coherence analyses to make the effective
+        Δu at base nodes equal GT (matching the clamp semantics).
+        """
+        if self.base_global_idx is None or self.base_clamp_mm <= 0.0:
+            return None
+        if not hasattr(graph, "part_nodes") or graph.part_nodes is None:
+            return None
+        part_nodes_cpu = graph.part_nodes.detach().cpu().numpy()
+        base_set = set(int(g) for g in self.base_global_idx)
+        flags = np.fromiter((int(g) in base_set for g in part_nodes_cpu),
+                            dtype=bool, count=len(part_nodes_cpu))
+        return torch.from_numpy(flags).to(graph.x.device)
+
+    # ---- Apply the per-step override on base needle nodes -----------------
+
+    def _apply_base_override(self, graph: Data, run_idx: int, t1: int):
+        """Overwrite the state of base needle nodes in `graph` with raw GT at
+        frame `t1` of run `run_idx`.  Silently no-ops when:
+          - base_clamp_mm <= 0,
+          - the graph carries no `part_nodes` attribute (e.g. older Data),
+          - t1 is past the last GT frame for that run,
+          - no base node falls inside the current crop.
+        After the override, edge_attr is rebuilt against the updated pos.
+        """
+        if self.base_global_idx is None or self.base_clamp_mm <= 0.0:
+            return
+        if not hasattr(graph, "part_nodes") or graph.part_nodes is None:
+            return
+        ft = self.dataset._run_data[run_idx]["frame_tensors"]
+        n_frames = ft["coord"].shape[0]
+        if t1 < 0 or t1 >= n_frames:
+            return
+
+        part_nodes_cpu = graph.part_nodes.detach().cpu().numpy()
+        base_set = set(int(g) for g in self.base_global_idx)
+        rows = [(i, int(g)) for i, g in enumerate(part_nodes_cpu) if int(g) in base_set]
+        if not rows:
+            return
+        local_idx = torch.tensor([r[0] for r in rows], dtype=torch.long, device=self.device)
+        global_idx = torch.tensor([r[1] for r in rows], dtype=torch.long)
+
+        node_stats = self.dataset._node_stats
+
+        def _norm(key: str, raw: torch.Tensor) -> torch.Tensor:
+            mean = _stat_to_tensor(node_stats[f"{key}_mean"], self.device).view(1, -1)
+            std = _stat_to_tensor(node_stats[f"{key}_std"], self.device).view(1, -1)
+            return (raw - mean) / std.clamp(min=1e-12)
+
+        # ---- pos (raw mm) ----
+        coord_raw = ft["coord"][t1][global_idx].float().to(self.device)
+        graph.pos = graph.pos.clone()
+        graph.pos[local_idx] = coord_raw
+
+        # ---- x columns (normalised) — branch by input scheme ----
+        new_x = graph.x.clone()
+        if not self.mgn_paper:
+            for key in ("coord", "u", "v", "a", "evf"):
+                if key not in self._in_offsets or key not in ft:
+                    continue
+                lo, hi = self._in_offsets[key]
+                raw = ft[key][t1][global_idx].float().to(self.device)
+                new_x[local_idx, lo:hi] = _norm(key, raw)
+        else:
+            if "evf" in self._in_offsets and "evf" in ft:
+                lo, hi = self._in_offsets["evf"]
+                raw = ft["evf"][t1][global_idx].float().to(self.device)
+                new_x[local_idx, lo:hi] = _norm("evf", raw)
+            if "v_prev" in self._in_offsets and "v" in ft:
+                lo, hi = self._in_offsets["v_prev"]
+                raw = ft["v"][t1][global_idx].float().to(self.device)
+                new_x[local_idx, lo:hi] = _norm("v", raw)
+            # mat_fiber is static; node_type one-hot is static — no override.
+        graph.x = new_x
+
+        # ---- node_velocity (always present from dataset emission) ----
+        if hasattr(graph, "node_velocity") and graph.node_velocity is not None and "v" in ft:
+            v_raw = ft["v"][t1][global_idx].float().to(self.device)
+            nv = graph.node_velocity.clone()
+            nv[local_idx] = _norm("v", v_raw)
+            graph.node_velocity = nv
+
+        # ---- Rebuild edges so edge_attr reflects the moved pos ----
+        new_ei, new_attr = self._rebuild_edges(
+            graph.pos, graph.edge_index, graph.edge_attr, graph.is_needle
+        )
+        graph.edge_index = new_ei
+        graph.edge_attr = new_attr
 
     # ---- Edge rebuild (matches trainer) -----------------------------------
 
@@ -263,33 +411,62 @@ class RolloutEngine:
     def forward(self, graph: Data) -> torch.Tensor:
         return self.model(graph.x, graph.edge_attr, graph)
 
+    # ---- Sample bookkeeping for the base-clamp override --------------------
+
+    def _rollout_context(self, sample_idx: Optional[int]) -> Optional[Tuple[int, int]]:
+        """Return (run_idx, t_local) for the given sample, or None if the
+        clamp is disabled / no sample given.  Used by rollout() and
+        rollout_with_states() to derive the per-step GT frame index.
+        """
+        if self.base_global_idx is None or self.base_clamp_mm <= 0.0:
+            return None
+        if sample_idx is None:
+            return None
+        r_idx, t_local = self.dataset._samples[int(sample_idx)]
+        return (int(r_idx), int(t_local))
+
+    def step_and_clamp(self, graph: Data, pred: torch.Tensor,
+                       ctx: Optional[Tuple[int, int]], k: int) -> Data:
+        """engine.step followed by an optional base-clamp override at frame
+        t_local + k + 1.  When ctx is None the override no-ops."""
+        self.step(graph, pred)
+        if ctx is not None:
+            r_idx, t_local = ctx
+            self._apply_base_override(graph, r_idx, t_local + k + 1)
+        return graph
+
     # ---- Rollout: returns list of normalised preds per step ---------------
 
     @torch.no_grad()
-    def rollout(self, graph: Data, n_steps: int) -> List[torch.Tensor]:
+    def rollout(self, graph: Data, n_steps: int,
+                sample_idx: Optional[int] = None) -> List[torch.Tensor]:
         graph = graph.clone()
+        ctx = self._rollout_context(sample_idx)
         preds: List[torch.Tensor] = []
         for k in range(n_steps):
             pred = self.forward(graph)
             preds.append(pred.detach())
             if k < n_steps - 1:
-                self.step(graph, pred)
+                self.step_and_clamp(graph, pred, ctx, k)
         return preds
 
     # ---- Rollout with state snapshots -------------------------------------
 
     @torch.no_grad()
-    def rollout_with_states(self, graph: Data, n_steps: int) -> Tuple[List[torch.Tensor], List[Data]]:
+    def rollout_with_states(self, graph: Data, n_steps: int,
+                            sample_idx: Optional[int] = None
+                            ) -> Tuple[List[torch.Tensor], List[Data]]:
         """Return (preds, states) where states[k] is the graph the model saw
         at step k (before applying its k-th prediction).  states[0] is the
         original graph (cloned)."""
         g = graph.clone()
+        ctx = self._rollout_context(sample_idx)
         preds: List[torch.Tensor] = []
         states: List[Data] = [g.clone()]
         for k in range(n_steps):
             pred = self.forward(g)
             preds.append(pred.detach())
-            self.step(g, pred)
+            self.step_and_clamp(g, pred, ctx, k)
             if k < n_steps - 1:
                 states.append(g.clone())
         return preds, states
@@ -434,12 +611,15 @@ def _worker_perturb(rank: int, exp_dir: str, data_dir: str, sample_idx: int,
             input_energy = float((delta_u[needle_local] ** 2).sum().item())
             wanted = set(step_horizons)
             captured: Dict[int, float] = {}
+            ctx = engine._rollout_context(sample_idx)
             for k in range(1, max_steps + 1):
                 with torch.no_grad():
                     p_unp = engine.forward(g_unp)
                     p_pert = engine.forward(g_pert)
-                engine.step(g_unp, p_unp)
-                engine.step(g_pert, p_pert)
+                # k-1 here because step indices in step_and_clamp are 0-based
+                # and the current pred advances state from step (k-1) to k.
+                engine.step_and_clamp(g_unp, p_unp, ctx, k - 1)
+                engine.step_and_clamp(g_pert, p_pert, ctx, k - 1)
                 if k in wanted:
                     dev = g_pert.pos[needle_local] - g_unp.pos[needle_local]
                     captured[k] = float((dev ** 2).sum().item())
@@ -617,6 +797,8 @@ def exp_base_trajectory(args, out_subdir: str):
     #     We then evaluate engine_b.forward on that input.
     g_a = graph_a.clone()
     g_b = graph_b.clone()
+    ctx_a = engine_a._rollout_context(sample_idx)
+    ctx_b = engine_b._rollout_context(sample_idx)
     # Per-key node-keep mask from the dataset's loss_mask.  Under
     # mgn_kinematic_needle_only=true, tissue-u / tissue-v / tissue-a are
     # zeroed in the training loss, so the model's predictions on those nodes
@@ -670,10 +852,10 @@ def exp_base_trajectory(args, out_subdir: str):
             # Advance both engines along engine_a's prediction.  engine_b's
             # state lives on device_b; translate engine_a's pred to engine_b's
             # scheme *on device_b* by moving pred_a there before translating.
-            engine_a.step(g_a, pred_a)
+            engine_a.step_and_clamp(g_a, pred_a, ctx_a, k)
             pred_a_on_b = pred_a.to(device_b)
             pred_a_in_b = _translate_pred(pred_a_on_b, engine_a, engine_b)
-            engine_b.step(g_b, pred_a_in_b)
+            engine_b.step_and_clamp(g_b, pred_a_in_b, ctx_b, k)
 
     csv_path = os.path.join(out_dir, "per_step.csv")
     _write_csv(rows, csv_path)
@@ -778,19 +960,24 @@ def _worker_coherence(rank: int, exp_dir: str, data_dir: str,
             print(f"[{label}|cuda:{rank}] sample {sample_idx} load failed: {e}", flush=True)
             continue
         future = graph.future_deltas
-        preds, _ = engine.rollout_with_states(graph, n_steps)
+        preds, _ = engine.rollout_with_states(graph, n_steps, sample_idx=sample_idx)
 
         needle_local = torch.nonzero(graph.is_needle, as_tuple=False).squeeze(-1)
         if needle_local.numel() < 8:
             del graph, preds
             continue
         _axis, transverse, axial = _needle_axis_and_transverse(graph.pos[needle_local])
+        # Make the effective pred at base nodes equal GT under the clamp.
+        base_mask = engine.base_local_mask(graph)
 
         err_vecs: List[torch.Tensor] = []
         errs_proj: List[torch.Tensor] = []
         for k in range(n_steps):
             pred_raw = _denorm_pred_u(preds[k], engine)
             gt_raw = _denorm_per_key(future[:, k, :], engine)["u"]
+            if base_mask is not None and base_mask.any():
+                pred_raw = pred_raw.clone()
+                pred_raw[base_mask] = gt_raw[base_mask]
             diff = (pred_raw - gt_raw)[needle_local]
             err_vecs.append(diff)
             errs_proj.append((diff * transverse.view(1, 3)).sum(-1))
@@ -1069,13 +1256,14 @@ def _worker_mat_fiber_noise(rank: int, exp_dir: str, data_dir: str, n_steps: int
 
         # Unperturbed rollout (baseline reference).
         with torch.no_grad():
-            preds_unp, _ = engine.rollout_with_states(graph, n_steps)
+            preds_unp, _ = engine.rollout_with_states(graph, n_steps, sample_idx=sample_idx)
         gt_u_per_step = [
             _denorm_per_key(future[:, k, :], engine)["u"] for k in range(n_steps)
         ]
         pred_u_unp_per_step = [_denorm_pred_u(preds_unp[k], engine) for k in range(n_steps)]
 
         gen = torch.Generator(device=device).manual_seed(seed + 1000 * sample_idx)
+        ctx_p = engine._rollout_context(sample_idx)
 
         for amp in amplitudes:
             g_p = graph.clone()
@@ -1116,7 +1304,7 @@ def _worker_mat_fiber_noise(rank: int, exp_dir: str, data_dir: str, n_steps: int
                 })
 
                 if k < n_steps - 1:
-                    engine.step(g_p, pred_p)
+                    engine.step_and_clamp(g_p, pred_p, ctx_p, k)
 
         if (sample_idx + 1) % 5 == 0:
             print(f"[{label}|cuda:{rank}] {sample_idx + 1}/{n_samples} samples done", flush=True)
@@ -1326,10 +1514,17 @@ def _worker_bias_spectrum(rank: int, exp_dir: str, data_dir: str,
         order = np.argsort(s_norm)
         s_sorted = s_norm[order]
 
-        preds, _ = engine.rollout_with_states(graph, n_steps)
+        preds, _ = engine.rollout_with_states(graph, n_steps, sample_idx=sample_idx)
+        # Under the base-clamp inference scheme, the effective Δu at base
+        # nodes is GT (not the model's prediction).  Replace pred at base
+        # nodes with GT so the bias-spectrum analysis reflects that.
+        base_mask = engine.base_local_mask(graph)
         for k in range(n_steps):
             pred_raw = _denorm_pred_u(preds[k], engine)
             gt_raw = _denorm_per_key(future[:, k, :], engine)["u"]
+            if base_mask is not None and base_mask.any():
+                pred_raw = pred_raw.clone()
+                pred_raw[base_mask] = gt_raw[base_mask]
             err = (pred_raw - gt_raw)[needle_local]  # (n_needle, 3)
 
             # Project onto needle-aligned basis.

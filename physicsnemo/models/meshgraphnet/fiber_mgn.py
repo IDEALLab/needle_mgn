@@ -443,6 +443,7 @@ class FiberEquivariantMGN(Module):
         extra_edge_invariants: bool = False,
         extra_decoder_basis: bool = False,
         extra_node_vec: bool = False,
+        n_global_needle_vecs: int = 0,
     ):
         super().__init__(meta=MetaData())
 
@@ -463,6 +464,13 @@ class FiberEquivariantMGN(Module):
         # modulate per-edge α weights through these extra invariants.
         self.extra_node_vec = extra_node_vec
 
+        # Multi-channel per-node 1o vector input via `graph.global_needle_vecs`
+        # of shape (N, K, 3).  Adds the same 3 invariants per channel for a
+        # total of 3*K extra edge features.  Used by the needle "global
+        # context" variant that ships [centroid_rel, axis_dir, centroid_v,
+        # ang_v] as K=4 channels (zero on tissue).
+        self.n_global_needle_vecs = int(n_global_needle_vecs)
+
         scalar_dim = output_dim - n_vec_outputs * 3
         if scalar_dim < 0:
             raise ValueError(
@@ -482,6 +490,8 @@ class FiberEquivariantMGN(Module):
         edge_extra = 6 if extra_edge_invariants else 2
         if extra_node_vec:
             edge_extra += 3
+        if n_global_needle_vecs > 0:
+            edge_extra += 3 * n_global_needle_vecs
         self.edge_encoder = MeshGraphMLP(
             input_dim=input_dim_edges + edge_extra,
             output_dim=hidden_dim_processor,
@@ -614,6 +624,21 @@ class FiberEquivariantMGN(Module):
             edge_features_aug = torch.cat(
                 [edge_features_aug, cos_theta_g, cos_phi_g, g_src_norm], dim=-1
             )
+
+        if self.n_global_needle_vecs > 0:
+            # Multi-channel global needle context: (N, K, 3).  For each
+            # channel k, append (cos_theta, cos_phi, |g_src|).  Zero rows
+            # for tissue nodes give zero contributions naturally.
+            gv = graph.global_needle_vecs  # (N, K, 3)
+            extras = []
+            for ki in range(self.n_global_needle_vecs):
+                g_k = gv[:, ki, :]
+                g_k_src = g_k[src]
+                g_k_dst = g_k[dst]
+                extras.append((g_k_src * e_hat).sum(-1, keepdim=True))
+                extras.append((g_k_src * g_k_dst).sum(-1, keepdim=True))
+                extras.append(torch.linalg.norm(g_k_src, dim=-1, keepdim=True))
+            edge_features_aug = torch.cat([edge_features_aug] + extras, dim=-1)
 
         efeat = self.edge_encoder(edge_features_aug)
         nfeat = self.node_encoder(node_features)

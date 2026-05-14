@@ -1128,6 +1128,30 @@ def main(cfg: DictConfig) -> None:
             f"axial range={needle_axial_coords.min():.1f}..{needle_axial_coords.max():.1f} mm"
         )
 
+    # ---- Base-clamp inference scheme -------------------------------------
+    # When base_clamp_mm > 0, the rollout overrides needle nodes within
+    # base_clamp_mm of the *base* end of the needle with their ground-truth
+    # state at every step.  This simulates having a known/tracked base (e.g.
+    # a robotic insertion fixture) while letting the model predict the rest
+    # of the needle and the tissue.  Base = minimum axial coord (tip is at
+    # max axial per the sign convention used elsewhere in this codebase).
+    #
+    # The override is applied AFTER the state update, on the dynamic state
+    # keys (u, v, coord, a if predicted), so the next step's input reflects
+    # the clamped value.
+    base_clamp_mm = float(OmegaConf.select(cfg, "base_clamp_mm", default=0.0))
+    base_clamp_keys = ("u", "v", "a", "coord")
+    base_node_global_idx: Optional[np.ndarray] = None
+    if base_clamp_mm > 0.0:
+        axial_min = float(needle_axial_coords.min().item())
+        keep = (needle_axial_coords <= axial_min + base_clamp_mm).numpy()
+        base_node_global_idx = needle_node_indices[keep]
+        print(
+            f"Base clamp: {len(base_node_global_idx)} needle nodes "
+            f"(axial coord ≤ {axial_min + base_clamp_mm:.2f} mm, "
+            f"base_clamp_mm={base_clamp_mm})"
+        )
+
     needle_edge_cap_mm: Optional[float] = None
     if bool(OmegaConf.select(cfg, "needle_edge_cap", default=False)):
         stats_file = os.path.join(stats_dir, "needle_edge_stats.json")
@@ -1321,6 +1345,30 @@ def main(cfg: DictConfig) -> None:
                 local_map[part_nodes] = torch.arange(len(part_nodes))
                 local_idx = local_map[needle_in_crop]
                 state["coord"][needle_in_crop] += next_uvw_sub["u"][local_idx]
+
+            # --- Base-clamp override (after state update, before pred_points)
+            # Replace state at base needle nodes with ground truth at frame t+1.
+            # If we've run past the GT trajectory, leave state alone (no GT).
+            if base_node_global_idx is not None:
+                t1 = infer_start + step + 1
+                if t1 < n_frames:
+                    base_t = torch.from_numpy(base_node_global_idx).long()
+                    for _bk in base_clamp_keys:
+                        if _bk not in frame_tensors:
+                            continue
+                        gt = frame_tensors[_bk][t1][base_t].float()
+                        # Only override if the key is part of the tracked state.
+                        if _bk in state:
+                            state[_bk][base_t] = gt
+                        elif _bk == "coord":
+                            # 'coord' always exists in state (initialised above).
+                            state["coord"][base_t] = gt
+                elif step == 0:
+                    print(
+                        f"  (base_clamp_mm={base_clamp_mm} active but only "
+                        f"{n_frames - infer_start - 1} GT future frames available; "
+                        f"the clamp will deactivate when GT runs out.)"
+                    )
 
             # Update predicted output point positions for all needle nodes
             pred_points[needle_node_indices] = state["coord"][needle_node_indices].numpy()

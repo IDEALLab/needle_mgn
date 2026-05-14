@@ -785,6 +785,7 @@ class NeedleTissueDataset(Dataset):
         bevel_normal_feature: bool = False,
         surface_contact_normal_feature: bool = False,
         needle_geometry_path: Optional[str] = None,
+        global_needle_vecs: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -820,6 +821,11 @@ class NeedleTissueDataset(Dataset):
         self.bevel_normal_feature = bool(bevel_normal_feature)
         self.surface_contact_normal_feature = bool(surface_contact_normal_feature)
         self.needle_geometry_path = needle_geometry_path
+        # Global per-frame needle features: centroid offset, principal axis,
+        # centroid velocity, principal-axis angular velocity.  Computed from
+        # the *full* needle (pre-crop) so the model sees state-of-the-whole-
+        # needle context even when the crop hides part of it.
+        self.global_needle_vecs = bool(global_needle_vecs)
         self.mgn_paper_features = mgn_paper_features
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
         self.mgn_include_prev_v = mgn_include_prev_v
@@ -1172,6 +1178,16 @@ class NeedleTissueDataset(Dataset):
                 f"needle_geometry_features expects {self._geom_bevel_normal.shape[0]} "
                 f"nodes but dataset has {self.n_nodes}."
             )
+
+        # ---- Per-frame global needle features (cached once per run) -------
+        # When global_needle_vecs=true, _build_graph wants four 3-vectors
+        # per frame (centroid, axis_dir, centroid_velocity, angular
+        # velocity) computed from the FULL needle state.  Cache them
+        # eagerly here so the dataloader doesn't redo the SVD + sums every
+        # sample.  Storage per run: (n_frames, 4, 3) float32 — a few KB
+        # per run, negligible compared to frame_tensors.
+        if self.global_needle_vecs:
+            self._precompute_global_needle_features()
 
         # ---- Normalisation statistics ---------------------------------------
         if split == "train":
@@ -1591,6 +1607,62 @@ class NeedleTissueDataset(Dataset):
         is_needle_full = torch.zeros(self.n_nodes, dtype=torch.bool)
         is_needle_full[self._needle_idx_t] = True
         data_kwargs["is_needle"] = is_needle_full[part_nodes]
+        # Global node indices that this cropped subgraph covers — used by
+        # inference-time post-processing (e.g. base-clamp override) that
+        # needs to map local indices back to full-mesh indices.
+        data_kwargs["part_nodes"] = part_nodes.clone()
+
+        # ---- Global needle features (per-frame, from FULL needle) ----------
+        # Computed before cropping so the model sees correct centroid /
+        # principal axis / velocities for the *entire* needle even when the
+        # subgraph excludes the part outside the tissue contact zone.
+        #
+        # Output layout: graph.global_needle_vecs shape (n_sub, 4, 3) with
+        # channels ordered [centroid_rel, axis_dir, centroid_v, ang_v].
+        # Tissue nodes get zeros so the model can use a simple
+        # masked-edge-invariant scheme.
+        if self.global_needle_vecs:
+            # Look up cached per-frame globals.  Pre-cropped to the full
+            # needle and computed once per run in __init__, so dataloader
+            # access here is O(1).
+            gf = run["global_needle_features"][t_local]  # (4, 3) raw values
+            centroid = gf[0]
+            axis_dir = gf[1]
+            centroid_v_raw = gf[2]
+            ang_v = gf[3]
+
+            # Normalise the dimensionful features against existing stats.
+            coord_std_t = self._node_stats["coord_std"].float() \
+                if isinstance(self._node_stats["coord_std"], torch.Tensor) \
+                else torch.tensor(self._node_stats["coord_std"], dtype=torch.float32)
+            v_std_t = self._node_stats["v_std"].float() \
+                if isinstance(self._node_stats["v_std"], torch.Tensor) \
+                else torch.tensor(self._node_stats["v_std"], dtype=torch.float32)
+            coord_std_t = coord_std_t.view(1, 3)
+            v_std_t = v_std_t.view(1, 3)
+
+            # Centroid as a per-node 1o vector: (centroid − local_node_pos) / coord_std.
+            local_pos = coord[part_nodes].float()
+            centroid_rel = (centroid.view(1, 3) - local_pos) / coord_std_t
+            axis_bcast = axis_dir.view(1, 3).expand(part_nodes.shape[0], 3).clone()
+            centroid_v_bcast = (centroid_v_raw.view(1, 3) / v_std_t).expand(part_nodes.shape[0], 3).clone()
+            # ang_v doesn't have a precomputed stat — leave raw (rad/s).  The
+            # MLP encoder can absorb the scale.
+            ang_v_bcast = ang_v.view(1, 3).expand(part_nodes.shape[0], 3).clone()
+
+            # Zero out tissue nodes so the model sees these features only
+            # where they're meaningful.
+            is_needle_local_t = is_needle_full[part_nodes]
+            not_needle = ~is_needle_local_t
+            if not_needle.any():
+                centroid_rel[not_needle] = 0.0
+                axis_bcast[not_needle] = 0.0
+                centroid_v_bcast[not_needle] = 0.0
+                ang_v_bcast[not_needle] = 0.0
+
+            data_kwargs["global_needle_vecs"] = torch.stack(
+                [centroid_rel, axis_bcast, centroid_v_bcast, ang_v_bcast], dim=1
+            )  # (n_sub, 4, 3)
 
         # Multi-step rollout targets: normalised increments for future steps
         # t+k → t+k+1 for k=1..K-1.  k=0 is already in y_sub.  Cropped to
@@ -1619,6 +1691,49 @@ class NeedleTissueDataset(Dataset):
                 future_list.append(torch.cat(parts, dim=-1)[part_nodes].unsqueeze(1))
             data_kwargs["future_deltas"] = torch.cat(future_list, dim=1)  # (n_sub, K, output_dim)
         return Data(**data_kwargs)
+
+    def _precompute_global_needle_features(self) -> None:
+        """Fill ``self._run_data[r_idx]["global_needle_features"]`` with a
+        ``(n_frames, 4, 3)`` float32 tensor of raw per-frame values:
+
+            channel 0: centroid                 (mm)
+            channel 1: axis_dir (unit, sign-anchored)
+            channel 2: centroid_velocity        (mm/s)
+            channel 3: angular_velocity         (rad/s)
+
+        Computed from the FULL needle node set (``self._needle_idx_t``),
+        so the values are correct regardless of the per-sample crop.
+        Normalisation by node_stats happens later in ``_build_graph``
+        because stats aren't established yet at this point.
+        """
+        needle_idx = self._needle_idx_t
+        for r_idx, run in enumerate(self._run_data):
+            ft = run["frame_tensors"]
+            n_frames = ft["coord"].shape[0]
+            cache = torch.zeros(n_frames, 4, 3, dtype=torch.float32)
+            for t in range(n_frames):
+                pos = ft["coord"][t][needle_idx].float()
+                v = ft["v"][t][needle_idx].float()
+                centroid = pos.mean(dim=0)
+                centred = pos - centroid
+                _, _, vt = torch.linalg.svd(centred, full_matrices=False)
+                axis = vt[0]
+                if float(axis[int(torch.argmax(torch.abs(axis)).item())]) < 0:
+                    axis = -axis
+                centroid_v = v.mean(dim=0)
+                v_rel = v - centroid_v
+                ang_num = torch.cross(centred, v_rel, dim=-1).sum(dim=0)
+                ang_den = (centred * centred).sum().clamp(min=1e-12)
+                ang_v = ang_num / ang_den
+                cache[t, 0] = centroid
+                cache[t, 1] = axis
+                cache[t, 2] = centroid_v
+                cache[t, 3] = ang_v
+            run["global_needle_features"] = cache
+            print(
+                f"  precomputed global needle features for run {r_idx}: "
+                f"{n_frames} frames"
+            )
 
     # ------------------------------------------------------------------
     # Normalisation
