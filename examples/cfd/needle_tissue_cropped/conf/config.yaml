@@ -202,6 +202,15 @@ needle_geometry_path: null
 # adds 3*4 = 12 extra edge invariants (cos_theta, cos_phi, |g|).
 global_needle_vecs: false
 
+# Rigid-body error loss.  Adds rigid_loss_weight * ||rigid(err)||² to the
+# standard MSE, where rigid(err) is the rigid-body component (translation
+# Δt + small rotation Δω × r) of the per-needle-node Δu prediction error.
+# Penalises whole-body offsets/rotations preferentially over bending.
+# Decomposition is done in normalised-Δu units using raw needle coords for
+# r; weight is unitless.  0 disables.  Reasonable starting values: 0.3–3.0
+# depending on baseline MSE scale.
+rigid_loss_weight: 0.0
+
 # -------------------------
 # Model architecture
 # -------------------------

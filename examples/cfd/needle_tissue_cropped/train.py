@@ -270,6 +270,33 @@ class MGNTrainer:
         )
         self.scaler = GradScaler()
 
+        # ---- Rigid-body error loss ----------------------------------------
+        # Decompose per-needle-node Δu prediction error into rigid-body
+        # modes (translation Δt + rotation Δω × r) and residual bending,
+        # then add lambda * ||rigid_part||² to the standard MSE.  The
+        # decomposition is done in normalised-Δu space using raw needle
+        # coords for r.
+        self.rigid_loss_weight = float(cfg.get("rigid_loss_weight", 0.0))
+        self._rigid_u_off = None  # type: ignore[assignment]
+        self._rigid_u_dim = 0
+        if self.rigid_loss_weight > 0.0:
+            off = 0
+            for k, d in zip(train_dataset.TARGET_KEYS, train_dataset.TARGET_DIMS):
+                if k == "u":
+                    self._rigid_u_off = off
+                    self._rigid_u_dim = int(d)
+                    break
+                off += d
+            if self._rigid_u_off is None:
+                raise ValueError(
+                    "rigid_loss_weight > 0 requires 'u' in TARGET_KEYS "
+                    "(needed to compute the rigid-body decomposition)."
+                )
+            rank_zero_logger.info(
+                f"Rigid-body loss enabled: weight={self.rigid_loss_weight}, "
+                f"u target columns [{self._rigid_u_off}:{self._rigid_u_off + self._rigid_u_dim})"
+            )
+
         # ---- Multi-step rollout curriculum --------------------------------
         self.multistep_K = int(cfg.get("multistep_K", 1))
         self.multistep_w_max = float(cfg.get("multistep_w_max", 0.7))
@@ -556,6 +583,55 @@ class MGNTrainer:
             return (diff_sq * mask).sum() / mask.sum().clamp(min=1.0)
         return self.criterion(pred, y)
 
+    def _rigid_body_loss(self, pred, y, graph):
+        """L2 of the rigid-body component of the per-needle-node Δu error.
+
+        Decomposes the normalised Δu error vector e_i = pred_u_i − y_u_i
+        on needle nodes into:
+          Δt = mean(e)              translational mode
+          Δω = Σ(r × (e − Δt)) / Σ|r|²    best-fit small rotation
+          rigid_i = Δt + Δω × r_i   rigid-body part of the error
+        and returns mean(rigid_i²) (averaged over needle nodes and xyz).
+        Returns a 0-dim tensor on the same device as `pred`.
+
+        If the needle subset is empty (e.g. crop has no needle nodes left),
+        returns a zero tensor (no contribution to the loss).
+        """
+        if self._rigid_u_off is None or self._rigid_u_dim == 0:
+            return pred.new_zeros(())
+        u_lo = self._rigid_u_off
+        u_hi = u_lo + self._rigid_u_dim
+        err = pred[:, u_lo:u_hi] - y[:, u_lo:u_hi]   # (N, 3) normalised Δu error
+
+        if not hasattr(graph, "is_needle") or graph.is_needle is None:
+            return pred.new_zeros(())
+        needle = graph.is_needle
+        if not needle.any():
+            return pred.new_zeros(())
+
+        err_n = err[needle]                          # (N_needle, 3)
+        pos_n = graph.pos[needle].float()            # (N_needle, 3) raw mm
+
+        delta_t = err_n.mean(dim=0)                  # (3,)
+        centroid = pos_n.mean(dim=0)
+        r = pos_n - centroid                         # (N_needle, 3)
+        e_prime = err_n - delta_t.view(1, 3)
+        ang_num = torch.cross(r, e_prime, dim=-1).sum(dim=0)  # (3,)
+        ang_den = (r * r).sum().clamp(min=1e-12)
+        omega = ang_num / ang_den                    # (3,)
+
+        rigid = delta_t.view(1, 3) + torch.cross(
+            omega.view(1, 3).expand_as(r), r, dim=-1
+        )                                            # (N_needle, 3)
+        return (rigid ** 2).mean()
+
+    def _total_loss(self, pred, y, graph, mask):
+        """Standard masked MSE plus rigid-body penalty when enabled."""
+        base = self._masked_mse(pred, y, mask)
+        if self.rigid_loss_weight > 0.0:
+            base = base + self.rigid_loss_weight * self._rigid_body_loss(pred, y, graph)
+        return base
+
     def _curriculum_w(self, epoch):
         if self.multistep_K <= 1:
             return 0.0
@@ -603,7 +679,7 @@ class MGNTrainer:
             else:
                 pred = self.model(x, graph.edge_attr, graph)
             mask = getattr(graph, "loss_mask", None)
-            return self._masked_mse(pred, y, mask)
+            return self._total_loss(pred, y, graph, mask)
 
     def _train_multistep(self, graph):
         """Pushforward-trick K-step training: each step's loss backprops
@@ -641,7 +717,7 @@ class MGNTrainer:
                 y = y.clone()
                 y[:, :9] = y[:, :9] - noise
             pred = self.model(x, graph.edge_attr, graph)
-            l1 = self._masked_mse(pred, y, mask)
+            l1 = self._total_loss(pred, y, graph, mask)
             scaled_l1 = w1 * l1
         if self.amp:
             self.scaler.scale(scaled_l1).backward()
@@ -662,7 +738,7 @@ class MGNTrainer:
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
                 pred_k = self.model(graph.x, graph.edge_attr, graph)
                 target_k = future[:, k, :]
-                l_k = self._masked_mse(pred_k, target_k, mask)
+                l_k = self._total_loss(pred_k, target_k, graph, mask)
                 scaled_lk = wk * l_k
             if self.amp:
                 self.scaler.scale(scaled_lk).backward()
