@@ -510,6 +510,8 @@ def _build_step_graph(
     mgn_include_mat_fiber: bool = False,
     mgn_include_prev_v: bool = False,
     mgn_include_evf: bool = False,
+    bevel_node_normal_full: Optional[torch.Tensor] = None,
+    surface_node_normal_full: Optional[torch.Tensor] = None,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -605,6 +607,23 @@ def _build_step_graph(
     v_norm_full = (v_node_full - node_stats["v_mean"]) / node_stats["v_std"]
     node_velocity_sub = v_norm_full[part_nodes]
 
+    # Per-node 1o vector input for FiberEquivariantMGN(extra_node_vec=True).
+    # bevel_node_normal_full: precomputed bevel-face normal (zero off bevel).
+    # surface_node_normal_full: surface normal, masked per-step to nodes with
+    # at least one world (contact) edge.
+    extra_node_vec_sub = None
+    if bevel_node_normal_full is not None:
+        extra_node_vec_sub = bevel_node_normal_full[part_nodes]
+    elif surface_node_normal_full is not None:
+        extra_node_vec_sub = surface_node_normal_full[part_nodes].clone()
+        has_contact = torch.zeros(part_nodes.shape[0], dtype=torch.bool)
+        world_edge_mask = all_et[:, 2] > 0.5
+        if world_edge_mask.any():
+            wei = all_ei[:, world_edge_mask]
+            has_contact[wei[0]] = True
+            has_contact[wei[1]] = True
+        extra_node_vec_sub[~has_contact] = 0.0
+
     return Data(
         x=x_sub,
         edge_attr=edge_attr,
@@ -615,6 +634,7 @@ def _build_step_graph(
         x_scalar=x_scalar_sub,
         x_vec=x_vec_sub,
         node_velocity=node_velocity_sub,
+        extra_node_vec=extra_node_vec_sub,
     )
 
 
@@ -816,11 +836,16 @@ def main(cfg: DictConfig) -> None:
             num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
         )
     elif model_type == "fiber":
+        _extra_node_vec = bool(
+            OmegaConf.select(cfg, "bevel_normal_feature", default=False)
+            or OmegaConf.select(cfg, "surface_contact_normal_feature", default=False)
+        )
         model = FiberEquivariantMGN(
             **_shared_kwargs,
             n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
             extra_edge_invariants=bool(OmegaConf.select(cfg, "fiber_extra_invariants", default=False)),
             extra_decoder_basis=bool(OmegaConf.select(cfg, "fiber_extra_decoder_basis", default=False)),
+            extra_node_vec=_extra_node_vec,
         )
     elif model_type == "fiber_kan":
         model = FiberEquivariantKAN(
@@ -980,6 +1005,37 @@ def main(cfg: DictConfig) -> None:
         fiber_dir_full = _fiber_raw / _fiber_norm       # (N, 3) unit vectors
     else:
         fiber_dir_full = None
+
+    # ---- Optional precomputed needle-geometry features --------------------
+    # Variants cropped_fiber_iso_invw_bevel / _contact ship with a per-node
+    # 1o vector input (bevel-face or surface-contact normal) loaded once
+    # from <data_dir>/needle_geometry_features.pt and attached to each
+    # step's graph as `extra_node_vec`.  FiberEquivariantMGN(extra_node_vec=
+    # True) reads it.
+    bevel_normal_feature = bool(OmegaConf.select(cfg, "bevel_normal_feature", default=False))
+    surface_contact_normal_feature = bool(
+        OmegaConf.select(cfg, "surface_contact_normal_feature", default=False)
+    )
+    bevel_node_normal_full = None
+    surface_node_normal_full = None
+    if bevel_normal_feature or surface_contact_normal_feature:
+        _geom_path = OmegaConf.select(cfg, "needle_geometry_path", default=None)
+        if _geom_path is None:
+            _geom_path = os.path.join(_abspath(cfg.data_dir), "needle_geometry_features.pt")
+        else:
+            _geom_path = _abspath(_geom_path)
+        if not os.path.exists(_geom_path):
+            raise FileNotFoundError(
+                f"needle geometry features not found at {_geom_path}.  "
+                f"Run compute_needle_geometry.py to generate it."
+            )
+        _geom = torch.load(_geom_path, weights_only=False)
+        if bevel_normal_feature:
+            bevel_node_normal_full = _geom["bevel_node_normal"].float()
+            print(f"  bevel_normal_feature: loaded from {_geom_path}")
+        if surface_contact_normal_feature:
+            surface_node_normal_full = _geom["surface_node_normal"].float()
+            print(f"  surface_contact_normal_feature: loaded from {_geom_path}")
 
     # MGN-paper feature precomputation — match dataset.py: 2-dim node-type
     # one-hot per node, and per-run reference positions (frame-0 coord minus
@@ -1144,6 +1200,8 @@ def main(cfg: DictConfig) -> None:
                 mgn_include_mat_fiber=mgn_include_mat_fiber,
                 mgn_include_prev_v=mgn_include_prev_v,
                 mgn_include_evf=mgn_include_evf,
+                bevel_node_normal_full=bevel_node_normal_full,
+                surface_node_normal_full=surface_node_normal_full,
             )
             graph = graph.to(dist.device)
             if model_type == "bistride":
