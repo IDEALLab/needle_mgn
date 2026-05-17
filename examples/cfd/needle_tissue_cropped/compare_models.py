@@ -97,6 +97,10 @@ class RolloutEngine:
         self.mgn_include_evf = bool(cfg.get("mgn_include_evf", False))
         self.mgn_include_mat_fiber = bool(cfg.get("mgn_include_mat_fiber", False))
         self.mgn_include_prev_v = bool(cfg.get("mgn_include_prev_v", False))
+        # When true, RolloutEngine.step recomputes graph.global_needle_vecs
+        # from the live needle pos / node_velocity so the model on rollout
+        # step k > 0 sees up-to-date centroid / axis / velocities.
+        self.uses_global_needle_vecs = bool(cfg.get("global_needle_vecs", False))
         # Base-clamp inference scheme: at every rollout step, override the
         # state on needle nodes within base_clamp_mm of the base end with
         # the dataset's ground-truth values at that time step.  0 disables.
@@ -226,6 +230,63 @@ class RolloutEngine:
             f"[RolloutEngine] base_clamp_mm={self.base_clamp_mm}: "
             f"{len(self.base_global_idx)} needle nodes will be overridden each step",
             flush=True,
+        )
+
+    # ---- Per-step recompute of global needle vectors ---------------------
+
+    def _cache_global_stat_tensors(self):
+        """Pre-fetch v / coord stats used by global_needle_vecs recompute."""
+        ns = self.dataset._node_stats
+        self._coord_std_for_global = _stat_to_tensor(ns["coord_std"], self.device).view(1, 3)
+        self._v_std_for_global = _stat_to_tensor(ns["v_std"], self.device).view(1, 3)
+        self._v_mean_for_global = _stat_to_tensor(ns["v_mean"], self.device).view(1, 3)
+
+    def _recompute_global_needle_vecs(self, graph: Data):
+        """Rebuild graph.global_needle_vecs from the live needle pos /
+        node_velocity.  Matches the dataset/inference convention:
+        centroid_rel per node, axis_dir / centroid_v / ang_v broadcast,
+        zero on tissue.  No-op when the flag is off."""
+        if not self.uses_global_needle_vecs:
+            return
+        if not hasattr(graph, "global_needle_vecs") or graph.global_needle_vecs is None:
+            return
+        needle_mask = graph.is_needle
+        if not needle_mask.any():
+            return
+        if not hasattr(self, "_v_std_for_global"):
+            self._cache_global_stat_tensors()
+
+        pos_needle = graph.pos[needle_mask].float()
+        v_norm_needle = graph.node_velocity[needle_mask].float()
+        v_needle = v_norm_needle * self._v_std_for_global + self._v_mean_for_global
+
+        centroid = pos_needle.mean(dim=0)
+        centred = pos_needle - centroid
+        _, _, vt = torch.linalg.svd(centred, full_matrices=False)
+        axis = vt[0]
+        if float(axis[int(torch.argmax(torch.abs(axis)).item())]) < 0:
+            axis = -axis
+
+        centroid_v = v_needle.mean(dim=0)
+        v_rel = v_needle - centroid_v
+        ang_num = torch.cross(centred, v_rel - 0.0, dim=-1).sum(dim=0)
+        ang_den = (centred * centred).sum().clamp(min=1e-12)
+        ang_v = ang_num / ang_den
+
+        n_sub = graph.pos.shape[0]
+        local_pos = graph.pos.float()
+        centroid_rel = (centroid.view(1, 3) - local_pos) / self._coord_std_for_global
+        axis_bcast = axis.view(1, 3).expand(n_sub, 3).clone()
+        centroid_v_bcast = (centroid_v.view(1, 3) / self._v_std_for_global).expand(n_sub, 3).clone()
+        ang_v_bcast = ang_v.view(1, 3).expand(n_sub, 3).clone()
+        not_needle = ~needle_mask
+        if not_needle.any():
+            centroid_rel[not_needle] = 0.0
+            axis_bcast[not_needle] = 0.0
+            centroid_v_bcast[not_needle] = 0.0
+            ang_v_bcast[not_needle] = 0.0
+        graph.global_needle_vecs = torch.stack(
+            [centroid_rel, axis_bcast, centroid_v_bcast, ang_v_bcast], dim=1
         )
 
     # ---- Local mask of base nodes (used by analyses) ---------------------
@@ -403,6 +464,9 @@ class RolloutEngine:
         graph.edge_index = new_ei
         graph.edge_attr = new_attr
         graph.node_velocity = new_nv
+        # Refresh global needle features so the next forward sees up-to-date
+        # centroid / axis / centroid_v / ang_v.  No-op when flag is off.
+        self._recompute_global_needle_vecs(graph)
         return graph
 
     # ---- Forward (no grad) ------------------------------------------------
@@ -1746,6 +1810,259 @@ def _plot_bias_spectrum(out_dir, csv_a, csv_b, label_a, label_b):
 
 
 # ===========================================================================
+# Experiment 6: rigid-body drift and rotation.
+# ===========================================================================
+#
+# Tracks the needle's *rigid-body* trajectory through an autoregressive
+# rollout — independent of whether the model was trained with rigid_loss.
+# At each step k we accumulate the predicted Δu and GT Δu separately and,
+# from the resulting predicted vs GT needle node sets, compute:
+#
+#   centroid_pred(k)  = mean(pred_needle_pos)
+#   centroid_gt(k)    = mean(gt_needle_pos)
+#   axis_pred(k)      = sign-anchored 1st SVD axis of pred (centred)
+#   axis_gt(k)        = same for GT
+#
+# Per-step metrics:
+#   translation_err   = ‖centroid_pred − centroid_gt‖     (mm)
+#   rotation_err      = arccos|axis_pred · axis_gt|       (deg)
+#   pred_drift        = ‖centroid_pred(k) − centroid_pred(0)‖
+#   gt_drift          = ‖centroid_gt(k)   − centroid_gt(0)‖
+#   pred_rotation     = arccos|axis_pred(k)·axis_pred(0)| (deg)
+#   gt_rotation       = arccos|axis_gt(k)·axis_gt(0)|     (deg)
+#
+# Pred-vs-GT comparison answers "does the model translate/rotate the needle
+# wrong over time?"; the *_drift / *_rotation columns let you see whether
+# the disagreement is because the trajectory has lots of rigid motion the
+# model is mis-tracking, or whether the model invents motion that isn't in
+# the GT.
+
+
+def _principal_axis(centred_pts: torch.Tensor) -> torch.Tensor:
+    """Sign-anchored 1st principal axis of a centred point cloud."""
+    _, _, vt = torch.linalg.svd(centred_pts, full_matrices=False)
+    axis = vt[0]
+    if float(axis[int(torch.argmax(torch.abs(axis)).item())]) < 0:
+        axis = -axis
+    return axis
+
+
+def _worker_rigid_drift(rank: int, exp_dir: str, data_dir: str,
+                        n_steps: int, n_samples_max: Optional[int],
+                        out_path: str, label: str):
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    print(f"[{label}|cuda:{rank}] loading ...", flush=True)
+    _, _, engine = load_experiment(exp_dir, data_dir, device)
+    dataset = _reload_dataset_with_K(exp_dir, data_dir, n_steps)
+    engine.dataset = dataset
+
+    n_samples = len(dataset)
+    if n_samples_max is not None:
+        n_samples = min(n_samples, int(n_samples_max))
+
+    rad2deg = 180.0 / np.pi
+    rows = []
+    for sample_idx in range(n_samples):
+        try:
+            graph = dataset[sample_idx].to(device)
+        except Exception as e:
+            print(f"[{label}|cuda:{rank}] sample {sample_idx} load failed: {e}", flush=True)
+            continue
+        needle_local = torch.nonzero(graph.is_needle, as_tuple=False).squeeze(-1)
+        if needle_local.numel() < 8:
+            continue
+        future = graph.future_deltas
+
+        pos_init_needle = graph.pos[needle_local].clone().float()
+        # Accumulate pred and GT needle positions step by step.
+        pred_pos = pos_init_needle.clone()
+        gt_pos = pos_init_needle.clone()
+
+        centroid_pred_0 = pred_pos.mean(dim=0)
+        centroid_gt_0 = gt_pos.mean(dim=0)
+        axis_pred_0 = _principal_axis(pred_pos - centroid_pred_0)
+        axis_gt_0 = _principal_axis(gt_pos - centroid_gt_0)
+
+        preds, _ = engine.rollout_with_states(graph, n_steps, sample_idx=sample_idx)
+        for k in range(n_steps):
+            pred_du = _denorm_pred_u(preds[k], engine)[needle_local]
+            gt_du = _denorm_per_key(future[:, k, :], engine)["u"][needle_local]
+            pred_pos = pred_pos + pred_du
+            gt_pos = gt_pos + gt_du
+
+            centroid_pred = pred_pos.mean(dim=0)
+            centroid_gt = gt_pos.mean(dim=0)
+            axis_pred = _principal_axis(pred_pos - centroid_pred)
+            axis_gt = _principal_axis(gt_pos - centroid_gt)
+
+            t_err = centroid_pred - centroid_gt
+            cos_err = torch.clamp((axis_pred * axis_gt).sum(), -1.0, 1.0).abs()
+            rot_err = torch.acos(cos_err)
+
+            pred_drift = centroid_pred - centroid_pred_0
+            gt_drift = centroid_gt - centroid_gt_0
+            cos_pred = torch.clamp((axis_pred * axis_pred_0).sum(), -1.0, 1.0).abs()
+            cos_gt = torch.clamp((axis_gt * axis_gt_0).sum(), -1.0, 1.0).abs()
+            pred_rot = torch.acos(cos_pred)
+            gt_rot = torch.acos(cos_gt)
+
+            rows.append({
+                "label": label,
+                "sample_idx": int(sample_idx),
+                "step": int(k),
+                "translation_err_mm": float(t_err.norm().item()),
+                "translation_err_x_mm": float(t_err[0].item()),
+                "translation_err_y_mm": float(t_err[1].item()),
+                "translation_err_z_mm": float(t_err[2].item()),
+                "rotation_err_deg": float((rot_err * rad2deg).item()),
+                "pred_drift_mm": float(pred_drift.norm().item()),
+                "gt_drift_mm": float(gt_drift.norm().item()),
+                "pred_rotation_deg": float((pred_rot * rad2deg).item()),
+                "gt_rotation_deg": float((gt_rot * rad2deg).item()),
+                "n_needle": int(needle_local.numel()),
+            })
+
+        if (sample_idx + 1) % 5 == 0:
+            print(f"[{label}|cuda:{rank}] {sample_idx + 1}/{n_samples} samples done", flush=True)
+
+    _write_csv(rows, out_path)
+    print(f"[{label}|cuda:{rank}] wrote {len(rows)} rows → {out_path}", flush=True)
+
+
+def exp_rigid_drift(args, out_subdir: str):
+    out_dir = os.path.join(args.out_dir, out_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    label_a, label_b = args.label_a, args.label_b
+    csv_a = os.path.join(out_dir, f"{label_a}.csv")
+    csv_b = os.path.join(out_dir, f"{label_b}.csv")
+    n_steps = int(args.n_rollout_rigid)
+    n_samples_max = None if args.n_samples_rigid <= 0 else int(args.n_samples_rigid)
+
+    ctx = mp.get_context("spawn")
+    procs = []
+    for rank, (exp_dir, csv_path, label) in enumerate([
+        (args.exp_a, csv_a, label_a),
+        (args.exp_b, csv_b, label_b),
+    ]):
+        p = ctx.Process(
+            target=_worker_rigid_drift,
+            args=(rank, exp_dir, args.data_dir, n_steps,
+                  n_samples_max, csv_path, label),
+        )
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"rigid_drift worker exited {p.exitcode}")
+
+    _plot_rigid_drift(out_dir, csv_a, csv_b, label_a, label_b)
+
+
+def _plot_rigid_drift(out_dir, csv_a, csv_b, label_a, label_b):
+    plt = _matplotlib()
+
+    def _read(path):
+        with open(path) as f:
+            header = f.readline().strip().split(",")
+            data = [dict(zip(header, line.strip().split(","))) for line in f if line.strip()]
+        for d in data:
+            for k in ("translation_err_mm", "translation_err_x_mm",
+                      "translation_err_y_mm", "translation_err_z_mm",
+                      "rotation_err_deg", "pred_drift_mm", "gt_drift_mm",
+                      "pred_rotation_deg", "gt_rotation_deg"):
+                d[k] = float(d[k])
+            d["sample_idx"] = int(d["sample_idx"])
+            d["step"] = int(d["step"])
+        return data
+
+    da = _read(csv_a)
+    db = _read(csv_b)
+
+    def _agg(data, metric: str):
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for d in data:
+            buckets[d["step"]].append(d[metric])
+        steps = sorted(buckets.keys())
+        m = np.array([np.mean(buckets[s]) for s in steps])
+        s_lo = np.array([np.percentile(buckets[s], 25) for s in steps])
+        s_hi = np.array([np.percentile(buckets[s], 75) for s in steps])
+        return np.array(steps), m, s_lo, s_hi
+
+    colors = {label_a: "tab:blue", label_b: "tab:red"}
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    # Top-left: translation error vs GT, both models.
+    ax = axes[0, 0]
+    for data, lab in [(da, label_a), (db, label_b)]:
+        steps, m, lo, hi = _agg(data, "translation_err_mm")
+        ax.plot(steps, m, "o-", label=f"{lab} (median)", color=colors[lab])
+        ax.fill_between(steps, lo, hi, alpha=0.2, color=colors[lab],
+                        label=f"{lab} (IQR over samples)")
+    ax.set_xlabel("rollout step")
+    ax.set_ylabel("‖centroid_pred − centroid_gt‖  (mm)")
+    ax.set_title("Translation error vs GT")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # Top-right: rotation error vs GT.
+    ax = axes[0, 1]
+    for data, lab in [(da, label_a), (db, label_b)]:
+        steps, m, lo, hi = _agg(data, "rotation_err_deg")
+        ax.plot(steps, m, "o-", label=f"{lab} (median)", color=colors[lab])
+        ax.fill_between(steps, lo, hi, alpha=0.2, color=colors[lab],
+                        label=f"{lab} (IQR over samples)")
+    ax.set_xlabel("rollout step")
+    ax.set_ylabel("∠(axis_pred, axis_gt)  (deg)")
+    ax.set_title("Principal-axis rotation error vs GT")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # Bottom-left: absolute drift — predicted vs GT.
+    ax = axes[1, 0]
+    for data, lab in [(da, label_a), (db, label_b)]:
+        steps, m, lo, hi = _agg(data, "pred_drift_mm")
+        ax.plot(steps, m, "o-", label=f"{lab} pred (median)", color=colors[lab])
+        ax.fill_between(steps, lo, hi, alpha=0.2, color=colors[lab],
+                        label=f"{lab} pred (IQR)")
+    # GT drift is the same regardless of model — average the two for the reference curve.
+    all_data = da + db
+    steps, m, lo, hi = _agg(all_data, "gt_drift_mm")
+    ax.plot(steps, m, "k--", label="GT (median, both runs)")
+    ax.fill_between(steps, lo, hi, alpha=0.15, color="k", label="GT (IQR)")
+    ax.set_xlabel("rollout step")
+    ax.set_ylabel("‖centroid(k) − centroid(0)‖  (mm)")
+    ax.set_title("Centroid drift over time")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # Bottom-right: absolute rotation — predicted vs GT.
+    ax = axes[1, 1]
+    for data, lab in [(da, label_a), (db, label_b)]:
+        steps, m, lo, hi = _agg(data, "pred_rotation_deg")
+        ax.plot(steps, m, "o-", label=f"{lab} pred (median)", color=colors[lab])
+        ax.fill_between(steps, lo, hi, alpha=0.2, color=colors[lab],
+                        label=f"{lab} pred (IQR)")
+    steps, m, lo, hi = _agg(all_data, "gt_rotation_deg")
+    ax.plot(steps, m, "k--", label="GT (median, both runs)")
+    ax.fill_between(steps, lo, hi, alpha=0.15, color="k", label="GT (IQR)")
+    ax.set_xlabel("rollout step")
+    ax.set_ylabel("∠(axis(k), axis(0))  (deg)")
+    ax.set_title("Principal-axis rotation over time")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    fig.suptitle("Rigid-body drift and rotation through autoregressive rollout")
+    fig.tight_layout()
+    out_svg = os.path.join(out_dir, "rigid_drift.svg")
+    fig.savefig(out_svg)
+    plt.close(fig)
+    print(f"wrote → {out_svg}", flush=True)
+
+
+# ===========================================================================
 # Driver.
 # ===========================================================================
 
@@ -1759,7 +2076,8 @@ def main():
     parser.add_argument("--out_dir", default="./compare_models_out")
     parser.add_argument("--mode", choices=["perturb_propagation", "base_traj",
                                            "error_coherence", "mat_fiber_noise",
-                                           "bias_spectrum", "all"], default="all")
+                                           "bias_spectrum", "rigid_drift",
+                                           "all"], default="all")
     parser.add_argument("--sample_idx", type=int, default=0)
     # Exp 1 knobs
     parser.add_argument("--n_centres", type=int, default=5)
@@ -1795,6 +2113,11 @@ def main():
                         help="Uniform axial-grid size for the bias FFT.")
     parser.add_argument("--n_samples_bias", type=int, default=0,
                         help="Cap on test samples for bias_spectrum.  0 = all.")
+    # Exp 6 knobs (rigid drift)
+    parser.add_argument("--n_rollout_rigid", type=int, default=16,
+                        help="Number of rollout steps for rigid_drift.")
+    parser.add_argument("--n_samples_rigid", type=int, default=0,
+                        help="Cap on test samples for rigid_drift.  0 = all.")
     args = parser.parse_args()
 
     args.label_a = args.label_a or os.path.basename(os.path.normpath(args.exp_a))
@@ -1803,7 +2126,8 @@ def main():
 
     n_gpus = torch.cuda.device_count()
     if n_gpus < 2 and args.mode in ("perturb_propagation", "error_coherence",
-                                     "mat_fiber_noise", "bias_spectrum", "all"):
+                                     "mat_fiber_noise", "bias_spectrum",
+                                     "rigid_drift", "all"):
         raise RuntimeError(
             f"Modes perturb_propagation / error_coherence / all need 2+ visible GPUs (found {n_gpus})."
         )
@@ -1829,6 +2153,8 @@ def main():
         exp_mat_fiber_noise(args, "mat_fiber_noise")
     if args.mode in ("bias_spectrum", "all"):
         exp_bias_spectrum(args, "bias_spectrum")
+    if args.mode in ("rigid_drift", "all"):
+        exp_rigid_drift(args, "rigid_drift")
 
 
 if __name__ == "__main__":

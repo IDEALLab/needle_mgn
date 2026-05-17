@@ -512,6 +512,8 @@ def _build_step_graph(
     mgn_include_evf: bool = False,
     bevel_node_normal_full: Optional[torch.Tensor] = None,
     surface_node_normal_full: Optional[torch.Tensor] = None,
+    global_needle_vecs: bool = False,
+    needle_idx_global: Optional[torch.Tensor] = None,
 ) -> Data:
     """Build the normalised PyG Data object for one rollout step on the cropped subgraph."""
     sub_ei_hex, sub_et_hex = subgraph(
@@ -624,6 +626,66 @@ def _build_step_graph(
             has_contact[wei[1]] = True
         extra_node_vec_sub[~has_contact] = 0.0
 
+    # Global per-frame needle features (centroid, axis_dir, centroid_v,
+    # ang_v) — computed from the CURRENT autoregressive state (not from
+    # frame_tensors, which haven't been advanced).  Mirrors what the
+    # dataset emits during training but recomputed each step here.
+    global_needle_vecs_sub = None
+    if global_needle_vecs:
+        if needle_idx_global is None:
+            raise RuntimeError(
+                "global_needle_vecs=True requires needle_idx_global "
+                "(global indices of needle nodes in the full mesh)."
+            )
+        pos_full = state["coord"]
+        v_full = state["v"]
+        needle_pos_full = pos_full[needle_idx_global].float()
+        needle_v_full = v_full[needle_idx_global].float()
+
+        centroid = needle_pos_full.mean(dim=0)
+        centred = needle_pos_full - centroid
+        _, _, _Vt_g = torch.linalg.svd(centred, full_matrices=False)
+        axis_dir = _Vt_g[0]
+        if float(axis_dir[int(torch.argmax(torch.abs(axis_dir)).item())]) < 0:
+            axis_dir = -axis_dir
+
+        centroid_v = needle_v_full.mean(dim=0)
+        v_rel = needle_v_full - centroid_v
+        ang_num = torch.cross(centred, v_rel, dim=-1).sum(dim=0)
+        ang_den = (centred * centred).sum().clamp(min=1e-12)
+        ang_v = ang_num / ang_den
+
+        coord_std_t = node_stats["coord_std"].float() if isinstance(
+            node_stats["coord_std"], torch.Tensor
+        ) else torch.tensor(node_stats["coord_std"], dtype=torch.float32)
+        v_std_t = node_stats["v_std"].float() if isinstance(
+            node_stats["v_std"], torch.Tensor
+        ) else torch.tensor(node_stats["v_std"], dtype=torch.float32)
+        coord_std_t = coord_std_t.view(1, 3)
+        v_std_t = v_std_t.view(1, 3)
+
+        # Centroid as a per-local-node 1o vector: (centroid − pos_local) / coord_std.
+        local_pos = coord_sub.float()
+        centroid_rel = (centroid.view(1, 3) - local_pos) / coord_std_t
+        axis_bcast = axis_dir.view(1, 3).expand(part_nodes.shape[0], 3).clone()
+        centroid_v_bcast = (centroid_v.view(1, 3) / v_std_t).expand(part_nodes.shape[0], 3).clone()
+        ang_v_bcast = ang_v.view(1, 3).expand(part_nodes.shape[0], 3).clone()
+
+        # Mask tissue nodes to zero (same convention as the dataset).
+        is_needle_full = torch.zeros(n_nodes, dtype=torch.bool)
+        is_needle_full[needle_idx_global] = True
+        is_needle_local_t = is_needle_full[part_nodes]
+        not_needle = ~is_needle_local_t
+        if not_needle.any():
+            centroid_rel[not_needle] = 0.0
+            axis_bcast[not_needle] = 0.0
+            centroid_v_bcast[not_needle] = 0.0
+            ang_v_bcast[not_needle] = 0.0
+
+        global_needle_vecs_sub = torch.stack(
+            [centroid_rel, axis_bcast, centroid_v_bcast, ang_v_bcast], dim=1
+        )  # (n_sub, 4, 3)
+
     return Data(
         x=x_sub,
         edge_attr=edge_attr,
@@ -635,6 +697,7 @@ def _build_step_graph(
         x_vec=x_vec_sub,
         node_velocity=node_velocity_sub,
         extra_node_vec=extra_node_vec_sub,
+        global_needle_vecs=global_needle_vecs_sub,
     )
 
 
@@ -840,12 +903,16 @@ def main(cfg: DictConfig) -> None:
             OmegaConf.select(cfg, "bevel_normal_feature", default=False)
             or OmegaConf.select(cfg, "surface_contact_normal_feature", default=False)
         )
+        _n_global_needle_vecs = 4 if bool(
+            OmegaConf.select(cfg, "global_needle_vecs", default=False)
+        ) else 0
         model = FiberEquivariantMGN(
             **_shared_kwargs,
             n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
             extra_edge_invariants=bool(OmegaConf.select(cfg, "fiber_extra_invariants", default=False)),
             extra_decoder_basis=bool(OmegaConf.select(cfg, "fiber_extra_decoder_basis", default=False)),
             extra_node_vec=_extra_node_vec,
+            n_global_needle_vecs=_n_global_needle_vecs,
         )
     elif model_type == "fiber_kan":
         model = FiberEquivariantKAN(
@@ -1037,6 +1104,17 @@ def main(cfg: DictConfig) -> None:
             surface_node_normal_full = _geom["surface_node_normal"].float()
             print(f"  surface_contact_normal_feature: loaded from {_geom_path}")
 
+    # ---- Global per-frame needle features --------------------------------
+    # When global_needle_vecs=true, the model expects a per-step (n_sub, 4, 3)
+    # tensor (centroid_rel, axis_dir, centroid_v, ang_v) computed from the
+    # *current* autoregressive state.  Mirrors the dataset emission but
+    # rebuilt each step here.  Just needs needle_idx_t — already available.
+    global_needle_vecs_flag = bool(
+        OmegaConf.select(cfg, "global_needle_vecs", default=False)
+    )
+    if global_needle_vecs_flag:
+        print(f"  global_needle_vecs: enabled (4 channels per needle node)")
+
     # MGN-paper feature precomputation — match dataset.py: 2-dim node-type
     # one-hot per node, and per-run reference positions (frame-0 coord minus
     # frame-0 displacement) for mesh-space rel_pos in the edge encoder.
@@ -1226,6 +1304,11 @@ def main(cfg: DictConfig) -> None:
                 mgn_include_evf=mgn_include_evf,
                 bevel_node_normal_full=bevel_node_normal_full,
                 surface_node_normal_full=surface_node_normal_full,
+                global_needle_vecs=global_needle_vecs_flag,
+                needle_idx_global=(
+                    torch.from_numpy(needle_node_indices.astype(np.int64))
+                    if global_needle_vecs_flag else None
+                ),
             )
             graph = graph.to(dist.device)
             if model_type == "bistride":
