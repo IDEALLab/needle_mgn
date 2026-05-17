@@ -175,12 +175,16 @@ def run_experiment(
     rollout_overrides = [f"n_rollout={n_rollout}"]
     # Needle-displacement post-processing: low-pass via axial polynomial fit.
     # Preserves smooth bending modes along the needle axis, suppresses per-node
-    # high-frequency noise that drives rollout drift.  Listed last so the CLI
-    # values override anything stale in the checkpoint config.
-    postproc_overrides = [
-        f"axial_polyfit_alpha={polyfit_alpha}",
-        f"axial_polyfit_degree={polyfit_degree}",
-    ]
+    # high-frequency noise that drives rollout drift.  Only forwarded when the
+    # caller explicitly sets --polyfit_alpha / --polyfit_degree; otherwise the
+    # checkpoint's saved cfg value (loaded by infer.py via
+    # _load_ckpt_config_over_defaults) wins, so editing the experiment's
+    # checkpoints/config.yaml takes effect through this batch runner too.
+    postproc_overrides = []
+    if polyfit_alpha is not None:
+        postproc_overrides.append(f"axial_polyfit_alpha={polyfit_alpha}")
+    if polyfit_degree is not None:
+        postproc_overrides.append(f"axial_polyfit_degree={polyfit_degree}")
     extra = " ".join(cfg_overrides + path_overrides + rollout_overrides + postproc_overrides)
 
     infer_out.mkdir(parents=True, exist_ok=True)
@@ -256,17 +260,19 @@ def main():
         help="Re-run eval even if eval/summary.csv already exists",
     )
     parser.add_argument(
-        "--polyfit_alpha", type=float, default=.3,
+        "--polyfit_alpha", type=float, default=None,
         help="axial_polyfit_alpha forwarded to infer.py.  Blends the predicted "
              "needle displacement toward its polynomial fit along the needle "
-             "axis (preserves bending, suppresses per-node noise).  "
-             "0.0 disables.  Default: 0.6.",
+             "axis (preserves bending, suppresses per-node noise).  When "
+             "omitted, the experiment's checkpoints/config.yaml value is used "
+             "instead (so editing the saved cfg takes effect).  0.0 disables.",
     )
     parser.add_argument(
-        "--polyfit_degree", type=int, default=3,
+        "--polyfit_degree", type=int, default=None,
         help="axial_polyfit_degree forwarded to infer.py.  Polynomial degree "
-             "for the axial fit.  3 captures clamped-cantilever bending; "
-             "1 ≈ Procrustes (rigid-only).  Default: 3.",
+             "for the axial fit.  When omitted, the experiment's "
+             "checkpoints/config.yaml value is used.  3 captures clamped-"
+             "cantilever bending; 1 ≈ Procrustes (rigid-only).",
     )
     args = parser.parse_args()
 
@@ -302,7 +308,9 @@ def main():
     print(f"Data dir:     {data_dir}")
     print(f"Experiments:  {experiments_dir}")
     print(f"VTU limit:    {args.vtu_limit} (n_rollout = vtu_limit / timestep_stride)")
-    print(f"Polyfit:      alpha={args.polyfit_alpha}, degree={args.polyfit_degree}")
+    def _opt(v):
+        return "<ckpt cfg>" if v is None else str(v)
+    print(f"Polyfit:      alpha={_opt(args.polyfit_alpha)}, degree={_opt(args.polyfit_degree)}")
     print(f"Found {len(exp_dirs)} experiment(s) to process\n")
 
     failed = []

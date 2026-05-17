@@ -211,6 +211,16 @@ global_needle_vecs: false
 # depending on baseline MSE scale.
 rigid_loss_weight: 0.0
 
+# Inference-time rigid-body bias correction.  When apply_rigid_correction=true,
+# infer.py (and compare_models.RolloutEngine) subtract per-step Δt + Δω × r
+# from predicted Δu on needle nodes, where (Δt_k, Δω_k) are training-rollout
+# averages cached by compute_rigid_correction.py.  rigid_correction_per_step
+# controls whether per-step values (true) or the mean over steps (false) are
+# used.  rigid_correction_path overrides the default <stats_dir>/rigid_correction.pt.
+apply_rigid_correction: true
+rigid_correction_per_step: true
+rigid_correction_path: null
+
 # -------------------------
 # Model architecture
 # -------------------------

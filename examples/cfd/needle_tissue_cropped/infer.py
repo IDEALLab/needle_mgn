@@ -750,8 +750,59 @@ def _write_pvd(out_dir: str, entries: list) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+def _load_ckpt_config_over_defaults(cfg: DictConfig) -> DictConfig:
+    """Make ``<ckpt_path>/config.yaml`` the source of truth.
+
+    Logic (in order of precedence, low → high):
+      1. defaults baked into ``conf/config.yaml`` (Hydra loads this)
+      2. values saved in ``<ckpt_path>/config.yaml`` (the cfg used at the
+         time of training, written by train.py when wandb_log_artifact=true)
+      3. any keys explicitly overridden on the CLI
+
+    The intent: running ``infer.py ckpt_path=/path/to/exp/checkpoints
+    data_dir=/path/to/RUN-2`` should reproduce the model's training-time
+    feature scheme automatically, regardless of what ``conf/config.yaml``
+    currently says — and CLI overrides like ``base_clamp_mm`` /
+    ``apply_rigid_correction`` should still win.
+    """
+    from hydra.core.hydra_config import HydraConfig  # noqa: PLC0415 — runtime import
+
+    try:
+        cli_overrides = list(HydraConfig.get().overrides.task)
+    except Exception:
+        cli_overrides = []
+    cli_keys = set()
+    for o in cli_overrides:
+        if "=" in o:
+            k = o.split("=", 1)[0].lstrip("+~")
+            cli_keys.add(k)
+
+    ckpt_path_abs = _abspath(cfg.ckpt_path)
+    ckpt_cfg_file = os.path.join(ckpt_path_abs, "config.yaml")
+    if not os.path.exists(ckpt_cfg_file):
+        print(f"  (no checkpoint config at {ckpt_cfg_file}; using conf/config.yaml + CLI overrides only)")
+        return cfg
+
+    ckpt_cfg = OmegaConf.load(ckpt_cfg_file)
+    # Compose: ckpt values overlay defaults, then CLI overrides take precedence.
+    merged = OmegaConf.merge(cfg, ckpt_cfg)
+    # Re-apply CLI overrides on top of the checkpoint cfg.
+    if cli_keys:
+        for key in cli_keys:
+            try:
+                val = OmegaConf.select(cfg, key)
+                OmegaConf.update(merged, key, val, merge=True)
+            except Exception:
+                pass  # silently skip keys that can't be re-applied
+    overridden_str = ", ".join(sorted(cli_keys)) if cli_keys else "(none)"
+    print(f"  loaded experiment config from {ckpt_cfg_file}")
+    print(f"  CLI overrides preserved: {overridden_str}")
+    return merged
+
+
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    cfg = _load_ckpt_config_over_defaults(cfg)
     if cfg.get("cuda_devices") is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.cuda_devices)
     DistributedManager.initialize()
@@ -1104,6 +1155,38 @@ def main(cfg: DictConfig) -> None:
             surface_node_normal_full = _geom["surface_node_normal"].float()
             print(f"  surface_contact_normal_feature: loaded from {_geom_path}")
 
+    # ---- Rigid-body bias correction --------------------------------------
+    # When apply_rigid_correction=true, load a cached (Δt_k, Δω_k) tensor
+    # produced by compute_rigid_correction.py and subtract the per-step
+    # rigid component from the model's normalised Δu prediction on needle
+    # nodes before applying the state update.  Reduces systematic
+    # translation / rotation drift averaged out of training rollouts.
+    apply_rigid_correction = bool(
+        OmegaConf.select(cfg, "apply_rigid_correction", default=False)
+    )
+    rigid_correction_per_step = bool(
+        OmegaConf.select(cfg, "rigid_correction_per_step", default=True)
+    )
+    rigid_correction = None
+    if apply_rigid_correction:
+        _rc_path = OmegaConf.select(cfg, "rigid_correction_path", default=None)
+        if _rc_path is None:
+            _rc_path = os.path.join(stats_dir, "rigid_correction.pt")
+        else:
+            _rc_path = _abspath(_rc_path)
+        if not os.path.exists(_rc_path):
+            raise FileNotFoundError(
+                f"apply_rigid_correction=true but no cache at {_rc_path}.  "
+                f"Run compute_rigid_correction.py first."
+            )
+        rigid_correction = torch.load(_rc_path, weights_only=False)
+        print(
+            f"  apply_rigid_correction: loaded from {_rc_path} "
+            f"(n_samples={rigid_correction['n_samples']}, "
+            f"K={rigid_correction['n_steps']}, "
+            f"per_step={rigid_correction_per_step})"
+        )
+
     # ---- Global per-frame needle features --------------------------------
     # When global_needle_vecs=true, the model expects a per-step (n_sub, 4, 3)
     # tensor (centroid_rel, axis_dir, centroid_v, ang_v) computed from the
@@ -1342,6 +1425,34 @@ def main(cfg: DictConfig) -> None:
                     f"the model is fine for early steps, (2) retrain with "
                     f"noise_std=3e-3, (3) inspect state['v'] norms each step."
                 )
+
+            # ---- Rigid-body bias correction (normalised space) -------------
+            # Subtract Δt_k + Δω_k × r_i from pred_sub[u_cols] on needle nodes
+            # using cached per-step training-rollout averages.
+            if rigid_correction is not None and "u" in target_keys:
+                u_off = 0
+                for _k, _d in zip(target_keys, target_dims):
+                    if _k == "u":
+                        break
+                    u_off += _d
+                if rigid_correction_per_step:
+                    K_cache = int(rigid_correction["n_steps"])
+                    k_idx = min(step, K_cache - 1)
+                    dt = rigid_correction["delta_t_norm"][k_idx]      # (3,)
+                    dw = rigid_correction["delta_omega_norm"][k_idx]  # (3,)
+                else:
+                    dt = rigid_correction["delta_t_norm_mean"]
+                    dw = rigid_correction["delta_omega_norm_mean"]
+                part_nodes_np = part_nodes.numpy()
+                needle_in_part_mask = torch.from_numpy(np.isin(part_nodes_np, needle_node_indices))
+                if needle_in_part_mask.any():
+                    pos_needle_local = state["coord"][part_nodes][needle_in_part_mask].float()
+                    centroid_n = pos_needle_local.mean(dim=0)
+                    r = pos_needle_local - centroid_n                  # (n_needle_local, 3)
+                    rigid_corr = dt.view(1, 3) + torch.cross(
+                        dw.view(1, 3).expand_as(r), r, dim=-1
+                    )                                                  # (n_needle_local, 3)
+                    pred_sub[needle_in_part_mask, u_off : u_off + 3] -= rigid_corr
 
             # Per-region denorm: compute needle/tissue masks in crop-local index space
             if per_region_norm:
