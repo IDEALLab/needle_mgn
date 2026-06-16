@@ -780,6 +780,7 @@ class NeedleTissueDataset(Dataset):
         mgn_include_mat_fiber: bool = False,
         mgn_include_prev_v: bool = False,
         mgn_include_evf: bool = False,
+        mgn_include_arclen_clamp: bool = False,
         mgn_kinematic_needle_only: bool = False,
         multistep_K: int = 1,
         bevel_normal_feature: bool = False,
@@ -835,6 +836,12 @@ class NeedleTissueDataset(Dataset):
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
         self.mgn_include_prev_v = mgn_include_prev_v
         self.mgn_include_evf = mgn_include_evf
+        # Single absolute "anchor" scalar: the normalised [0,1] arc-length of
+        # each needle node from the clamp end (0 = clamp, ~1 = tip), zero on
+        # tissue nodes.  Loaded from needle_geometry_features.pt.  Gives the
+        # otherwise translation-invariant MGN an absolute coordinate along the
+        # needle so interior nodes are no longer locally indistinguishable.
+        self.mgn_include_arclen_clamp = mgn_include_arclen_clamp
         self.mgn_kinematic_needle_only = mgn_kinematic_needle_only
         if mgn_include_mat_fiber and not mgn_paper_features:
             raise ValueError(
@@ -850,6 +857,10 @@ class NeedleTissueDataset(Dataset):
             raise ValueError(
                 "mgn_include_evf only applies when mgn_paper_features=True; "
                 "in the standard input scheme evf is already a dynamic input."
+            )
+        if mgn_include_arclen_clamp and not mgn_paper_features:
+            raise ValueError(
+                "mgn_include_arclen_clamp only applies when mgn_paper_features=True."
             )
 
         self.use_cpress = use_cpress
@@ -1166,7 +1177,12 @@ class NeedleTissueDataset(Dataset):
         # These come from compute_needle_geometry.py and are mesh-fixed.
         self._geom_bevel_normal: Optional[torch.Tensor] = None
         self._geom_surface_normal: Optional[torch.Tensor] = None
-        if self.bevel_normal_feature or self.surface_contact_normal_feature:
+        self._geom_arclen_clamp: Optional[torch.Tensor] = None
+        if (
+            self.bevel_normal_feature
+            or self.surface_contact_normal_feature
+            or self.mgn_include_arclen_clamp
+        ):
             geom_path = self.needle_geometry_path or os.path.join(
                 cache_dir or data_dir, "needle_geometry_features.pt"
             )
@@ -1177,12 +1193,25 @@ class NeedleTissueDataset(Dataset):
                     f"to generate it."
                 )
             geom = torch.load(geom_path, weights_only=False)
-            self._geom_bevel_normal = geom["bevel_node_normal"].float()
-            self._geom_surface_normal = geom["surface_node_normal"].float()
-            assert self._geom_bevel_normal.shape[0] == self.n_nodes, (
-                f"needle_geometry_features expects {self._geom_bevel_normal.shape[0]} "
-                f"nodes but dataset has {self.n_nodes}."
-            )
+            if self.bevel_normal_feature or self.surface_contact_normal_feature:
+                self._geom_bevel_normal = geom["bevel_node_normal"].float()
+                self._geom_surface_normal = geom["surface_node_normal"].float()
+                assert self._geom_bevel_normal.shape[0] == self.n_nodes, (
+                    f"needle_geometry_features expects {self._geom_bevel_normal.shape[0]} "
+                    f"nodes but dataset has {self.n_nodes}."
+                )
+            if self.mgn_include_arclen_clamp:
+                if "arclen_to_clamp" not in geom:
+                    raise KeyError(
+                        f"'arclen_to_clamp' missing from {geom_path}. Re-run "
+                        f"compute_needle_geometry.py to regenerate it with the "
+                        f"arc-length-to-clamp coordinate."
+                    )
+                self._geom_arclen_clamp = geom["arclen_to_clamp"].float().view(-1, 1)
+                assert self._geom_arclen_clamp.shape[0] == self.n_nodes, (
+                    f"arclen_to_clamp has {self._geom_arclen_clamp.shape[0]} nodes "
+                    f"but dataset has {self.n_nodes}."
+                )
 
         # ---- Per-frame global needle features (cached once per run) -------
         # When global_needle_vecs=true, _build_graph wants four 3-vectors
@@ -1214,6 +1243,7 @@ class NeedleTissueDataset(Dataset):
         With ``mgn_paper_features=True`` the model sees only a 2-dim node-type
         one-hot.  Optional appended channels:
           - ``mgn_include_evf``: + 1 scalar dim (current EVF).
+          - ``mgn_include_arclen_clamp``: + 1 scalar dim (arc-length-to-clamp).
           - ``mgn_include_mat_fiber``: + 3 dims (unit fiber direction).
           - ``mgn_include_prev_v``: + 3 dims (normalised current velocity).
         Layout: scalars first, vectors last (so the TFN split is positional).
@@ -1221,6 +1251,8 @@ class NeedleTissueDataset(Dataset):
         if self.mgn_paper_features:
             d = 2
             if self.mgn_include_evf:
+                d += 1
+            if self.mgn_include_arclen_clamp:
                 d += 1
             if self.mgn_include_mat_fiber:
                 d += 3
@@ -1238,9 +1270,13 @@ class NeedleTissueDataset(Dataset):
     def n_tfn_scalar(self) -> int:
         """Number of scalar node features for TFNMeshGraphNet (excludes coord and vectors)."""
         if self.mgn_paper_features:
-            # node_type one-hot (2) plus optional evf (1).  mat_fiber and
-            # prev_v are 1o vectors and go to x_vec.
-            return 2 + (1 if self.mgn_include_evf else 0)
+            # node_type one-hot (2) plus optional evf (1) and arc-length (1).
+            # mat_fiber and prev_v are 1o vectors and go to x_vec.
+            return (
+                2
+                + (1 if self.mgn_include_evf else 0)
+                + (1 if self.mgn_include_arclen_clamp else 0)
+            )
         return 15 if self.use_cpress else 14
 
     @property
@@ -1283,9 +1319,9 @@ class NeedleTissueDataset(Dataset):
             Shape ``(N, n_tfn_vec * 3)`` — consecutive xyz per vector.
         """
         if self.mgn_paper_features:
-            # x layout: [node_type(2), evf(1)?, mat_fiber(3)?, prev_v(3)?].
-            # All scalars are at the front, all 1o vectors at the back, so
-            # the split is purely positional.
+            # x layout: [node_type(2), evf(1)?, arclen(1)?, mat_fiber(3)?,
+            # prev_v(3)?].  All scalars are at the front, all 1o vectors at
+            # the back, so the split is purely positional.
             n_scalar = self.n_tfn_scalar
             return x[:, :n_scalar], x[:, n_scalar:]
         if self.use_cpress:
@@ -1506,15 +1542,21 @@ class NeedleTissueDataset(Dataset):
         # Mesh edges (hex needle/tissue connectivity) get both blocks.
         if self.mgn_paper_features:
             x_sub = self._mgn_node_features[part_nodes]
-            # Scalars first (evf), then 1o vectors (mat_fiber, prev_v).  The
-            # ordering matters for _split_tfn_features which assumes all
-            # scalars precede all vectors.
+            # Scalars first (evf, arc-length), then 1o vectors (mat_fiber,
+            # prev_v).  The ordering matters for _split_tfn_features which
+            # assumes all scalars precede all vectors.
             if self.mgn_include_evf:
                 evf_t = ft["evf"][t_local]
                 evf_norm = (
                     evf_t - self._node_stats["evf_mean"]
                 ) / self._node_stats["evf_std"]
                 x_sub = torch.cat([x_sub, evf_norm[part_nodes]], dim=-1)
+            if self.mgn_include_arclen_clamp:
+                # Absolute anchor: normalised [0,1] arc-length from the clamp
+                # end (static per node, zero on tissue).
+                x_sub = torch.cat(
+                    [x_sub, self._geom_arclen_clamp[part_nodes]], dim=-1
+                )
             if self.mgn_include_mat_fiber:
                 # Append unit fiber direction.  For TFN, _split_tfn_features
                 # peels this off into x_vec as a 1o feature.

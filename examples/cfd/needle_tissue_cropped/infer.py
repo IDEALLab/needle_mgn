@@ -470,15 +470,17 @@ def _split_tfn_features(
     mgn_include_mat_fiber: bool = False,
     mgn_include_prev_v: bool = False,
     mgn_include_evf: bool = False,
+    mgn_include_arclen_clamp: bool = False,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Split flat node features into (x_scalar, x_vec) for TFNMeshGraphNet.
 
     Mirrors ``NeedleTissueDataset._split_tfn_features``.  In MGN-paper mode
-    the layout is [node_type(2), evf(1)?, mat_fiber(3)?, prev_v(3)?] — all
-    scalars first, all 1o vectors after, so the split is positional.
+    the layout is [node_type(2), evf(1)?, arclen(1)?, mat_fiber(3)?,
+    prev_v(3)?] — all scalars first, all 1o vectors after, so the split is
+    positional.
     """
     if mgn_paper_features:
-        n_scalar = 2 + (1 if mgn_include_evf else 0)
+        n_scalar = 2 + (1 if mgn_include_evf else 0) + (1 if mgn_include_arclen_clamp else 0)
         return x[:, :n_scalar], x[:, n_scalar:]
     if use_cpress:
         x_vec = torch.cat([x[:, 3:12], x[:, 23:26]], dim=-1)
@@ -510,8 +512,10 @@ def _build_step_graph(
     mgn_include_mat_fiber: bool = False,
     mgn_include_prev_v: bool = False,
     mgn_include_evf: bool = False,
+    mgn_include_arclen_clamp: bool = False,
     bevel_node_normal_full: Optional[torch.Tensor] = None,
     surface_node_normal_full: Optional[torch.Tensor] = None,
+    arclen_clamp_full: Optional[torch.Tensor] = None,
     global_needle_vecs: bool = False,
     needle_idx_global: Optional[torch.Tensor] = None,
 ) -> Data:
@@ -550,6 +554,12 @@ def _build_step_graph(
             evf_t = state["evf"]
             evf_norm = (evf_t - node_stats["evf_mean"]) / node_stats["evf_std"]
             x_sub = torch.cat([x_sub, evf_norm[part_nodes]], dim=-1)
+        if mgn_include_arclen_clamp:
+            if arclen_clamp_full is None:
+                raise RuntimeError(
+                    "mgn_include_arclen_clamp=True but arclen_clamp_full is None."
+                )
+            x_sub = torch.cat([x_sub, arclen_clamp_full[part_nodes]], dim=-1)
         if mgn_include_mat_fiber:
             if fiber_dir_full is None:
                 raise RuntimeError(
@@ -601,6 +611,7 @@ def _build_step_graph(
         mgn_include_mat_fiber=mgn_include_mat_fiber,
         mgn_include_prev_v=mgn_include_prev_v,
         mgn_include_evf=mgn_include_evf,
+        mgn_include_arclen_clamp=mgn_include_arclen_clamp,
     )
 
     # Always attach normalised current velocity for the fiber-extra edge
@@ -904,6 +915,9 @@ def main(cfg: DictConfig) -> None:
         if mgn_include_evf:
             input_dim_nodes += 1
             extra += " + evf(1)"
+        if bool(OmegaConf.select(cfg, "mgn_include_arclen_clamp", default=False)):
+            input_dim_nodes += 1
+            extra += " + arclen_clamp(1)"
         if mgn_include_mat_fiber:
             input_dim_nodes += 3
             extra += " + mat_fiber(3)"
@@ -1139,9 +1153,13 @@ def main(cfg: DictConfig) -> None:
     surface_contact_normal_feature = bool(
         OmegaConf.select(cfg, "surface_contact_normal_feature", default=False)
     )
+    mgn_include_arclen_clamp = bool(
+        OmegaConf.select(cfg, "mgn_include_arclen_clamp", default=False)
+    )
     bevel_node_normal_full = None
     surface_node_normal_full = None
-    if bevel_normal_feature or surface_contact_normal_feature:
+    arclen_clamp_full = None
+    if bevel_normal_feature or surface_contact_normal_feature or mgn_include_arclen_clamp:
         _geom_path = OmegaConf.select(cfg, "needle_geometry_path", default=None)
         if _geom_path is None:
             _geom_path = os.path.join(_abspath(cfg.data_dir), "needle_geometry_features.pt")
@@ -1159,6 +1177,14 @@ def main(cfg: DictConfig) -> None:
         if surface_contact_normal_feature:
             surface_node_normal_full = _geom["surface_node_normal"].float()
             print(f"  surface_contact_normal_feature: loaded from {_geom_path}")
+        if mgn_include_arclen_clamp:
+            if "arclen_to_clamp" not in _geom:
+                raise KeyError(
+                    f"'arclen_to_clamp' missing from {_geom_path}. Re-run "
+                    f"compute_needle_geometry.py to regenerate it."
+                )
+            arclen_clamp_full = _geom["arclen_to_clamp"].float().view(-1, 1)
+            print(f"  mgn_include_arclen_clamp: loaded from {_geom_path}")
 
     # ---- Rigid-body bias correction --------------------------------------
     # When apply_rigid_correction=true, load a cached (Δt_k, Δω_k) tensor
@@ -1390,8 +1416,10 @@ def main(cfg: DictConfig) -> None:
                 mgn_include_mat_fiber=mgn_include_mat_fiber,
                 mgn_include_prev_v=mgn_include_prev_v,
                 mgn_include_evf=mgn_include_evf,
+                mgn_include_arclen_clamp=mgn_include_arclen_clamp,
                 bevel_node_normal_full=bevel_node_normal_full,
                 surface_node_normal_full=surface_node_normal_full,
+                arclen_clamp_full=arclen_clamp_full,
                 global_needle_vecs=global_needle_vecs_flag,
                 needle_idx_global=(
                     torch.from_numpy(needle_node_indices.astype(np.int64))

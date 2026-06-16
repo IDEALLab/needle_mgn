@@ -123,6 +123,7 @@ class MGNTrainer:
             mgn_include_mat_fiber=bool(cfg.get("mgn_include_mat_fiber", False)),
             mgn_include_prev_v=bool(cfg.get("mgn_include_prev_v", False)),
             mgn_include_evf=bool(cfg.get("mgn_include_evf", False)),
+            mgn_include_arclen_clamp=bool(cfg.get("mgn_include_arclen_clamp", False)),
             mgn_kinematic_needle_only=bool(cfg.get("mgn_kinematic_needle_only", False)),
             multistep_K=int(cfg.get("multistep_K", 1)),
             bevel_normal_feature=bool(cfg.get("bevel_normal_feature", False)),
