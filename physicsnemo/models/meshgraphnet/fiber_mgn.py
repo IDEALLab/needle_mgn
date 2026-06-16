@@ -177,17 +177,21 @@ class _FiberEquivNodeBlock(nn.Module):
     ) -> torch.Tensor:
         # Aggregate scalar edge features and concat with node features → (N, 2*hidden)
         cat_feat = aggregate_and_concat(efeat, nfeat, graph, self.aggregation)
-        # Append invariant summaries of the vector aggregate
-        V_norm = torch.linalg.norm(V, dim=-1, keepdim=True)   # (N, 1)
-        V_dot_d = (V * fiber_dir).sum(-1, keepdim=True)        # (N, 1)
+        # Append invariant summaries of the vector aggregate.  V/W/C are
+        # float32 (the geometry path runs in full precision); cast their
+        # invariants to the feature dtype so the concat is uniform under AMP.
+        fdtype = cat_feat.dtype
+        fiber_dir = fiber_dir.float()
+        V_norm = torch.linalg.norm(V, dim=-1, keepdim=True).to(fdtype)   # (N, 1)
+        V_dot_d = (V * fiber_dir).sum(-1, keepdim=True).to(fdtype)       # (N, 1)
         full_in = torch.cat([cat_feat, V_norm, V_dot_d], dim=-1)  # (N, 2*h+2)
         if W is not None:
-            W_norm = torch.linalg.norm(W, dim=-1, keepdim=True)
-            W_dot_d = (W * fiber_dir).sum(-1, keepdim=True)
+            W_norm = torch.linalg.norm(W, dim=-1, keepdim=True).to(fdtype)
+            W_dot_d = (W * fiber_dir).sum(-1, keepdim=True).to(fdtype)
             full_in = torch.cat([full_in, W_norm, W_dot_d], dim=-1)
         if C is not None:
-            C_norm = torch.linalg.norm(C, dim=-1, keepdim=True)
-            C_dot_d = (C * fiber_dir).sum(-1, keepdim=True)
+            C_norm = torch.linalg.norm(C, dim=-1, keepdim=True).to(fdtype)
+            C_dot_d = (C * fiber_dir).sum(-1, keepdim=True).to(fdtype)
             full_in = torch.cat([full_in, C_norm, C_dot_d], dim=-1)
         return self.node_mlp(full_in) + nfeat
 
@@ -337,16 +341,25 @@ class _FiberEquivProcessor(nn.Module):
         src = graph.edge_index[0]
         dst = graph.edge_index[1]  # (E,) destination node indices
 
-        V = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=nfeat.dtype)
+        # The equivariant geometry (the V/W/C aggregates and the decoder basis)
+        # is accumulated in float32, independent of the surrounding autocast
+        # dtype.  ``e_hat`` / ``fiber_dir`` come from the float32 edge/node
+        # geometry, whereas the per-edge scalar weights (alpha/beta/gamma) are
+        # produced by autocast MLPs in reduced precision.  Mixing the two in
+        # an in-place ``scatter_add_`` (or in ``cross``/``einsum`` downstream)
+        # raises a dtype error under AMP, so we cast the scalar weights up to
+        # float32 here and keep the whole vector path in float32.
+        e_hat = e_hat.float()
+        V = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=torch.float32)
         W = None
         d_cross_e = None
         if self.extra_decoder_basis:
             # d_i × ê_ij is the per-edge equivariant vector that's by
             # construction perpendicular to d_i.  Computed once outside
             # the loop because both factors are fixed across layers.
-            d_src = fiber_dir[src]
+            d_src = fiber_dir[src].float()
             d_cross_e = torch.linalg.cross(d_src, e_hat, dim=-1)   # (E, 3)
-            W = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=nfeat.dtype)
+            W = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=torch.float32)
 
         C = None
         contact_e_hat = None
@@ -360,7 +373,7 @@ class _FiberEquivProcessor(nn.Module):
             # all edges accumulates only the radial contact directions.
             wm = world_edge_mask.to(dtype=e_hat.dtype).unsqueeze(-1)   # (E, 1)
             contact_e_hat = e_hat * wm                                 # (E, 3)
-            C = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=nfeat.dtype)
+            C = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=torch.float32)
 
         for layer_idx, (edge_block, alpha_head, node_block) in enumerate(
             zip(self.edge_blocks, self.alpha_heads, self.node_blocks)
@@ -368,28 +381,28 @@ class _FiberEquivProcessor(nn.Module):
             # 1. Scalar edge update (residual inside MeshEdgeBlock)
             efeat, _ = edge_block(efeat, nfeat, graph)
 
-            # 2. Scalar weight → vector message
-            alpha = alpha_head(efeat)          # (E, 1)
-            vec_msg = alpha * e_hat            # (E, 3)
+            # 2. Scalar weight → vector message (float32 vector path)
+            alpha = alpha_head(efeat).float()      # (E, 1)
+            vec_msg = alpha * e_hat                 # (E, 3)
 
             # 3. Scatter-add to destination nodes
-            V = torch.zeros(n_nodes, 3, device=efeat.device, dtype=efeat.dtype)
+            V = torch.zeros(n_nodes, 3, device=efeat.device, dtype=torch.float32)
             dst_exp = dst.unsqueeze(-1).expand_as(vec_msg)   # (E, 3)
             V.scatter_add_(0, dst_exp, vec_msg)
 
             if self.extra_decoder_basis:
-                beta = self.beta_heads[layer_idx](efeat)       # (E, 1)
-                vec_msg_w = beta * d_cross_e                   # (E, 3)
+                beta = self.beta_heads[layer_idx](efeat).float()   # (E, 1)
+                vec_msg_w = beta * d_cross_e                        # (E, 3)
                 W = torch.zeros(
-                    n_nodes, 3, device=efeat.device, dtype=efeat.dtype
+                    n_nodes, 3, device=efeat.device, dtype=torch.float32
                 )
                 W.scatter_add_(0, dst_exp, vec_msg_w)
 
             if self.contact_decoder_basis:
-                gamma = self.gamma_heads[layer_idx](efeat)     # (E, 1)
-                vec_msg_c = gamma * contact_e_hat              # (E, 3), 0 off-contact
+                gamma = self.gamma_heads[layer_idx](efeat).float()  # (E, 1)
+                vec_msg_c = gamma * contact_e_hat                   # (E, 3), 0 off-contact
                 C = torch.zeros(
-                    n_nodes, 3, device=efeat.device, dtype=efeat.dtype
+                    n_nodes, 3, device=efeat.device, dtype=torch.float32
                 )
                 C.scatter_add_(0, dst_exp, vec_msg_c)
 
@@ -730,21 +743,28 @@ class FiberEquivariantMGN(Module):
         )
 
         # --- Decoder --------------------------------------------------------
-        V_norm = torch.linalg.norm(V, dim=-1, keepdim=True)           # (N, 1)
-        V_dot_d = (V * fiber_dir).sum(-1, keepdim=True)               # (N, 1)
+        # The vector path (V/W/C and the equivariant basis) runs in float32;
+        # the MLP feature path follows the surrounding autocast dtype.  Cast
+        # the float32 invariants to the feature dtype before concatenating so
+        # the decoder MLP input is uniform under AMP.
+        fdtype = nfeat.dtype
+        fiber_dir = fiber_dir.float()
+        V_norm = torch.linalg.norm(V, dim=-1, keepdim=True).to(fdtype)   # (N, 1)
+        V_dot_d = (V * fiber_dir).sum(-1, keepdim=True).to(fdtype)       # (N, 1)
         decoder_in = torch.cat([nfeat, V_norm, V_dot_d], dim=-1)      # (N, h+2)
         if self.extra_decoder_basis:
-            W_norm = torch.linalg.norm(W, dim=-1, keepdim=True)
-            W_dot_d = (W * fiber_dir).sum(-1, keepdim=True)
+            W_norm = torch.linalg.norm(W, dim=-1, keepdim=True).to(fdtype)
+            W_dot_d = (W * fiber_dir).sum(-1, keepdim=True).to(fdtype)
             decoder_in = torch.cat([decoder_in, W_norm, W_dot_d], dim=-1)
         if self.contact_decoder_basis:
-            C_norm = torch.linalg.norm(C, dim=-1, keepdim=True)
-            C_dot_d = (C * fiber_dir).sum(-1, keepdim=True)
+            C_norm = torch.linalg.norm(C, dim=-1, keepdim=True).to(fdtype)
+            C_dot_d = (C * fiber_dir).sum(-1, keepdim=True).to(fdtype)
             decoder_in = torch.cat([decoder_in, C_norm, C_dot_d], dim=-1)
 
         # Equivariant vector outputs via local basis {V, d, V×d} or
         # {V, d, V×d, W, W×d} when extra_decoder_basis is set, plus the
-        # contact direction C when contact_decoder_basis is set.
+        # contact direction C when contact_decoder_basis is set.  All basis
+        # vectors are float32.
         VcrossD = torch.linalg.cross(V, fiber_dir, dim=-1)            # (N, 3)
         basis_vecs = [V, fiber_dir, VcrossD]
         if self.extra_decoder_basis:
@@ -754,8 +774,9 @@ class FiberEquivariantMGN(Module):
             basis_vecs.append(C)
         basis = torch.stack(basis_vecs, dim=-1)                       # (N, 3, n_basis)
 
-        # Scalar coefficients: (N, n_vec_outputs * n_basis) → (N, n_vec_out, n_basis)
-        vec_coefs = self.vec_coef_head(decoder_in)
+        # Scalar coefficients: (N, n_vec_outputs * n_basis) → (N, n_vec_out, n_basis).
+        # Cast to float32 to match the basis for the equivariant contraction.
+        vec_coefs = self.vec_coef_head(decoder_in).float()
         vec_coefs = vec_coefs.view(-1, self.n_vec_outputs, self.n_basis)
 
         # vec_out[n, k, x] = Σ_b coefs[n, k, b] * basis[n, x, b]
@@ -771,7 +792,8 @@ class FiberEquivariantMGN(Module):
 
         if self.scalar_decoder is not None:
             scalar_out = self.scalar_decoder(decoder_in)               # (N, scalar_dim)
-            return torch.cat([vec_out, scalar_out], dim=-1)
+            # vec_out is float32 (equivariant path); align scalar_out before cat.
+            return torch.cat([vec_out, scalar_out.to(vec_out.dtype)], dim=-1)
         return vec_out
 
 
