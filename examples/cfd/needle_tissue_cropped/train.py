@@ -129,6 +129,7 @@ class MGNTrainer:
             surface_contact_normal_feature=bool(cfg.get("surface_contact_normal_feature", False)),
             needle_geometry_path=cfg.get("needle_geometry_path", None),
             global_needle_vecs=bool(cfg.get("global_needle_vecs", False)),
+            contact_decoder_basis=bool(cfg.get("contact_decoder_basis", False)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         # Val keeps K=1 so the metric is the standard 1-step rel-err and
@@ -200,6 +201,7 @@ class MGNTrainer:
                 n_vec_outputs=int(cfg.get("n_vec_outputs", 3)),
                 extra_edge_invariants=bool(cfg.get("fiber_extra_invariants", False)),
                 extra_decoder_basis=bool(cfg.get("fiber_extra_decoder_basis", False)),
+                contact_decoder_basis=bool(cfg.get("contact_decoder_basis", False)),
                 extra_node_vec=bool(cfg.get("bevel_normal_feature", False)
                                     or cfg.get("surface_contact_normal_feature", False)),
                 n_global_needle_vecs=4 if bool(cfg.get("global_needle_vecs", False)) else 0,
@@ -211,6 +213,7 @@ class MGNTrainer:
                 num_harmonics=int(cfg.get("num_harmonics", 5)),
                 extra_edge_invariants=bool(cfg.get("fiber_extra_invariants", False)),
                 extra_decoder_basis=bool(cfg.get("fiber_extra_decoder_basis", False)),
+                contact_decoder_basis=bool(cfg.get("contact_decoder_basis", False)),
             )
         elif model_type == "tfn":
             n_tfn_scalar = train_dataset.n_tfn_scalar

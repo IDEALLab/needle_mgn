@@ -698,6 +698,9 @@ def _build_step_graph(
         node_velocity=node_velocity_sub,
         extra_node_vec=extra_node_vec_sub,
         global_needle_vecs=global_needle_vecs_sub,
+        # Per-edge contact mask for FiberEquivariantMGN(contact_decoder_basis).
+        # Cheap (E,) bool; ignored by models that don't read it.
+        world_edge_mask=all_et[:, 2] > 0.5,
     )
 
 
@@ -962,6 +965,7 @@ def main(cfg: DictConfig) -> None:
             n_vec_outputs=int(OmegaConf.select(cfg, "n_vec_outputs", default=3)),
             extra_edge_invariants=bool(OmegaConf.select(cfg, "fiber_extra_invariants", default=False)),
             extra_decoder_basis=bool(OmegaConf.select(cfg, "fiber_extra_decoder_basis", default=False)),
+            contact_decoder_basis=bool(OmegaConf.select(cfg, "contact_decoder_basis", default=False)),
             extra_node_vec=_extra_node_vec,
             n_global_needle_vecs=_n_global_needle_vecs,
         )
@@ -972,6 +976,7 @@ def main(cfg: DictConfig) -> None:
             num_harmonics=int(OmegaConf.select(cfg, "num_harmonics", default=5)),
             extra_edge_invariants=bool(OmegaConf.select(cfg, "fiber_extra_invariants", default=False)),
             extra_decoder_basis=bool(OmegaConf.select(cfg, "fiber_extra_decoder_basis", default=False)),
+            contact_decoder_basis=bool(OmegaConf.select(cfg, "contact_decoder_basis", default=False)),
         )
     elif model_type == "tfn":
         if mgn_paper_features:

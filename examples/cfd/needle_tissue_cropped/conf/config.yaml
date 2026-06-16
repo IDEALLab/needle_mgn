@@ -217,7 +217,7 @@ rigid_loss_weight: 0.0
 # averages cached by compute_rigid_correction.py.  rigid_correction_per_step
 # controls whether per-step values (true) or the mean over steps (false) are
 # used.  rigid_correction_path overrides the default <stats_dir>/rigid_correction.pt.
-apply_rigid_correction: true
+apply_rigid_correction: false
 rigid_correction_per_step: true
 rigid_correction_path: null
 

@@ -786,6 +786,7 @@ class NeedleTissueDataset(Dataset):
         surface_contact_normal_feature: bool = False,
         needle_geometry_path: Optional[str] = None,
         global_needle_vecs: bool = False,
+        contact_decoder_basis: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -820,6 +821,10 @@ class NeedleTissueDataset(Dataset):
             )
         self.bevel_normal_feature = bool(bevel_normal_feature)
         self.surface_contact_normal_feature = bool(surface_contact_normal_feature)
+        # When True, attach a per-edge boolean `world_edge_mask` to each graph
+        # so FiberEquivariantMGN(contact_decoder_basis=True) can build the
+        # contact-only equivariant aggregate C.
+        self.contact_decoder_basis = bool(contact_decoder_basis)
         self.needle_geometry_path = needle_geometry_path
         # Global per-frame needle features: centroid offset, principal axis,
         # centroid velocity, principal-axis angular velocity.  Computed from
@@ -1578,6 +1583,12 @@ class NeedleTissueDataset(Dataset):
         )
         if loss_mask is not None:
             data_kwargs["loss_mask"] = loss_mask
+
+        # Per-edge contact mask for FiberEquivariantMGN(contact_decoder_basis).
+        # all_et[:, 2] is the world-edge type one-hot in the assembled
+        # edge_index/edge_attr above.  Shape (E,), batches along the edge dim.
+        if self.contact_decoder_basis:
+            data_kwargs["world_edge_mask"] = all_et[:, 2] > 0.5
 
         # Extra 1o vector feature (bevel-face normal OR surface-contact
         # normal), zero on non-applicable nodes.  Plugs into

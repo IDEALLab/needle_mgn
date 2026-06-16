@@ -78,6 +78,20 @@ as the Hydra config keys ``fiber_extra_invariants`` and
   represented even when ``V``'s direction is dominated by axial neighbours.
   Adds one ``beta_head`` per processor layer plus 2 invariants in
   ``_FiberEquivNodeBlock`` and the decoder.
+
+* ``contact_decoder_basis`` (config: ``contact_decoder_basis``) — add a
+  dedicated equivariant aggregate built **only** from the needle–tissue
+  contact (world) edges: ``C = Σ_{j∈contact} γⱼ · ê_ij``.  The model reads a
+  per-edge boolean ``graph.world_edge_mask`` selecting those edges.  Contact
+  edges point radially from the needle surface into the surrounding tissue —
+  transverse to the axis by construction — so ``C`` is a transverse decoder
+  basis vector that, unlike ``W``, does not depend on ``d_i`` and therefore
+  stays informative on needle nodes even where ``d_i = 0`` (``mat_fiber``
+  zero) collapses the ``{V, d, V×d}`` basis to 1-D.  Appended to the decoder
+  basis as ``{…, C}``; adds one ``gamma_head`` per processor layer plus 2
+  invariants (``||C||``, ``C·d``) in ``_FiberEquivNodeBlock`` and the decoder.
+  Composes with ``extra_decoder_basis`` (basis grows to ``{V, d, V×d, W,
+  W×d, C}``).
 """
 
 from dataclasses import dataclass
@@ -159,6 +173,7 @@ class _FiberEquivNodeBlock(nn.Module):
         fiber_dir: torch.Tensor,
         graph: GraphType,
         W: "torch.Tensor | None" = None,
+        C: "torch.Tensor | None" = None,
     ) -> torch.Tensor:
         # Aggregate scalar edge features and concat with node features → (N, 2*hidden)
         cat_feat = aggregate_and_concat(efeat, nfeat, graph, self.aggregation)
@@ -170,6 +185,10 @@ class _FiberEquivNodeBlock(nn.Module):
             W_norm = torch.linalg.norm(W, dim=-1, keepdim=True)
             W_dot_d = (W * fiber_dir).sum(-1, keepdim=True)
             full_in = torch.cat([full_in, W_norm, W_dot_d], dim=-1)
+        if C is not None:
+            C_norm = torch.linalg.norm(C, dim=-1, keepdim=True)
+            C_dot_d = (C * fiber_dir).sum(-1, keepdim=True)
+            full_in = torch.cat([full_in, C_norm, C_dot_d], dim=-1)
         return self.node_mlp(full_in) + nfeat
 
 
@@ -213,10 +232,12 @@ class _FiberEquivProcessor(nn.Module):
         activation_fn: nn.Module = nn.ReLU(),
         norm_type: str = "LayerNorm",
         extra_decoder_basis: bool = False,
+        contact_decoder_basis: bool = False,
     ):
         super().__init__()
         self.processor_size = processor_size
         self.extra_decoder_basis = extra_decoder_basis
+        self.contact_decoder_basis = contact_decoder_basis
 
         self.edge_blocks = nn.ModuleList(
             [
@@ -243,7 +264,20 @@ class _FiberEquivProcessor(nn.Module):
             self.beta_heads = nn.ModuleList(
                 [nn.Linear(hidden_dim, 1) for _ in range(processor_size)]
             )
-        node_block_extra = 2 if extra_decoder_basis else 0
+        # Third equivariant message head producing the contact aggregate
+        # C = Σ_{j ∈ contact} γᵢⱼ · ê_ij, restricted to needle–tissue world
+        # (contact/proximity) edges.  Those edges point radially from the
+        # needle surface into the surrounding tissue — transverse to the
+        # fiber axis by construction — so C is a transverse decoder-basis
+        # vector that does NOT depend on d_i and therefore survives the
+        # d_i = 0 collapse on needle nodes (where mat_fiber is zero).
+        if contact_decoder_basis:
+            self.gamma_heads = nn.ModuleList(
+                [nn.Linear(hidden_dim, 1) for _ in range(processor_size)]
+            )
+        node_block_extra = (2 if extra_decoder_basis else 0) + (
+            2 if contact_decoder_basis else 0
+        )
         self.node_blocks = nn.ModuleList(
             [
                 _FiberEquivNodeBlock(
@@ -265,6 +299,7 @@ class _FiberEquivProcessor(nn.Module):
         graph: GraphType,
         e_hat: torch.Tensor,
         fiber_dir: torch.Tensor,
+        world_edge_mask: "torch.Tensor | None" = None,
     ):
         """Run all message-passing steps.
 
@@ -280,6 +315,10 @@ class _FiberEquivProcessor(nn.Module):
             Unit edge vectors from physical coords, shape ``(E, 3)``.
         fiber_dir : torch.Tensor
             Unit fiber directions per node, shape ``(N, 3)``.
+        world_edge_mask : torch.Tensor or None
+            Boolean mask of shape ``(E,)`` selecting the needle–tissue world
+            (contact) edges.  Required when ``contact_decoder_basis=True``;
+            ignored otherwise.
 
         Returns
         -------
@@ -290,6 +329,9 @@ class _FiberEquivProcessor(nn.Module):
         W : torch.Tensor or None
             Final-step ``(d × ê)`` aggregate, ``(N, 3)``.  Only returned
             when ``extra_decoder_basis=True`` was passed at construction.
+        C : torch.Tensor or None
+            Final-step contact aggregate ``Σ_{j∈contact} γ ê``, ``(N, 3)``.
+            Only returned when ``contact_decoder_basis=True``.
         """
         n_nodes = nfeat.shape[0]
         src = graph.edge_index[0]
@@ -305,6 +347,20 @@ class _FiberEquivProcessor(nn.Module):
             d_src = fiber_dir[src]
             d_cross_e = torch.linalg.cross(d_src, e_hat, dim=-1)   # (E, 3)
             W = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=nfeat.dtype)
+
+        C = None
+        contact_e_hat = None
+        if self.contact_decoder_basis:
+            if world_edge_mask is None:
+                raise ValueError(
+                    "contact_decoder_basis=True requires graph.world_edge_mask "
+                    "(a boolean (E,) tensor marking needle–tissue contact edges)."
+                )
+            # Pre-zero ê on non-contact edges so a single masked scatter over
+            # all edges accumulates only the radial contact directions.
+            wm = world_edge_mask.to(dtype=e_hat.dtype).unsqueeze(-1)   # (E, 1)
+            contact_e_hat = e_hat * wm                                 # (E, 3)
+            C = torch.zeros(n_nodes, 3, device=nfeat.device, dtype=nfeat.dtype)
 
         for layer_idx, (edge_block, alpha_head, node_block) in enumerate(
             zip(self.edge_blocks, self.alpha_heads, self.node_blocks)
@@ -329,10 +385,18 @@ class _FiberEquivProcessor(nn.Module):
                 )
                 W.scatter_add_(0, dst_exp, vec_msg_w)
 
-            # 4. Node update using scalar aggregate + V (and optionally W)
-            nfeat = node_block(efeat, nfeat, V, fiber_dir, graph, W=W)
+            if self.contact_decoder_basis:
+                gamma = self.gamma_heads[layer_idx](efeat)     # (E, 1)
+                vec_msg_c = gamma * contact_e_hat              # (E, 3), 0 off-contact
+                C = torch.zeros(
+                    n_nodes, 3, device=efeat.device, dtype=efeat.dtype
+                )
+                C.scatter_add_(0, dst_exp, vec_msg_c)
 
-        return nfeat, V, W
+            # 4. Node update using scalar aggregate + V (and optionally W, C)
+            nfeat = node_block(efeat, nfeat, V, fiber_dir, graph, W=W, C=C)
+
+        return nfeat, V, W, C
 
 
 class FiberEquivariantMGN(Module):
@@ -442,6 +506,7 @@ class FiberEquivariantMGN(Module):
         norm_type: Literal["LayerNorm", "TELayerNorm"] = "LayerNorm",
         extra_edge_invariants: bool = False,
         extra_decoder_basis: bool = False,
+        contact_decoder_basis: bool = False,
         extra_node_vec: bool = False,
         n_global_needle_vecs: int = 0,
     ):
@@ -453,6 +518,13 @@ class FiberEquivariantMGN(Module):
         self.n_vec_outputs = n_vec_outputs
         self.extra_edge_invariants = extra_edge_invariants
         self.extra_decoder_basis = extra_decoder_basis
+        # When True, add a dedicated equivariant aggregate built only from the
+        # needle–tissue contact (world) edges: C_i = Σ_{j∈contact} γ_ij ê_ij.
+        # The model reads a per-edge boolean `graph.world_edge_mask`.  C is
+        # appended as a decoder basis vector {…, C}; being transverse to the
+        # axis by construction and independent of d_i, it stays informative on
+        # needle nodes even where d_i = 0 collapses the {V, d, V×d} basis.
+        self.contact_decoder_basis = contact_decoder_basis
         # When True, the model reads `graph.extra_node_vec` (per-node 1o
         # vector, e.g. bevel-face or contact surface normal) and augments
         # the edge encoder with three additional invariants:
@@ -521,21 +593,30 @@ class FiberEquivariantMGN(Module):
             activation_fn=activation_fn,
             norm_type=norm_type,
             extra_decoder_basis=extra_decoder_basis,
+            contact_decoder_basis=contact_decoder_basis,
         )
 
         # Decoder inputs: [h_i (hidden), ||V|| (1), V·d (1)]
-        # plus optional [||W|| (1), W·d (1)] when the W aggregate is tracked.
+        # plus optional [||W|| (1), W·d (1)] when the W aggregate is tracked
+        # and [||C|| (1), C·d (1)] when the contact aggregate is tracked.
         decoder_in_dim = hidden_dim_processor + 2
         if extra_decoder_basis:
+            decoder_in_dim += 2
+        if contact_decoder_basis:
             decoder_in_dim += 2
 
         # Number of basis vectors used to express each equivariant output:
         #   3 = {V, d, V × d}                                 (default)
         #   5 = {V, d, V × d, W, W × d}                       (extra_decoder_basis)
+        #   +1 = {…, C}                                       (contact_decoder_basis)
         # The W basis vectors are guaranteed perpendicular to d, so the basis
         # spans 3-D even when V ∥ d (which happens for needle nodes whose
         # neighbours are mostly axial — the bottleneck causing x-z flattening).
-        self.n_basis = 5 if extra_decoder_basis else 3
+        # C adds a transverse, d-independent direction sourced from the radial
+        # contact edges, which survives the d = 0 collapse on needle nodes.
+        self.n_basis = (5 if extra_decoder_basis else 3) + (
+            1 if contact_decoder_basis else 0
+        )
 
         # Equivariant vector decoder: outputs n_vec_outputs * n_basis scalar
         # coefficients for the local equivariant basis.
@@ -643,7 +724,10 @@ class FiberEquivariantMGN(Module):
         efeat = self.edge_encoder(edge_features_aug)
         nfeat = self.node_encoder(node_features)
 
-        nfeat, V, W = self.processor(nfeat, efeat, graph, e_hat, fiber_dir)
+        world_edge_mask = getattr(graph, "world_edge_mask", None)
+        nfeat, V, W, C = self.processor(
+            nfeat, efeat, graph, e_hat, fiber_dir, world_edge_mask=world_edge_mask
+        )
 
         # --- Decoder --------------------------------------------------------
         V_norm = torch.linalg.norm(V, dim=-1, keepdim=True)           # (N, 1)
@@ -653,14 +737,21 @@ class FiberEquivariantMGN(Module):
             W_norm = torch.linalg.norm(W, dim=-1, keepdim=True)
             W_dot_d = (W * fiber_dir).sum(-1, keepdim=True)
             decoder_in = torch.cat([decoder_in, W_norm, W_dot_d], dim=-1)
+        if self.contact_decoder_basis:
+            C_norm = torch.linalg.norm(C, dim=-1, keepdim=True)
+            C_dot_d = (C * fiber_dir).sum(-1, keepdim=True)
+            decoder_in = torch.cat([decoder_in, C_norm, C_dot_d], dim=-1)
 
         # Equivariant vector outputs via local basis {V, d, V×d} or
-        # {V, d, V×d, W, W×d} when extra_decoder_basis is set.
+        # {V, d, V×d, W, W×d} when extra_decoder_basis is set, plus the
+        # contact direction C when contact_decoder_basis is set.
         VcrossD = torch.linalg.cross(V, fiber_dir, dim=-1)            # (N, 3)
         basis_vecs = [V, fiber_dir, VcrossD]
         if self.extra_decoder_basis:
             WcrossD = torch.linalg.cross(W, fiber_dir, dim=-1)
             basis_vecs.extend([W, WcrossD])
+        if self.contact_decoder_basis:
+            basis_vecs.append(C)
         basis = torch.stack(basis_vecs, dim=-1)                       # (N, 3, n_basis)
 
         # Scalar coefficients: (N, n_vec_outputs * n_basis) → (N, n_vec_out, n_basis)
@@ -738,6 +829,7 @@ class FiberEquivariantKAN(FiberEquivariantMGN):
         norm_type: Literal["LayerNorm", "TELayerNorm"] = "LayerNorm",
         extra_edge_invariants: bool = False,
         extra_decoder_basis: bool = False,
+        contact_decoder_basis: bool = False,
     ):
         super().__init__(
             input_dim_nodes=input_dim_nodes,
@@ -759,6 +851,7 @@ class FiberEquivariantKAN(FiberEquivariantMGN):
             norm_type=norm_type,
             extra_edge_invariants=extra_edge_invariants,
             extra_decoder_basis=extra_decoder_basis,
+            contact_decoder_basis=contact_decoder_basis,
         )
 
         # Replace the MLP node encoder with a KAN.
