@@ -130,7 +130,7 @@ class MGNTrainer:
             surface_contact_normal_feature=bool(cfg.get("surface_contact_normal_feature", False)),
             needle_geometry_path=cfg.get("needle_geometry_path", None),
             global_needle_vecs=bool(cfg.get("global_needle_vecs", False)),
-            contact_decoder_basis=bool(cfg.get("contact_decoder_basis", False)),
+            needle_axis_rot_aug=bool(cfg.get("needle_axis_rot_aug", False)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         # Val keeps K=1 so the metric is the standard 1-step rel-err and

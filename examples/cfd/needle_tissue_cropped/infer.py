@@ -709,9 +709,6 @@ def _build_step_graph(
         node_velocity=node_velocity_sub,
         extra_node_vec=extra_node_vec_sub,
         global_needle_vecs=global_needle_vecs_sub,
-        # Per-edge contact mask for FiberEquivariantMGN(contact_decoder_basis).
-        # Cheap (E,) bool; ignored by models that don't read it.
-        world_edge_mask=all_et[:, 2] > 0.5,
     )
 
 

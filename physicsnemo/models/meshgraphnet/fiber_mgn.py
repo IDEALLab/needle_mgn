@@ -81,8 +81,10 @@ as the Hydra config keys ``fiber_extra_invariants`` and
 
 * ``contact_decoder_basis`` (config: ``contact_decoder_basis``) — add a
   dedicated equivariant aggregate built **only** from the needle–tissue
-  contact (world) edges: ``C = Σ_{j∈contact} γⱼ · ê_ij``.  The model reads a
-  per-edge boolean ``graph.world_edge_mask`` selecting those edges.  Contact
+  contact (world) edges: ``C = Σ_{j∈contact} γⱼ · ê_ij``.  Contact edges are
+  identified from the final edge-type one-hot column of ``edge_attr`` (the
+  world-edge channel), so the mask stays correct even when callers rebuild
+  edges per step.  Contact
   edges point radially from the needle surface into the surrounding tissue —
   transverse to the axis by construction — so ``C`` is a transverse decoder
   basis vector that, unlike ``W``, does not depend on ``d_i`` and therefore
@@ -322,7 +324,8 @@ class _FiberEquivProcessor(nn.Module):
         world_edge_mask : torch.Tensor or None
             Boolean mask of shape ``(E,)`` selecting the needle–tissue world
             (contact) edges.  Required when ``contact_decoder_basis=True``;
-            ignored otherwise.
+            ignored otherwise.  The caller (:meth:`FiberEquivariantMGN.forward`)
+            derives it from the world-edge one-hot column of ``edge_attr``.
 
         Returns
         -------
@@ -366,7 +369,7 @@ class _FiberEquivProcessor(nn.Module):
         if self.contact_decoder_basis:
             if world_edge_mask is None:
                 raise ValueError(
-                    "contact_decoder_basis=True requires graph.world_edge_mask "
+                    "contact_decoder_basis=True requires a world_edge_mask "
                     "(a boolean (E,) tensor marking needle–tissue contact edges)."
                 )
             # Pre-zero ê on non-contact edges so a single masked scatter over
@@ -533,7 +536,8 @@ class FiberEquivariantMGN(Module):
         self.extra_decoder_basis = extra_decoder_basis
         # When True, add a dedicated equivariant aggregate built only from the
         # needle–tissue contact (world) edges: C_i = Σ_{j∈contact} γ_ij ê_ij.
-        # The model reads a per-edge boolean `graph.world_edge_mask`.  C is
+        # Contact edges are read off the final edge-type one-hot column of
+        # edge_attr (the world-edge channel).  C is
         # appended as a decoder basis vector {…, C}; being transverse to the
         # axis by construction and independent of d_i, it stays informative on
         # needle nodes even where d_i = 0 collapses the {V, d, V×d} basis.
@@ -737,7 +741,16 @@ class FiberEquivariantMGN(Module):
         efeat = self.edge_encoder(edge_features_aug)
         nfeat = self.node_encoder(node_features)
 
-        world_edge_mask = getattr(graph, "world_edge_mask", None)
+        world_edge_mask = None
+        if self.contact_decoder_basis:
+            # Needle–tissue world (contact) edges are flagged by the final
+            # edge-type one-hot column, which is the last column of edge_attr
+            # in every graph builder (dataset, infer, compare_models rollout).
+            # Deriving the mask here — instead of reading a precomputed
+            # graph.world_edge_mask attribute — keeps it correct when callers
+            # rebuild edges per step (proximity-based world edges change count
+            # each frame), which a stale attribute would not.
+            world_edge_mask = edge_features[:, -1] > 0.5
         nfeat, V, W, C = self.processor(
             nfeat, efeat, graph, e_hat, fiber_dir, world_edge_mask=world_edge_mask
         )

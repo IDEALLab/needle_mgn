@@ -94,6 +94,17 @@ vector_iso_norm: false
 # needle axis by symmetry) and cannot express transverse deflection.
 needle_fiber_axis: false
 
+# Data augmentation (train split only): rotate each sample by a random angle
+# about the frame-0 needle axis.  All 1o vector quantities (coord, u, v, a,
+# mat_fiber) co-rotate; rotation-invariant scalars and the scalar-decoded
+# stress / evf are left unchanged.  Because the rotation axis IS the needle
+# axis, the needle's fiber direction maps to itself while transverse
+# deflections rotate — exposing the (imperfectly) equivariant model to
+# deflections in every transverse direction.  Not compatible with
+# global_needle_vecs / bevel_normal_feature / surface_contact_normal_feature
+# (their precomputed vectors are not rotated).
+needle_axis_rot_aug: false
+
 # Drop one or more kinematic vector targets (subset of u/v/a) from the
 # model's outputs.  The remaining outputs train as usual; each dropped key
 # is handled at inference time as follows:
@@ -145,6 +156,16 @@ mgn_include_prev_v: false
 # geometry.  Goes to x_scalar for TFN.
 mgn_include_evf: false
 
+# Append a single absolute "anchor" scalar to the MGN-paper input: the
+# normalised [0,1] arc-length of each needle node along the needle axis from
+# the clamp end (0 = clamp, ~1 = bevel tip), zero on tissue nodes.  Loaded
+# from needle_geometry_features.pt ("arclen_to_clamp"; run
+# compute_needle_geometry.py to (re)generate).  Gives the otherwise
+# translation-invariant MGN an absolute coordinate along the needle so
+# interior shaft nodes are no longer locally indistinguishable.  Only
+# meaningful when mgn_paper_features=true.  Goes to x_scalar for TFN.
+mgn_include_arclen_clamp: false
+
 # Mask the per-node loss for kinematic targets (u/v/a) on tissue nodes —
 # in our setup tissue u is ~3000× smaller than needle u (the Eulerian mesh
 # nodes don't move; u-on-tissue stores the tiny material flow plus
@@ -173,8 +194,18 @@ mgn_kinematic_needle_only: false
 #   transverse-to-fiber direction is always represented even when V's
 #   direction is dominated by axial neighbours.  Adds one beta_head per
 #   processor layer plus 2 invariants in node_block / decoder.
+#
+# contact_decoder_basis:  add a dedicated equivariant aggregate built only
+#   from the needle–tissue contact (world) edges, C = Σ_{j∈contact} γⱼ · ê_ij,
+#   appended to the decoder basis as {…, C}.  Contact edges point radially
+#   from the needle surface into the tissue — transverse to the axis by
+#   construction — so C is a transverse, d-independent basis vector that
+#   survives the d = 0 collapse on needle nodes.  The dataset attaches a
+#   per-edge graph.world_edge_mask.  Adds one gamma_head per processor layer
+#   plus 2 invariants in node_block / decoder.
 fiber_extra_invariants: false
 fiber_extra_decoder_basis: false
+contact_decoder_basis: false
 
 # Optional per-node 1o vector input fed to FiberEquivariantMGN via
 # graph.extra_node_vec (precomputed once by compute_needle_geometry.py and

@@ -787,7 +787,7 @@ class NeedleTissueDataset(Dataset):
         surface_contact_normal_feature: bool = False,
         needle_geometry_path: Optional[str] = None,
         global_needle_vecs: bool = False,
-        contact_decoder_basis: bool = False,
+        needle_axis_rot_aug: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -822,16 +822,34 @@ class NeedleTissueDataset(Dataset):
             )
         self.bevel_normal_feature = bool(bevel_normal_feature)
         self.surface_contact_normal_feature = bool(surface_contact_normal_feature)
-        # When True, attach a per-edge boolean `world_edge_mask` to each graph
-        # so FiberEquivariantMGN(contact_decoder_basis=True) can build the
-        # contact-only equivariant aggregate C.
-        self.contact_decoder_basis = bool(contact_decoder_basis)
         self.needle_geometry_path = needle_geometry_path
         # Global per-frame needle features: centroid offset, principal axis,
         # centroid velocity, principal-axis angular velocity.  Computed from
         # the *full* needle (pre-crop) so the model sees state-of-the-whole-
         # needle context even when the crop hides part of it.
         self.global_needle_vecs = bool(global_needle_vecs)
+        # Data augmentation: rotate each training sample by a random angle about
+        # the (frame-0) needle axis.  All 1o vector quantities (coord, u, v, a,
+        # mat_fiber) co-rotate; rotation-invariant scalars/edge-invariants and
+        # the scalar-decoded stress/evf are left unchanged (the fiber model
+        # decodes those with a rotation-invariant head, and a rotation about
+        # the axis preserves every invariant feature).  Active on the train
+        # split only.  See _build_graph / _sample_axis_rotation.
+        self.needle_axis_rot_aug = bool(needle_axis_rot_aug)
+        if self.needle_axis_rot_aug and (
+            self.global_needle_vecs
+            or bevel_normal_feature
+            or surface_contact_normal_feature
+        ):
+            # These ship precomputed per-node/per-frame vector features that the
+            # augmentation would NOT rotate, silently desyncing them from the
+            # rotated geometry.  Not needed by the fiber/invw variants.
+            raise ValueError(
+                "needle_axis_rot_aug is not supported together with "
+                "global_needle_vecs / bevel_normal_feature / "
+                "surface_contact_normal_feature (their precomputed vectors are "
+                "not rotated by the augmentation)."
+            )
         self.mgn_paper_features = mgn_paper_features
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
         self.mgn_include_prev_v = mgn_include_prev_v
@@ -1173,6 +1191,25 @@ class NeedleTissueDataset(Dataset):
                 new_mf[self._needle_idx_t] = axis.expand(self._needle_idx_t.numel(), 3)
                 run["node_props"]["mat_fiber"] = new_mf
 
+        # ---- Rotation-augmentation geometry (per-run, frame 0) --------------
+        # Cache the frame-0 needle principal axis (unit) and centroid for each
+        # run so _build_graph can sample a random rotation about that axis line.
+        self._aug_axis_per_run: Optional[List[torch.Tensor]] = None
+        self._aug_center_per_run: Optional[List[torch.Tensor]] = None
+        if self.needle_axis_rot_aug:
+            self._aug_axis_per_run = []
+            self._aug_center_per_run = []
+            for run in self._run_data:
+                ref_coord = run["frame_tensors"]["coord"][0].float()
+                needle_pts = ref_coord[self._needle_idx_t]
+                center = needle_pts.mean(dim=0)
+                centered = needle_pts - center
+                _, _, Vt = torch.linalg.svd(centered, full_matrices=False)
+                axis = Vt[0]
+                axis = axis / axis.norm().clamp(min=1e-8)
+                self._aug_axis_per_run.append(axis)
+                self._aug_center_per_run.append(center)
+
         # ---- Geometry feature load (bevel / surface contact normals) -------
         # These come from compute_needle_geometry.py and are mesh-fixed.
         self._geom_bevel_normal: Optional[torch.Tensor] = None
@@ -1441,6 +1478,26 @@ class NeedleTissueDataset(Dataset):
         ])
         return torch.from_numpy(np.sort(kept).astype(np.int64))
 
+    def _sample_axis_rotation(self, r_idx: int):
+        """Sample a random rotation about run ``r_idx``'s frame-0 needle axis.
+
+        Returns ``(R, center)`` where ``R`` is a ``(3, 3)`` rotation matrix
+        (Rodrigues' formula for a uniform angle in ``[0, 2π)`` about the unit
+        needle axis) and ``center`` is a point on that axis (the frame-0 needle
+        centroid).  Vectors rotate as ``v @ R.T``; positions as
+        ``(p - center) @ R.T + center``.
+        """
+        axis = self._aug_axis_per_run[r_idx]
+        center = self._aug_center_per_run[r_idx]
+        theta = float(np.random.uniform(0.0, 2.0 * np.pi))
+        c, s = float(np.cos(theta)), float(np.sin(theta))
+        ux, uy, uz = float(axis[0]), float(axis[1]), float(axis[2])
+        K = torch.tensor(
+            [[0.0, -uz, uy], [uz, 0.0, -ux], [-uy, ux, 0.0]], dtype=torch.float32
+        )
+        R = torch.eye(3, dtype=torch.float32) + s * K + (1.0 - c) * (K @ K)
+        return R, center
+
     def _build_graph(self, sample_idx: int) -> Data:
         r_idx, t_local = self._samples[sample_idx]
         run = self._run_data[r_idx]
@@ -1448,7 +1505,24 @@ class NeedleTissueDataset(Dataset):
         node_props = run["node_props"]
         t1_local = t_local + 1
 
-        coord = ft["coord"][t_local]
+        # Random rotation about the frame-0 needle axis (train-split data
+        # augmentation).  ``_rot`` co-rotates 1o vector quantities (coord, u,
+        # v, a, mat_fiber) and leaves everything else — rotation-invariant
+        # scalars, the Voigt stress, evf — unchanged.
+        _R = _center = None
+        if self.needle_axis_rot_aug and self.split == "train":
+            _R, _center = self._sample_axis_rotation(r_idx)
+
+        def _rot(key: str, t: torch.Tensor) -> torch.Tensor:
+            if _R is None:
+                return t
+            if key == "coord":
+                return (t - _center) @ _R.T + _center
+            if key in _VECTOR_KEYS:  # u, v, a, mat_fiber
+                return t @ _R.T
+            return t
+
+        coord = _rot("coord", ft["coord"][t_local])
 
         # Dynamic crop from current frame's needle positions
         part_nodes = self._crop_nodes(coord)
@@ -1456,7 +1530,7 @@ class NeedleTissueDataset(Dataset):
         # Node features (normalised): dynamic frame features + static material props
         x_parts = []
         for key in self.INPUT_KEYS:
-            feat = ft[key][t_local]  # (n_nodes, dim)
+            feat = _rot(key, ft[key][t_local])  # (n_nodes, dim)
             if self.per_region_norm:
                 feat_norm = feat.clone()
                 feat_norm[self._needle_idx_t] = (
@@ -1469,14 +1543,14 @@ class NeedleTissueDataset(Dataset):
             else:
                 x_parts.append((feat - self._node_stats[f"{key}_mean"]) / self._node_stats[f"{key}_std"])
         for key in self.STATIC_PROP_KEYS:
-            feat = node_props[key]
+            feat = _rot(key, node_props[key])  # rotates mat_fiber; others unchanged
             x_parts.append((feat - self._node_stats[f"{key}_mean"]) / self._node_stats[f"{key}_std"])
         x = torch.cat(x_parts, dim=-1)
 
         # Target: normalised increments Δf = f_{t+1} - f_t
         y_parts = []
         for key in self.TARGET_KEYS:
-            delta = ft[key][t1_local] - ft[key][t_local]  # (n_nodes, dim)
+            delta = _rot(key, ft[key][t1_local] - ft[key][t_local])  # (n_nodes, dim)
             if self.per_region_norm:
                 delta_norm = delta.clone()
                 delta_norm[self._needle_idx_t] = (
@@ -1524,7 +1598,7 @@ class NeedleTissueDataset(Dataset):
         # Unit fiber direction per node (for FiberEquivariantMGN, and as an
         # optional input under mgn_include_mat_fiber).  mat_fiber is a 3-D
         # material axis stored in node_props; normalise to unit length.
-        fiber_raw = node_props["mat_fiber"]  # (n_nodes, 3) float32
+        fiber_raw = _rot("mat_fiber", node_props["mat_fiber"])  # (n_nodes, 3) float32
         fiber_norm = torch.linalg.norm(fiber_raw, dim=-1, keepdim=True).clamp(min=1e-8)
         fiber_dir = (fiber_raw / fiber_norm)[part_nodes]  # (n_sub, 3)
 
@@ -1566,12 +1640,12 @@ class NeedleTissueDataset(Dataset):
                 # node input from the MGN paper.  Pulls v_t from the cache
                 # and uses the global v_mean/v_std stats (also valid under
                 # vector_iso_norm where v_std is a scalar broadcast to xyz).
-                v_t = ft["v"][t_local]
+                v_t = _rot("v", ft["v"][t_local])
                 v_norm = (
                     v_t - self._node_stats["v_mean"]
                 ) / self._node_stats["v_std"]
                 x_sub = torch.cat([x_sub, v_norm[part_nodes]], dim=-1)
-            ref_pos_sub = self._mgn_ref_pos_per_run[r_idx][part_nodes]
+            ref_pos_sub = _rot("coord", self._mgn_ref_pos_per_run[r_idx])[part_nodes]
             mesh_rel = ref_pos_sub[src] - ref_pos_sub[dst]
             mesh_d = torch.linalg.norm(mesh_rel, dim=-1, keepdim=True)
             is_world = all_et[:, 2] > 0.5
@@ -1589,7 +1663,7 @@ class NeedleTissueDataset(Dataset):
         # Used by FiberEquivariantMGN(extra_edge_invariants=True) to compute
         # velocity-driven edge invariants without depending on the layout
         # of x.  Cheap (3 floats per node) so unconditional.
-        v_t = ft["v"][t_local]
+        v_t = _rot("v", ft["v"][t_local])
         v_norm = (
             v_t - self._node_stats["v_mean"]
         ) / self._node_stats["v_std"]
@@ -1625,12 +1699,6 @@ class NeedleTissueDataset(Dataset):
         )
         if loss_mask is not None:
             data_kwargs["loss_mask"] = loss_mask
-
-        # Per-edge contact mask for FiberEquivariantMGN(contact_decoder_basis).
-        # all_et[:, 2] is the world-edge type one-hot in the assembled
-        # edge_index/edge_attr above.  Shape (E,), batches along the edge dim.
-        if self.contact_decoder_basis:
-            data_kwargs["world_edge_mask"] = all_et[:, 2] > 0.5
 
         # Extra 1o vector feature (bevel-face normal OR surface-contact
         # normal), zero on non-applicable nodes.  Plugs into
@@ -1726,7 +1794,7 @@ class NeedleTissueDataset(Dataset):
             for k in range(1, self.multistep_K):
                 parts = []
                 for key in self.TARGET_KEYS:
-                    delta_k = ft[key][t_local + k + 1] - ft[key][t_local + k]
+                    delta_k = _rot(key, ft[key][t_local + k + 1] - ft[key][t_local + k])
                     if self.per_region_norm:
                         dn = delta_k.clone()
                         dn[self._needle_idx_t] = (
