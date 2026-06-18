@@ -131,6 +131,9 @@ class MGNTrainer:
             needle_geometry_path=cfg.get("needle_geometry_path", None),
             global_needle_vecs=bool(cfg.get("global_needle_vecs", False)),
             needle_axis_rot_aug=bool(cfg.get("needle_axis_rot_aug", False)),
+            needle_axis_mirror_aug=bool(cfg.get("needle_axis_mirror_aug", False)),
+            mirror_plane_normal_deg=float(cfg.get("mirror_plane_normal_deg", 0.0)),
+            aug_transform_stress=bool(cfg.get("aug_transform_stress", False)),
         )
         train_dataset = NeedleTissueDataset(split="train", **_shared_dataset_kwargs)
         # Val keeps K=1 so the metric is the standard 1-step rel-err and

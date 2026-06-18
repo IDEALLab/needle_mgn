@@ -18,6 +18,11 @@ This script generates ``<data_dir>/needle_geometry_features.pt`` with:
       "is_needle_surface_node":  BoolTensor (n_nodes,),
       "needle_axis":             FloatTensor (3,),
       "needle_centroid":         FloatTensor (3,),
+      "arclen_to_clamp":         FloatTensor (n_nodes,) — normalised [0,1]
+                                                         arc-length from the
+                                                         clamp end, zero off
+                                                         the needle,
+      "needle_length_mm":        float,
     }
 
 All vectors are unit length on the nodes where they are non-zero.
@@ -194,6 +199,54 @@ def _classify_bevel_faces(face_normals: np.ndarray, axis: np.ndarray,
     return (dots >= axial_min) & (dots <= axial_max)
 
 
+def _compute_arclen_to_clamp(
+    points: np.ndarray,
+    needle_node_idx: np.ndarray,
+    axis: np.ndarray,
+    centroid: np.ndarray,
+    bevel_touched: np.ndarray,
+    n_nodes: int,
+) -> Tuple[np.ndarray, float]:
+    """Per-node arc-length coordinate measured from the needle clamp end.
+
+    For each needle node we project its rest-state position onto the needle
+    axis: ``proj_i = (p_i - centroid) · axis``.  The needle is approximately
+    straight in the rest state, so this axial projection *is* the arc length
+    along the centreline.
+
+    The *clamp* (proximal, driven) end is taken to be the axial extreme
+    **opposite** the bevel tip.  The bevel nodes (``bevel_touched``) localise
+    the tip end; the clamp is then the far extreme.  The returned coordinate
+    is normalised to ``[0, 1]`` with ``0`` at the clamp and ``≈1`` at the
+    tip, and is zero on non-needle (tissue) nodes.
+
+    Returns
+    -------
+    arclen : np.ndarray  (n_nodes,)
+        Normalised arc-length-to-clamp coordinate, zero off the needle.
+    length_mm : float
+        Physical axial extent of the needle (proj_max - proj_min), in mm.
+    """
+    proj = (points[needle_node_idx] - centroid) @ axis  # (n_needle,)
+    p_min, p_max = float(proj.min()), float(proj.max())
+    length = max(p_max - p_min, 1e-8)
+
+    # Which axial extreme is the bevel/tip?  Use the mean projection of the
+    # bevel nodes; the clamp is the opposite extreme.
+    bevel_in_needle = np.isin(needle_node_idx, np.nonzero(bevel_touched)[0])
+    if bevel_in_needle.any():
+        bevel_proj = float(proj[bevel_in_needle].mean())
+        clamp_proj = p_min if abs(bevel_proj - p_max) <= abs(bevel_proj - p_min) else p_max
+    else:
+        # No bevel detected — fall back to the min-projection end as clamp.
+        clamp_proj = p_min
+
+    s_needle = np.abs(proj - clamp_proj) / length  # [0, 1], 0 at clamp
+    arclen = np.zeros(n_nodes, dtype=np.float64)
+    arclen[needle_node_idx] = s_needle
+    return arclen, length
+
+
 def _aggregate_per_node(face_node_indices: np.ndarray, face_normals: np.ndarray,
                         n_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
     """Sum incident face normals per global node, then unit-normalise.
@@ -257,6 +310,12 @@ def main():
     print(f"  Per-node aggregation: {n_surface_nodes} surface nodes, "
           f"{n_bevel_nodes} bevel nodes")
 
+    arclen_to_clamp, needle_length_mm = _compute_arclen_to_clamp(
+        points, needle_node_idx, axis, centroid, bevel_touched, n_nodes
+    )
+    print(f"  Arc-length-to-clamp: needle length {needle_length_mm:.3f} mm, "
+          f"coordinate in [0, 1] (0 = clamp, 1 = tip)")
+
     payload = {
         "needle_node_indices": torch.from_numpy(needle_node_idx).long(),
         "bevel_node_normal": torch.from_numpy(bevel_node_normal).float(),
@@ -265,6 +324,8 @@ def main():
         "is_needle_surface_node": torch.from_numpy(surface_touched),
         "needle_axis": torch.from_numpy(axis).float(),
         "needle_centroid": torch.from_numpy(centroid).float(),
+        "arclen_to_clamp": torch.from_numpy(arclen_to_clamp).float(),
+        "needle_length_mm": float(needle_length_mm),
         "params": {
             "bevel_axial_min": args.bevel_axial_min,
             "bevel_axial_max": args.bevel_axial_max,

@@ -105,6 +105,33 @@ needle_fiber_axis: false
 # (their precomputed vectors are not rotated).
 needle_axis_rot_aug: false
 
+# De-biasing data augmentation (train split only): with 50% probability,
+# REFLECT each sample across the bevel symmetry plane (a plane containing the
+# frame-0 needle axis, normal at `mirror_plane_normal_deg` in the transverse
+# plane).  This synthesises the mirror-image fiber orientations the dataset
+# never simulated (the empty y=-x azimuth half), giving full orientation
+# coverage.  Unlike a rotation, a reflection is a TRUE symmetry of a beveled
+# needle, so the mirrored sample is physically valid.  All 1o vectors
+# (coord, u, v, a, mat_fiber) reflect; invariant scalars / stress / evf are
+# unchanged.  `mirror_plane_normal_deg` is the transverse azimuth of the
+# mirror-plane NORMAL; it MUST match the real bevel symmetry plane.  For this
+# dataset the verified value is 90 => normal along +Y => reflect y -> -y across
+# the X-Z plane (the needle maps onto itself there: mean self-overlap 0.054 mm
+# vs 0.120 mm for x -> -x, which flips the bevel).  This also fills the empty
+# fiber-azimuth half.  Confirm with mirror_vtu.py (bevel must map to itself).
+# Not compatible with global_needle_vecs / bevel_normal_feature /
+# surface_contact_normal_feature.
+needle_axis_mirror_aug: false
+mirror_plane_normal_deg: 90.0
+
+# When an axis augmentation (rotation/mirror) is active, also transform the
+# Voigt stress 's' as a rank-2 tensor (M S Mᵀ) so the stress target stays
+# physically consistent with the transformed geometry.  Leave false for the
+# equivariant fiber model (its scalar stress head only produces invariant
+# stress, so the target is left as-is); set true for non-equivariant models
+# (e.g. base MGN) that predict stress.
+aug_transform_stress: false
+
 # Drop one or more kinematic vector targets (subset of u/v/a) from the
 # model's outputs.  The remaining outputs train as usual; each dropped key
 # is handled at inference time as follows:

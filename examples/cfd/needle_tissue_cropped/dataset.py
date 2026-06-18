@@ -234,6 +234,29 @@ _STATIC_PROP_DIMS = [1, 1, 1, 3, 1, 1, 1, 1]
 # instead of per-component (mean, std), preserving SE(3) equivariance.
 _VECTOR_KEYS = {"u", "v", "a", "mat_fiber"}
 
+# Abaqus Voigt stress ordering for the 's' field: [S11, S22, S33, S12, S13, S23].
+_VOIGT_OFFDIAG = ((0, 1), (0, 2), (1, 2))
+
+
+def _transform_voigt_stress(S: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+    """Apply the rank-2 transform ``M S Mᵀ`` to Voigt-6 stress rows ``(N, 6)``.
+
+    ``S`` columns are the Abaqus order ``[S11, S22, S33, S12, S13, S23]`` and
+    ``M`` is the orthogonal augmentation matrix (rotation or reflection).  Used
+    so the stress target co-transforms with the geometry under the axis
+    augmentations (needed for non-equivariant models that predict stress).
+    """
+    M = M.to(dtype=S.dtype, device=S.device)
+    n = S.shape[0]
+    full = torch.zeros(n, 3, 3, dtype=S.dtype, device=S.device)
+    for i in range(3):
+        full[:, i, i] = S[:, i]
+    for k, (i, j) in enumerate(_VOIGT_OFFDIAG):
+        full[:, i, j] = full[:, j, i] = S[:, 3 + k]
+    out = torch.einsum("ij,njk,lk->nil", M, full, M)  # M S Mᵀ
+    cols = [out[:, i, i] for i in range(3)] + [out[:, i, j] for (i, j) in _VOIGT_OFFDIAG]
+    return torch.stack(cols, dim=-1)
+
 
 def _load_node_props(mesh: pv.UnstructuredGrid) -> Dict[str, torch.Tensor]:
     """Load static material node properties from the reference VTU frame.
@@ -788,6 +811,9 @@ class NeedleTissueDataset(Dataset):
         needle_geometry_path: Optional[str] = None,
         global_needle_vecs: bool = False,
         needle_axis_rot_aug: bool = False,
+        needle_axis_mirror_aug: bool = False,
+        mirror_plane_normal_deg: float = 0.0,
+        aug_transform_stress: bool = False,
     ):
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be 'train', 'validation', or 'test', got '{split}'")
@@ -849,6 +875,41 @@ class NeedleTissueDataset(Dataset):
                 "global_needle_vecs / bevel_normal_feature / "
                 "surface_contact_normal_feature (their precomputed vectors are "
                 "not rotated by the augmentation)."
+            )
+
+        # De-biasing data augmentation: with 50% probability, REFLECT each
+        # training sample across the bevel symmetry plane (a plane containing
+        # the frame-0 needle axis, normal at `mirror_plane_normal_deg` in the
+        # transverse plane).  This synthesises the mirror-image fiber
+        # orientations that the dataset never simulated (the empty y=-x
+        # azimuth half), so the model sees the full orientation space.  Unlike
+        # a rotation, a reflection is a TRUE symmetry of a beveled needle, so
+        # the reflected sample is physically valid.  All 1o vector quantities
+        # (coord, u, v, a, mat_fiber) reflect; rotation/reflection-invariant
+        # scalars and the scalar-decoded stress/evf are left unchanged.  Train
+        # split only.  The plane normal MUST match the actual bevel symmetry
+        # plane for the reflected deflections to be correct — verify against a
+        # couple of confirmatory simulations in the previously-empty region.
+        self.needle_axis_mirror_aug = bool(needle_axis_mirror_aug)
+        self.mirror_plane_normal_deg = float(mirror_plane_normal_deg)
+        # When an axis augmentation (rotation/mirror) is active, also transform
+        # the Voigt stress 's' as a rank-2 tensor (M S Mᵀ).  Leave False for the
+        # equivariant fiber model (its scalar stress head can only produce
+        # rotation/reflection-invariant stress, so the target is left
+        # untransformed); set True for non-equivariant models (e.g. base MGN)
+        # that predict stress, so the stress target stays physically consistent
+        # with the transformed geometry.
+        self.aug_transform_stress = bool(aug_transform_stress)
+        if self.needle_axis_mirror_aug and (
+            self.global_needle_vecs
+            or bevel_normal_feature
+            or surface_contact_normal_feature
+        ):
+            raise ValueError(
+                "needle_axis_mirror_aug is not supported together with "
+                "global_needle_vecs / bevel_normal_feature / "
+                "surface_contact_normal_feature (their precomputed vectors are "
+                "not reflected by the augmentation)."
             )
         self.mgn_paper_features = mgn_paper_features
         self.mgn_include_mat_fiber = mgn_include_mat_fiber
@@ -1191,12 +1252,12 @@ class NeedleTissueDataset(Dataset):
                 new_mf[self._needle_idx_t] = axis.expand(self._needle_idx_t.numel(), 3)
                 run["node_props"]["mat_fiber"] = new_mf
 
-        # ---- Rotation-augmentation geometry (per-run, frame 0) --------------
+        # ---- Axis-augmentation geometry (per-run, frame 0) ------------------
         # Cache the frame-0 needle principal axis (unit) and centroid for each
-        # run so _build_graph can sample a random rotation about that axis line.
+        # run so _build_graph can rotate about / reflect across that axis line.
         self._aug_axis_per_run: Optional[List[torch.Tensor]] = None
         self._aug_center_per_run: Optional[List[torch.Tensor]] = None
-        if self.needle_axis_rot_aug:
+        if self.needle_axis_rot_aug or self.needle_axis_mirror_aug:
             self._aug_axis_per_run = []
             self._aug_center_per_run = []
             for run in self._run_data:
@@ -1498,6 +1559,32 @@ class NeedleTissueDataset(Dataset):
         R = torch.eye(3, dtype=torch.float32) + s * K + (1.0 - c) * (K @ K)
         return R, center
 
+    def _sample_axis_reflection(self, r_idx: int):
+        """With 50% probability, reflect across run ``r_idx``'s bevel symmetry plane.
+
+        The plane contains the frame-0 needle axis and has unit normal at
+        ``mirror_plane_normal_deg`` in the transverse plane.  Returns
+        ``(M, center)`` where ``M = I - 2 n nᵀ`` is the ``(3, 3)`` reflection
+        (orthogonal, symmetric, det = −1) and ``center`` is a point on the
+        plane (frame-0 needle centroid); or ``(None, None)`` the other 50% of
+        the time, so the model sees both the original *and* mirror-image fiber
+        orientations.  Vectors reflect as ``v @ M``; positions as
+        ``(p − center) @ M + center`` (the same closure used for rotation,
+        since both are orthogonal transforms about ``center``).
+        """
+        if np.random.random() < 0.5:
+            return None, None
+        axis = self._aug_axis_per_run[r_idx]
+        center = self._aug_center_per_run[r_idx]
+        alpha = float(np.radians(self.mirror_plane_normal_deg))
+        n0 = torch.tensor([np.cos(alpha), np.sin(alpha), 0.0], dtype=torch.float32)
+        # Project the requested normal perpendicular to the needle axis so the
+        # mirror plane exactly contains the axis (needle maps to itself).
+        n = n0 - (n0 @ axis) * axis
+        n = n / n.norm().clamp(min=1e-8)
+        M = torch.eye(3, dtype=torch.float32) - 2.0 * torch.outer(n, n)
+        return M, center
+
     def _build_graph(self, sample_idx: int) -> Data:
         r_idx, t_local = self._samples[sample_idx]
         run = self._run_data[r_idx]
@@ -1505,13 +1592,20 @@ class NeedleTissueDataset(Dataset):
         node_props = run["node_props"]
         t1_local = t_local + 1
 
-        # Random rotation about the frame-0 needle axis (train-split data
-        # augmentation).  ``_rot`` co-rotates 1o vector quantities (coord, u,
-        # v, a, mat_fiber) and leaves everything else — rotation-invariant
+        # Train-split data augmentation about the frame-0 needle axis: a random
+        # rotation (needle_axis_rot_aug) OR a 50%-probability reflection across
+        # the bevel symmetry plane (needle_axis_mirror_aug, the de-biasing
+        # mirror that fills the unsampled fiber-orientation half).  Both are
+        # orthogonal transforms about ``_center``, so a single closure applies:
+        # ``_rot`` transforms the 1o vector quantities (coord, u, v, a,
+        # mat_fiber) and leaves everything else — rotation/reflection-invariant
         # scalars, the Voigt stress, evf — unchanged.
         _R = _center = None
-        if self.needle_axis_rot_aug and self.split == "train":
-            _R, _center = self._sample_axis_rotation(r_idx)
+        if self.split == "train":
+            if self.needle_axis_rot_aug:
+                _R, _center = self._sample_axis_rotation(r_idx)
+            elif self.needle_axis_mirror_aug:
+                _R, _center = self._sample_axis_reflection(r_idx)
 
         def _rot(key: str, t: torch.Tensor) -> torch.Tensor:
             if _R is None:
@@ -1520,6 +1614,8 @@ class NeedleTissueDataset(Dataset):
                 return (t - _center) @ _R.T + _center
             if key in _VECTOR_KEYS:  # u, v, a, mat_fiber
                 return t @ _R.T
+            if key == "s" and self.aug_transform_stress:
+                return _transform_voigt_stress(t, _R)
             return t
 
         coord = _rot("coord", ft["coord"][t_local])
