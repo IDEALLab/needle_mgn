@@ -209,6 +209,8 @@ class MGNTrainer:
                 extra_node_vec=bool(cfg.get("bevel_normal_feature", False)
                                     or cfg.get("surface_contact_normal_feature", False)),
                 n_global_needle_vecs=4 if bool(cfg.get("global_needle_vecs", False)) else 0,
+                displacement_bevel_ref=bool(cfg.get("displacement_bevel_ref", False)),
+                bevel_axis=list(cfg.get("bevel_axis", [1.0, 0.0, 0.0])),
             )
         elif model_type == "fiber_kan":
             self.model = FiberEquivariantKAN(

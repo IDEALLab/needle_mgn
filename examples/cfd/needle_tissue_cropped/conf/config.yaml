@@ -230,9 +230,21 @@ mgn_kinematic_needle_only: false
 #   survives the d = 0 collapse on needle nodes.  The dataset attaches a
 #   per-edge graph.world_edge_mask.  Adds one gamma_head per processor layer
 #   plus 2 invariants in node_block / decoder.
+#
+# displacement_bevel_ref:  append the FIXED lab-frame bevel axis (`bevel_axis`)
+#   to the *vector* (displacement) decoder basis, with its coefficient still
+#   produced from the rotation-invariant decoder features.  This deliberately
+#   breaks the displacement head's rotational equivariance so it can represent
+#   the lab-fixed bevel-steering deflection a purely equivariant basis cannot.
+#   The scalar (stress / CPRESS / EVF) constitutive head is unchanged and stays
+#   invariant.  `bevel_axis` is the lab-frame steering direction (unit vector,
+#   auto-normalised); default [1,0,0] is the in-plane transverse direction for
+#   this dataset (the bevel symmetry plane is X-Z; see mirror_plane_normal_deg).
 fiber_extra_invariants: false
 fiber_extra_decoder_basis: false
 contact_decoder_basis: false
+displacement_bevel_ref: false
+bevel_axis: [1.0, 0.0, 0.0]
 
 # Optional per-node 1o vector input fed to FiberEquivariantMGN via
 # graph.extra_node_vec (precomputed once by compute_needle_geometry.py and

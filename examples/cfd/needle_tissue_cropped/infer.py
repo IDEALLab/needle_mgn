@@ -979,6 +979,8 @@ def main(cfg: DictConfig) -> None:
             contact_decoder_basis=bool(OmegaConf.select(cfg, "contact_decoder_basis", default=False)),
             extra_node_vec=_extra_node_vec,
             n_global_needle_vecs=_n_global_needle_vecs,
+            displacement_bevel_ref=bool(OmegaConf.select(cfg, "displacement_bevel_ref", default=False)),
+            bevel_axis=list(OmegaConf.select(cfg, "bevel_axis", default=[1.0, 0.0, 0.0])),
         )
     elif model_type == "fiber_kan":
         model = FiberEquivariantKAN(

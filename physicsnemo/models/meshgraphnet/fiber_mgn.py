@@ -94,6 +94,20 @@ as the Hydra config keys ``fiber_extra_invariants`` and
   invariants (``||C||``, ``C·d``) in ``_FiberEquivNodeBlock`` and the decoder.
   Composes with ``extra_decoder_basis`` (basis grows to ``{V, d, V×d, W,
   W×d, C}``).
+
+* ``displacement_bevel_ref`` (config: ``displacement_bevel_ref``, with
+  ``bevel_axis``) — append a **fixed lab-frame** reference vector, the needle
+  bevel axis ``b``, to the *vector* (displacement) decoder basis.  Its
+  coefficient is still produced from the rotation-invariant decoder features,
+  so the displacement output gains a lab-fixed term ``δ_k · b`` — exactly the
+  bevel-steering deflection that a purely equivariant basis ``{V, d, V×d,
+  …}`` cannot represent (those have no preferred lab direction).  This is the
+  only place equivariance is deliberately broken; the scalar / constitutive
+  head (stress ``S``, contact pressure, EVF) is untouched and stays invariant.
+  ``b`` is registered as a buffer (saved with the checkpoint) and broadcast to
+  every node; ``bevel_axis`` defaults to ``(1, 0, 0)``.  Adds one basis vector
+  (``n_basis += 1``) — i.e. ``n_vec_outputs`` extra coefficients in
+  ``vec_coef_head``; no change to the scalar decoder.
 """
 
 from dataclasses import dataclass
@@ -525,6 +539,8 @@ class FiberEquivariantMGN(Module):
         contact_decoder_basis: bool = False,
         extra_node_vec: bool = False,
         n_global_needle_vecs: int = 0,
+        displacement_bevel_ref: bool = False,
+        bevel_axis: "tuple | list | None" = None,
     ):
         super().__init__(meta=MetaData())
 
@@ -559,6 +575,23 @@ class FiberEquivariantMGN(Module):
         # context" variant that ships [centroid_rel, axis_dir, centroid_v,
         # ang_v] as K=4 channels (zero on tissue).
         self.n_global_needle_vecs = int(n_global_needle_vecs)
+
+        # When True, append a FIXED lab-frame reference direction — the needle
+        # bevel axis — to the *vector* (displacement) decoder basis, with its
+        # coefficient still produced from the rotation-invariant decoder
+        # features.  This deliberately breaks the rotational equivariance of the
+        # displacement head so it CAN represent the lab-fixed (bevel-steering)
+        # component of the deflection that a purely equivariant basis cannot.
+        # The scalar (stress / contact-pressure / EVF) head is untouched and
+        # stays invariant — those constitutive outputs remain equivariant.
+        self.displacement_bevel_ref = displacement_bevel_ref
+        if displacement_bevel_ref:
+            b = torch.tensor(
+                bevel_axis if bevel_axis is not None else (1.0, 0.0, 0.0),
+                dtype=torch.float32,
+            )
+            b = b / b.norm().clamp(min=1e-8)
+            self.register_buffer("bevel_axis", b)  # (3,) unit lab vector
 
         scalar_dim = output_dim - n_vec_outputs * 3
         if scalar_dim < 0:
@@ -631,9 +664,13 @@ class FiberEquivariantMGN(Module):
         # neighbours are mostly axial — the bottleneck causing x-z flattening).
         # C adds a transverse, d-independent direction sourced from the radial
         # contact edges, which survives the d = 0 collapse on needle nodes.
+        #   +1 = {…, bevel_axis}                              (displacement_bevel_ref)
+        # The bevel-axis basis vector is a FIXED lab direction (not equivariant),
+        # so the displacement output gains a lab-fixed component — only the
+        # vector decoder is affected; the scalar decoder is unchanged.
         self.n_basis = (5 if extra_decoder_basis else 3) + (
             1 if contact_decoder_basis else 0
-        )
+        ) + (1 if displacement_bevel_ref else 0)
 
         # Equivariant vector decoder: outputs n_vec_outputs * n_basis scalar
         # coefficients for the local equivariant basis.
@@ -785,6 +822,13 @@ class FiberEquivariantMGN(Module):
             basis_vecs.extend([W, WcrossD])
         if self.contact_decoder_basis:
             basis_vecs.append(C)
+        if self.displacement_bevel_ref:
+            # Fixed lab-frame bevel axis, broadcast to every node.  Its
+            # coefficient comes from the invariant decoder features, so the
+            # displacement gains a lab-fixed component (the bevel-steering
+            # direction) that the equivariant basis cannot represent.
+            n_nodes = V.shape[0]
+            basis_vecs.append(self.bevel_axis.float().view(1, 3).expand(n_nodes, 3))
         basis = torch.stack(basis_vecs, dim=-1)                       # (N, 3, n_basis)
 
         # Scalar coefficients: (N, n_vec_outputs * n_basis) → (N, n_vec_out, n_basis).
@@ -865,6 +909,8 @@ class FiberEquivariantKAN(FiberEquivariantMGN):
         extra_edge_invariants: bool = False,
         extra_decoder_basis: bool = False,
         contact_decoder_basis: bool = False,
+        displacement_bevel_ref: bool = False,
+        bevel_axis: "tuple | list | None" = None,
     ):
         super().__init__(
             input_dim_nodes=input_dim_nodes,
@@ -887,6 +933,8 @@ class FiberEquivariantKAN(FiberEquivariantMGN):
             extra_edge_invariants=extra_edge_invariants,
             extra_decoder_basis=extra_decoder_basis,
             contact_decoder_basis=contact_decoder_basis,
+            displacement_bevel_ref=displacement_bevel_ref,
+            bevel_axis=bevel_axis,
         )
 
         # Replace the MLP node encoder with a KAN.
