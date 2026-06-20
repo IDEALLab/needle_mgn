@@ -240,11 +240,20 @@ mgn_kinematic_needle_only: false
 #   invariant.  `bevel_axis` is the lab-frame steering direction (unit vector,
 #   auto-normalised); default [1,0,0] is the in-plane transverse direction for
 #   this dataset (the bevel symmetry plane is X-Z; see mirror_plane_normal_deg).
+#
+# displacement_lab_mlp:  decode the kinematic (u/v/a) outputs with a plain,
+#   NON-equivariant MLP head that reads the same invariant node embeddings as
+#   the constitutive head plus the raw per-node fiber direction, and emits
+#   u/v/a directly in lab coordinates.  Removes the equivariant basis
+#   {V, d, V×d, …} from the kinematic head entirely (its invariant summaries
+#   stay in the constitutive/scalar head, which is unchanged and equivariant).
+#   Mutually exclusive with displacement_bevel_ref.
 fiber_extra_invariants: false
 fiber_extra_decoder_basis: false
 contact_decoder_basis: false
 displacement_bevel_ref: false
 bevel_axis: [1.0, 0.0, 0.0]
+displacement_lab_mlp: false
 
 # Optional per-node 1o vector input fed to FiberEquivariantMGN via
 # graph.extra_node_vec (precomputed once by compute_needle_geometry.py and

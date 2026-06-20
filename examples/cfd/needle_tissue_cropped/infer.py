@@ -981,6 +981,7 @@ def main(cfg: DictConfig) -> None:
             n_global_needle_vecs=_n_global_needle_vecs,
             displacement_bevel_ref=bool(OmegaConf.select(cfg, "displacement_bevel_ref", default=False)),
             bevel_axis=list(OmegaConf.select(cfg, "bevel_axis", default=[1.0, 0.0, 0.0])),
+            displacement_lab_mlp=bool(OmegaConf.select(cfg, "displacement_lab_mlp", default=False)),
         )
     elif model_type == "fiber_kan":
         model = FiberEquivariantKAN(
